@@ -56,6 +56,8 @@ LOGIN_DEFAULTS = {
     "allow_visible_fallback": False,
 }
 FAILURE_COOLDOWN = 6 * 60 * 60
+#: 提交验证码后，若验证码页仍在超过该秒数，视为华为已重发新码，重新开放输入。
+SMS_RETRY_GRACE = 8.0
 
 STATE_MESSAGES = {
     "IDLE": "尚未开始登录",
@@ -96,6 +98,7 @@ class HuaweiLoginSession:
         self._actions = queue.Queue()
         self._pending_action = ""
         self._sms_action_sent = False
+        self._sms_action_at = 0.0
         self._trust_action_sent = False
         self._state = "IDLE"
         self._message = STATE_MESSAGES["IDLE"]
@@ -463,6 +466,7 @@ class HuaweiLoginSession:
                     self._set_state("NEED_SMS", "验证码输入框尚未准备好，请稍后重试")
             else:
                 self._sms_action_sent = True
+                self._sms_action_at = time.time()
                 with self._lock:
                     self._set_state("SUBMITTING")
         elif kind == "trust":
@@ -486,9 +490,16 @@ class HuaweiLoginSession:
             if info.get("sms"):
                 if info.get("sms_error"):
                     self._sms_action_sent = False
+                    self._sms_action_at = 0.0
                     self._set_state("NEED_SMS", "验证码校验失败，请重新输入")
                 elif current != "NEED_SMS" and not self._sms_action_sent:
                     self._set_state("NEED_SMS")
+                elif (self._sms_action_sent and self._sms_action_at
+                      and time.time() - self._sms_action_at >= SMS_RETRY_GRACE):
+                    # 提交后验证码页仍在：华为多半已重发新码，重新开放输入，避免卡在 SUBMITTING。
+                    self._sms_action_sent = False
+                    self._sms_action_at = 0.0
+                    self._set_state("NEED_SMS", "验证码可能已失效，请重新输入")
             elif info.get("trust"):
                 if current == "NEED_TRUST":
                     return
@@ -510,9 +521,9 @@ class HuaweiLoginSession:
             "const sms=[...document.querySelectorAll('input[type=tel]')].filter(visible).length>=6;"
             "const text=[...document.querySelectorAll('span.hwid-vertical-align,button')].filter(visible)"
             ".map(e=>(e.innerText||e.textContent||'').trim());"
-            "const trust=text.some(t=>/信任此浏览器|信任该浏览器/.test(t));"
             "const body=(document.body&&document.body.innerText)||'';"
-            "const sms_error=sms&&/验证码.{0,6}(错误|不正确|失败)|校验失败/.test(body);"
+            "const trust=text.some(t=>/^(信任|信任此浏览器|信任该浏览器)$/.test(t))||/是否信任此浏览器/.test(body);"
+            "const sms_error=sms&&/(验证码|校验码).{0,10}(错误|不正确|失败|失效|过期|无效)/.test(body);"
             "return JSON.stringify({sms,trust,sms_error});})()"
         )
 
