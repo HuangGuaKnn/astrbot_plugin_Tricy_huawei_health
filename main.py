@@ -23,11 +23,13 @@ try:  # 插件作为包加载
     from .hw_client import AuthExpired, HuaweiHealthClient, HuaweiHealthError
     from .hw_store import HealthStore
     from .hw_login import HuaweiLoginManager
+    from .hw_credentials import HuaweiCredentialsStore
 except ImportError:  # 插件目录在 sys.path 里
     from hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS
     from hw_client import AuthExpired, HuaweiHealthClient, HuaweiHealthError
     from hw_store import HealthStore
     from hw_login import HuaweiLoginManager
+    from hw_credentials import HuaweiCredentialsStore
 
 PLUGIN_NAME = "astrbot_plugin_huawei_health"
 DEFAULT_CLIENT_ID = "106533743"
@@ -68,6 +70,7 @@ class HuaweiHealthPlugin(Star):
         self.cookie_file = os.path.join(self.data_dir, "hw_cookies.json")
         self.db_path = os.path.join(self.data_dir, "health.db")
         self.store = HealthStore(self.db_path)
+        self.credentials = HuaweiCredentialsStore(self.data_dir)
         self._lock = asyncio.Lock()
         # 记录每个缓存键的进行中任务，避免并发请求重复打华为接口。
         self._cache_inflight = {}

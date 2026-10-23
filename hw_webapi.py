@@ -14,8 +14,10 @@ from astrbot.api.web import json_response, request
 
 try:
     from .hw_login import LoginFlowError
+    from .hw_credentials import CredentialsError, DPAPIUnavailableError
 except ImportError:
     from hw_login import LoginFlowError
+    from hw_credentials import CredentialsError, DPAPIUnavailableError
 
 PAGE_PREFIX = "astrbot_plugin_huawei_health/page"
 
@@ -45,6 +47,8 @@ class HuaweiHealthWebApi:
         reg(f"{PAGE_PREFIX}/login/sms", self.login_sms, ["POST"], "提交网页登录验证码")
         reg(f"{PAGE_PREFIX}/login/trust", self.login_trust, ["POST"], "提交网页登录信任选择")
         reg(f"{PAGE_PREFIX}/login/cancel", self.login_cancel, ["POST"], "取消网页登录")
+        reg(f"{PAGE_PREFIX}/credentials", self.credentials_write, ["POST"], "保存账号密码凭据")
+        reg(f"{PAGE_PREFIX}/credentials/status", self.credentials_status, ["GET"], "账号密码凭据状态")
 
     # ---------- 工具 ----------
 
@@ -243,6 +247,85 @@ class HuaweiHealthWebApi:
         except Exception as exc:
             return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         return json_response({"status": "ok", "message": "缓存已清空，并已重新拿到最新 token"})
+
+    # ---------- 账号凭据（v0.4.0 第 3 阶段：DPAPI，只写接口） ----------
+
+    def _credentials_status_data(self):
+        store = getattr(self.plugin, "credentials", None)
+        raw = store.status() if store is not None else {}
+        password_set = bool(raw.get("password_set"))
+        login_manager = getattr(self.plugin, "login_manager", None)
+        configured_mode = getattr(login_manager, "login_mode", "cookie")
+        if configured_mode not in ("cookie", "password"):
+            configured_mode = "cookie"
+        mode = "password" if password_set else configured_mode
+        updated_at = raw.get("updated_at")
+        if isinstance(updated_at, (int, float)) and updated_at > 0:
+            try:
+                updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_at))
+            except (OverflowError, OSError, ValueError):
+                updated_at = "-"
+        if not updated_at:
+            updated_at = "-"
+        return {
+            "mode": mode,
+            "password_set": password_set,
+            "account_masked": str(raw.get("account_masked") or ""),
+            "updated_at": updated_at,
+        }
+
+    async def credentials_status(self):
+        return json_response({"status": "ok", "data": self._credentials_status_data()})
+
+    async def credentials_write(self):
+        try:
+            body = await request.json()
+        except Exception:
+            return json_response({"status": "error", "message": "请求体不是合法 JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return json_response({"status": "error", "message": "请求体必须是 JSON 对象"}, status_code=400)
+        store = getattr(self.plugin, "credentials", None)
+        if store is None:
+            return json_response({"status": "error", "message": "当前版本不支持安全凭据存储"}, status_code=409)
+
+        mode = str(body.get("mode") or "").strip().lower()
+        clear = body.get("clear") is True or mode == "cookie"
+        if clear:
+            try:
+                store.clear()
+                self.plugin.login_manager.set_login_mode("cookie")
+            except (CredentialsError, LoginFlowError):
+                return json_response({"status": "error", "message": "凭据清除失败，请稍后重试"}, status_code=500)
+            return json_response({
+                "status": "ok", "data": self._credentials_status_data(), "message": "账号密码凭据已清除",
+            })
+
+        account = body.get("account")
+        password = body.get("password")
+        if mode not in ("", "password") or not isinstance(account, str) or not isinstance(password, str):
+            return json_response({"status": "error", "message": "请输入账号和密码"}, status_code=400)
+        if not account.strip() or not password or len(account) > 150 or len(password) > 512:
+            return json_response({"status": "error", "message": "请输入有效的账号和密码"}, status_code=400)
+        if not store.available:
+            return json_response({
+                "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
+            }, status_code=409)
+        try:
+            store.save(account, password)
+            self.plugin.login_manager.set_login_mode("password")
+        except DPAPIUnavailableError:
+            return json_response({
+                "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
+            }, status_code=409)
+        except CredentialsError:
+            return json_response({"status": "error", "message": "凭据保存失败，请稍后重试"}, status_code=500)
+        finally:
+            # Do not retain request fields after the write path returns.
+            account = None
+            password = None
+        return json_response({
+            "status": "ok", "data": self._credentials_status_data(), "message": "账号密码已加密保存",
+        })
 
     # ---------- 登录会话（v0.4.0 第 2 阶段：验证码与信任选择） ----------
 

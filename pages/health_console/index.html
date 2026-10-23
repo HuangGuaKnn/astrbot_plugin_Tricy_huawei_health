@@ -94,6 +94,11 @@
   .login-state{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:13px}
   .login-state .left{color:var(--muted)}
   .login-state .deadline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted);font-size:12px}
+  .credential-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px;margin:10px 0}
+  .credential-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11.5px}
+  .credential-field input{width:100%;background:var(--code);color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:7px 8px;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}
+  .credential-field input:focus{outline:none;border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -164,6 +169,25 @@
       <button class="act sm" data-login-trust="later" disabled>稍后再说</button>
     </div>
     <p class="hint" id="loginHint" style="margin-bottom:0">登录会话只允许同时存在一个。</p>
+  </div>
+
+  <h2>账号密码登录（可选）</h2>
+  <div class="card">
+    <div class="hint" style="margin-top:0">
+      仅在你主动保存后启用账号密码模式。凭据只写入本机 Windows DPAPI 加密文件，页面不会回填密码；
+      当前阶段先完成安全存储，自动填充登录将在下一阶段接入。
+    </div>
+    <div class="credential-fields">
+      <label class="credential-field">华为账号<input id="credentialAccount" autocomplete="username"></label>
+      <label class="credential-field">密码<input id="credentialPassword" type="password" autocomplete="new-password"></label>
+    </div>
+    <div class="row">
+      <button class="act primary" id="btnCredentialSave">保存并加密</button>
+      <button class="act danger" id="btnCredentialClear">清除凭据</button>
+      <button class="act sm" id="btnCredentialStatus">刷新状态</button>
+      <span class="hint" id="credentialState" style="margin:0">未读取</span>
+    </div>
+    <div class="msg" id="credentialMsg"></div>
   </div>
 
   <h2>数据概览</h2>
@@ -566,6 +590,60 @@ async function doLoginTrust(choice){
   finally{ loadLoginStatus(true); renderDiag(); }
 }
 
+/* ---------- 账号凭据（第 3 阶段：只写 + DPAPI 状态） ---------- */
+function renderCredentialsStatus(d){
+  d = d || {};
+  const mode = d.mode === "password" ? "账号密码模式" : "Cookie 模式";
+  if(d.password_set){
+    const account = d.account_masked || "已保存账号";
+    const at = d.updated_at && d.updated_at !== "-" ? " · " + d.updated_at : "";
+    $("credentialState").textContent = mode + " · " + account + at;
+  }else{
+    $("credentialState").textContent = mode + " · 未保存账号密码";
+  }
+}
+
+async function loadCredentialsStatus(silent){
+  try{
+    const d = unwrap(await apiGet("credentials/status")) || {};
+    renderCredentialsStatus(d);
+    if(!silent) setMsg($("credentialMsg"), "凭据状态已刷新", "ok");
+  }catch(e){
+    if(!silent) setMsg($("credentialMsg"), "凭据状态读取失败：" + e.message, "err");
+  }
+  renderDiag();
+}
+
+async function doCredentialSave(){
+  const account = $("credentialAccount").value;
+  const password = $("credentialPassword").value;
+  if(!account.trim() || !password){ setMsg($("credentialMsg"), "请输入账号和密码", "err"); return; }
+  const b = $("btnCredentialSave"); b.disabled = true;
+  try{
+    const d = unwrap(await apiPost("credentials", {mode:"password", account, password})) || {};
+    renderCredentialsStatus(d);
+    setMsg($("credentialMsg"), "账号密码已加密保存", "ok");
+  }catch(e){ setMsg($("credentialMsg"), "凭据保存失败：" + e.message, "err"); }
+  finally{
+    $("credentialAccount").value = "";
+    $("credentialPassword").value = "";
+    b.disabled = false;
+    loadCredentialsStatus(true);
+    renderDiag();
+  }
+}
+
+async function doCredentialClear(){
+  if(!confirm("确定清除本机保存的账号密码凭据？")) return;
+  const b = $("btnCredentialClear"); b.disabled = true;
+  try{
+    const d = unwrap(await apiPost("credentials", {clear:true})) || {};
+    renderCredentialsStatus(d);
+    setMsg($("credentialMsg"), "账号密码凭据已清除", "ok");
+  }catch(e){ setMsg($("credentialMsg"), "凭据清除失败：" + e.message, "err"); }
+  finally{ b.disabled = false; loadCredentialsStatus(true); renderDiag(); }
+}
+
 async function doImport(){
   const text = $("cookieBox").value.trim();
   const fieldIds = ["CASTGC", "sid", "hwid_cas_sid", "HuaweiID_CAS_ISCASLOGIN", "CASLOGINSITE", "LOGINACCSITE"];
@@ -612,6 +690,9 @@ async function doClear(){
   document.querySelectorAll("[data-login-trust]").forEach(btn => {
     btn.onclick = () => doLoginTrust(btn.getAttribute("data-login-trust"));
   });
+  $("btnCredentialSave").onclick = doCredentialSave;
+  $("btnCredentialClear").onclick = doCredentialClear;
+  $("btnCredentialStatus").onclick = () => loadCredentialsStatus(false);
   $("btnImport").onclick = doImport;
   $("btnClear").onclick = doClear;
   $("btnDiag").onclick = () => {
@@ -632,6 +713,7 @@ async function doClear(){
   renderDiag(summary);
   loadStatus();
   loadLoginStatus(true);
+  loadCredentialsStatus(true);
 })();
 })();
 </script>

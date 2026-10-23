@@ -74,6 +74,7 @@ cookie 也可以直接用文件：`data/plugin_data/astrbot_plugin_huawei_health
 | 通道状态 | cookie 条数 / 更新时间、token 剩余秒数、浏览器探测结果、缓存条数、数据目录 |
 | 关键 cookie 表 | `sid` / `hwid_cas_sid` / `CASTGC` 的域与到期日，一眼看出「信任设备」还剩多久 |
 | 账号登录 | 打开独立可见浏览器，在窗口内手动输入账号密码；验证码可从 WebUI 提交，信任设备支持自动或手动选择；成功后自动保存新 Cookie |
+| 账号密码凭据 | WebUI 主动保存后写入 Windows DPAPI 加密的 `credentials.bin`；页面只显示账号掩码和保存时间，不回填密码 |
 | 操作 | 拉取概览 · 清缓存并重新认证 · 刷新状态 |
 | 数据概览 | 静息心率 / 睡眠 / HRV 的取数结果 + 取数时间 |
 | 重新导入 Cookie | 六条分项值或 Cookie-Editor JSON 导入（自动作废 token 缓存）；也可一键清除 cookie |
@@ -81,8 +82,9 @@ cookie 也可以直接用文件：`data/plugin_data/astrbot_plugin_huawei_health
 技术：走 AstrBot 的 bridge SDK（`window.AstrBotPluginPage`），iframe 内用 bridge、
 独立窗口降级直连 `/api/v1/plugins/extensions/<plugin>/page/...`；主题跟随系统并支持手动切换。
 
-登录相关的非敏感选项保存在插件数据目录的 `login_config.json`（当前包含 `auto_trust`）。
-账号密码不会写入插件配置、WebUI 状态或日志；DPAPI 加密凭据和全自动账号密码登录将在后续阶段加入。
+登录相关的非敏感选项保存在插件数据目录的 `login_config.json`（包含模式和 `auto_trust`）。
+账号密码不会写入插件配置、WebUI 状态或日志；凭据由 Windows DPAPI 绑定当前用户加密，文件被误传、备份泄露或被其他程序顺手读取时不能直接还原。
+DPAPI 不防同一 Windows 用户下已经能执行代码的恶意程序；它必须能在本机自动解密，才能支持后续无感登录。当前阶段只接入安全存储和只写接口，自动填充登录随后接入。
 
 ### 开发踩坑（2026-10-22 实测）
 

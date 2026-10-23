@@ -482,6 +482,7 @@ class HuaweiLoginManager:
         self._lock = threading.RLock()
         self._session = None
         self.login_config_path = os.path.join(plugin.data_dir, "login_config.json")
+        self.login_mode = "cookie"
         self.auto_trust = True
         self._load_login_config()
 
@@ -489,13 +490,16 @@ class HuaweiLoginManager:
         try:
             with open(self.login_config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict) and isinstance(data.get("auto_trust"), bool):
-                self.auto_trust = data["auto_trust"]
+            if isinstance(data, dict):
+                if data.get("mode") in ("cookie", "password"):
+                    self.login_mode = data["mode"]
+                if isinstance(data.get("auto_trust"), bool):
+                    self.auto_trust = data["auto_trust"]
         except (OSError, ValueError, TypeError):
             pass
 
     def _save_login_config(self):
-        data = {"mode": "cookie", "auto_trust": bool(self.auto_trust),
+        data = {"mode": self.login_mode, "auto_trust": bool(self.auto_trust),
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
         parent = os.path.dirname(self.login_config_path) or "."
         os.makedirs(parent, exist_ok=True)
@@ -512,6 +516,14 @@ class HuaweiLoginManager:
                     os.unlink(tmp)
             except OSError:
                 pass
+
+    def set_login_mode(self, mode: str):
+        mode = str(mode or "").strip().lower()
+        if mode not in ("cookie", "password"):
+            raise LoginFlowError("mode_invalid")
+        with self._lock:
+            self.login_mode = mode
+            self._save_login_config()
 
     def status(self) -> dict:
         with self._lock:
