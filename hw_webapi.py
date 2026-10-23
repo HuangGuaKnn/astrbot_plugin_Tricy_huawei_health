@@ -1,0 +1,234 @@
+# -*- coding: utf-8 -*-
+"""华为运动健康 · 插件 WebUI 后端 API
+
+页面位于 pages/health_console/，由 AstrBot 的 PluginPageService 自动挂载。
+前端通过 bridge（window.AstrBotPluginPage）调用本模块注册的接口，
+route 前缀：astrbot_plugin_huawei_health/page/...
+"""
+
+import asyncio
+import os
+import time
+
+from astrbot.api.web import json_response, request
+
+PAGE_PREFIX = "astrbot_plugin_huawei_health/page"
+
+#: cookie 里最关键的几个（决定「信任设备」是否还在）
+KEY_COOKIES = (
+    "sid", "hwid_cas_sid", "CASTGC", "HuaweiID_CAS_ISCASLOGIN",
+    "HUAWEI_ID_CAS_ISCASLOGIN", "__uni__uid",
+)
+
+
+class HuaweiHealthWebApi:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    # ---------- 注册 ----------
+
+    def register(self):
+        reg = self.plugin.context.register_web_api
+        reg(f"{PAGE_PREFIX}/status", self.get_status, ["GET"], "通道状态")
+        reg(f"{PAGE_PREFIX}/overview", self.overview, ["GET"], "数据概览")
+        reg(f"{PAGE_PREFIX}/cookie/import", self.import_cookie, ["POST"], "导入 cookie")
+        reg(f"{PAGE_PREFIX}/cookie/clear", self.clear_cookie, ["POST"], "清除 cookie")
+        reg(f"{PAGE_PREFIX}/refresh", self.refresh, ["POST"], "清缓存并重新认证")
+
+    # ---------- 工具 ----------
+
+    @staticmethod
+    def _fmt_ts(ts) -> str:
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            return "-"
+        if ts <= 0:
+            return "会话级"
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        except Exception:
+            return "-"
+
+    def _browser(self) -> dict:
+        p = self.plugin
+        try:
+            try:
+                from .hw_auth import find_browser
+            except ImportError:
+                from hw_auth import find_browser
+            path = find_browser((p.config.get("browser_path") or "").strip())
+        except Exception:
+            path = ""
+        return {"path": path, "found": bool(path)}
+
+    # ---------- 接口 ----------
+
+    async def get_status(self):
+        p = self.plugin
+        data = {
+            # 页面状态版本与插件元数据统一，避免前端误判部署版本。
+            "version": "v0.3.1",
+            "data_dir": p.data_dir,
+            "cookie_file": p.cookie_file,
+            "browser": self._browser(),
+            "config": {
+                "headless": bool(p.config.get("headless", True)),
+                "token_ttl": p.config.get("token_ttl", 3000),
+                "data_ttl": p.config.get("data_ttl", 600),
+                "warmup": bool(p.config.get("warmup", True)),
+            },
+        }
+
+        # cookie
+        cf = p.cookie_file
+        cinfo = {"exists": os.path.exists(cf), "count": 0, "mtime": "-", "keys": [], "error": ""}
+        if cinfo["exists"]:
+            try:
+                cookies = p.auth.load_cookies()
+                cinfo["count"] = len(cookies)
+                cinfo["mtime"] = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(cf)))
+                for c in cookies:
+                    if c.get("name") in KEY_COOKIES:
+                        cinfo["keys"].append({
+                            "name": c.get("name"),
+                            "domain": c.get("domain"),
+                            "expires": self._fmt_ts(c.get("expires")),
+                        })
+            except Exception as exc:
+                cinfo["error"] = str(exc)
+        data["cookie"] = cinfo
+
+        # token
+        tok = p.store.get("token") or {}
+        left = 0
+        if tok.get("expire_at"):
+            left = int(tok["expire_at"] - time.time())
+        data["token"] = {
+            "cached": bool(tok.get("token")),
+            "left": max(0, left),
+            "obtained_at": tok.get("obtained_at") or "-",
+        }
+
+        # 缓存
+        try:
+            keys = p.store.keys()
+        except Exception:
+            keys = []
+        data["cache"] = {"count": len(keys), "keys": keys[:20]}
+
+        return json_response({"status": "ok", "data": data})
+
+    async def overview(self):
+        """把所有已接入的数据项一次拉齐，给 WebUI 的「概览窗口」用。"""
+        p = self.plugin
+        async def add(key, title, producer, ttl=600):
+            try:
+                text = await p._cached("ov:%s" % key, producer, ttl=ttl)
+                return {"key": key, "title": title, "ok": True, "text": text}
+            except Exception as exc:
+                return {"key": key, "title": title, "ok": False, "text": p._err(exc)}
+
+        def fmt_acts(acts):
+            if not acts:
+                return "最近 30 天没有运动记录"
+            lines = ["最近 30 天共 %d 条：" % len(acts)]
+            for a in acts[:5]:
+                def v(*ks):
+                    for k in ks:
+                        if a.get(k) is not None:
+                            return a[k]
+                    return None
+                when = ""
+                ts = v("endTime", "startTime")
+                try:
+                    ms = int(ts)
+                    ms = ms / 1e6 if ms > 1e13 else ms
+                    when = time.strftime("%m-%d %H:%M", time.localtime(ms / 1000))
+                except Exception:
+                    when = str(ts)
+                bits = [when]
+                if v("activityType") is not None:
+                    bits.append("类型%s" % v("activityType"))
+                if v("distance"):
+                    bits.append("距离%s" % v("distance"))
+                if v("duration"):
+                    bits.append("时长%s" % v("duration"))
+                lines.append("  " + " ｜ ".join(str(b) for b in bits))
+            return "\n".join(lines)
+
+        # 最多同时请求 3 项，避免 WebUI 总览串行等待过久。
+        sem = asyncio.Semaphore(3)
+        async def limited(*args, **kwargs):
+            async with sem:
+                return await add(*args, **kwargs)
+        # gather 按传入顺序返回，保证并发后页面卡片顺序与原串行版本一致。
+        items = await asyncio.gather(
+            limited("heart", "静息心率（近 7 天）", lambda c: p._metric_text(c.resting_heart_rate(7), "bpm", 7, "静息心率", count_label="天")),
+            limited("sleep", "睡眠（近 7 晚）", lambda c: p._sleep_text(c.sleep_records(7), 7)),
+            limited("hrv", "睡眠 HRV", lambda c: p._metric_text(c.hrv_stats(7), "", 7, "HRV")),
+            limited("stress", "压力（近 7 天）", lambda c: p._metric_text(c.stress_stats(7), "", 7, "压力")),
+            limited("weight", "体重", lambda c: p._fmt_weight(c.body_weight(1095))),
+            limited("zones", "心率区间（储备心率）", lambda c: p._fmt_zones(c.heart_rate_zones())),
+            limited("perf", "运动能力与预测成绩", lambda c: p._fmt_perf(c.athletic_performance()), ttl=3600),
+            limited("pb", "个人纪录", lambda c: p._fmt_pb(c.personal_bests("running")), ttl=3600),
+            limited("acts", "近期运动", lambda c: fmt_acts(c.activities(30, 5))),
+        )
+
+        return json_response({"status": "ok", "data": {
+            "items": items,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }})
+
+    async def import_cookie(self):
+        p = self.plugin
+        try:
+            body = await request.json()
+        except Exception:
+            return json_response({"status": "error", "message": "请求体不是合法 JSON"},
+                                 status_code=400)
+        if not isinstance(body, dict):
+            return json_response({"status": "error", "message": "请求体必须是 JSON 对象"},
+                                 status_code=400)
+        text = (body.get("json") or "").strip()
+        fields = body.get("fields") if isinstance(body.get("fields"), dict) else {}
+        if not text and not any(str(v or "").strip() for v in fields.values()):
+            return json_response({"status": "error", "message": "cookie 内容为空"},
+                                 status_code=400)
+        try:
+            n = p.auth.import_cookie_sources(text, fields)
+        except Exception as exc:
+            return json_response({"status": "error", "message": str(exc)}, status_code=400)
+        # 换 cookie 时清除 token 及全部健康缓存，避免跨账号泄露旧数据。
+        await p._invalidate_auth_cache()
+        p.logger.info("[华为健康] WebUI 导入了 %d 条 cookie" % n)
+        return json_response({
+            "status": "ok",
+            "message": "已导入 %d 条 cookie，token 缓存已作废，下次查询会重新认证" % n,
+            "count": n,
+        })
+
+    async def clear_cookie(self):
+        p = self.plugin
+        try:
+            # 通过认证层的共享锁清除，避免与浏览器回写并发时旧 cookie 被恢复。
+            p.auth.clear_cookies()
+        except Exception as exc:
+            return json_response({"status": "error", "message": str(exc)}, status_code=500)
+        await p._invalidate_auth_cache()
+        p.logger.warning("[华为健康] WebUI 清除了 cookie 文件")
+        return json_response({"status": "ok", "message": "cookie 已清除，token 缓存已作废"})
+
+    async def refresh(self):
+        p = self.plugin
+        try:
+            # 统一推进缓存 generation，防止并发旧请求在刷新后写回。
+            await p._invalidate_auth_cache()
+        except Exception:
+            pass
+        try:
+            await p._token(force=True)
+        except Exception as exc:
+            return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
+        return json_response({"status": "ok", "message": "缓存已清空，并已重新拿到最新 token"})

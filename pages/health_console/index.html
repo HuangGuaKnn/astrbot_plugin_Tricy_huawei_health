@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>华为运动健康 · 控制面板</title>
+<style>
+  :root{
+    --bg:#fafafa; --panel:#fff; --line:#e4e4e7; --fg:#18181b; --muted:#71717a;
+    --accent:#2563eb; --ok:#15803d; --warn:#b45309; --err:#b91c1c; --code:#f4f4f5;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0f0f11; --panel:#17171a; --line:#2a2a30; --fg:#e9e9ec; --muted:#8f8f99;
+           --accent:#6ea8fe; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; --code:#1e1e22; }
+  }
+  html[data-theme="dark"]{ --bg:#0f0f11; --panel:#17171a; --line:#2a2a30; --fg:#e9e9ec; --muted:#8f8f99;
+           --accent:#6ea8fe; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; --code:#1e1e22; }
+  html[data-theme="light"]{ --bg:#fafafa; --panel:#fff; --line:#e4e4e7; --fg:#18181b; --muted:#71717a;
+           --accent:#2563eb; --ok:#15803d; --warn:#b45309; --err:#b91c1c; --code:#f4f4f5; }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:18px 18px 40px; background:var(--bg); color:var(--fg);
+    font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  .wrap{max-width:880px;margin:0 auto}
+  header{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+  h1{font-size:17px;font-weight:600;margin:0;letter-spacing:.2px}
+  .ver{font-size:12px;color:var(--muted)}
+  .sub{font-size:12.5px;color:var(--muted);margin:0 0 18px}
+  .theme-btn{margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);
+    border-radius:6px;padding:3px 9px;font-size:12px;cursor:pointer}
+  .theme-btn:hover{color:var(--fg)}
+
+  h2{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+     color:var(--muted);margin:24px 0 10px}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+
+  .kv{display:flex;flex-direction:column;gap:2px}
+  .kv .k{font-size:11.5px;color:var(--muted);letter-spacing:.03em}
+  .kv .v{font-size:13.5px;word-break:break-all}
+  .mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
+  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.err{background:var(--err)}
+
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:500;font-size:11.5px}
+  tr:last-child td{border-bottom:none}
+
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button.act{background:var(--panel);border:1px solid var(--line);color:var(--fg);
+    border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer}
+  button.act:hover{border-color:var(--accent);color:var(--accent)}
+  button.act[disabled]{opacity:.5;cursor:default}
+  button.act.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.act.primary:hover{opacity:.9;color:#fff}
+  button.act.danger:hover{border-color:var(--err);color:var(--err)}
+  button.act.sm{padding:4px 10px;font-size:12px}
+
+  textarea{width:100%;min-height:110px;background:var(--code);color:var(--fg);
+    border:1px solid var(--line);border-radius:6px;padding:10px;font-size:12px;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace;resize:vertical}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  .cookie-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px;margin:10px 0}
+  .cookie-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11.5px}
+  .cookie-field input{width:100%;background:var(--code);color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:7px 8px;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}
+  .cookie-field input:focus{outline:none;border-color:var(--accent)}
+
+  pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:12px;
+    font-size:12.5px;line-height:1.65;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-word;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+
+  .msg{margin-top:10px;font-size:12.5px;min-height:18px}
+  .msg.ok{color:var(--ok)} .msg.err{color:var(--err)} .msg.info{color:var(--muted)}
+  .hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.7}
+  code{background:var(--code);padding:1px 5px;border-radius:4px;font-size:12px}
+  .sep{height:1px;background:var(--line);margin:16px 0}
+
+  .diag{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 14px;font-size:12.5px}
+  .diag .st{color:var(--muted)}
+  #diagBox{margin-top:8px}
+
+  .ovgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:10px}
+  .ovcard{border:1px solid var(--line);border-radius:8px;padding:12px 14px;background:var(--code)}
+  .ovcard h3{font-size:12.5px;font-weight:600;margin:0 0 8px;display:flex;align-items:center;gap:6px;color:var(--fg)}
+  .ovcard pre{background:none;border:none;padding:0;font-size:12px;line-height:1.62}
+  .ovcard.bad h3{color:var(--err)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>华为运动健康</h1>
+    <span class="ver" id="ver">v-</span>
+    <button class="theme-btn" id="themeBtn">主题</button>
+  </header>
+  <p class="sub">数据来自华为运动健康网页端。cookie 注入 → 自动 OAuth 登录 → accessToken → 只读取数。</p>
+
+  <div class="diag">
+    <span id="diagSum"><span class="dot warn"></span>连接方式检测中…</span>
+    <button class="act sm" id="btnDiag" style="margin-left:auto">诊断详情</button>
+    <button class="act sm" id="btnReconnect">重连</button>
+  </div>
+  <div id="diagBox" style="display:none"><pre id="diagText">-</pre></div>
+
+  <h2>通道状态</h2>
+  <div class="card">
+    <div class="grid">
+      <div class="kv"><span class="k">COOKIE</span><span class="v" id="s_cookie">-</span></div>
+      <div class="kv"><span class="k">ACCESS TOKEN</span><span class="v" id="s_token">-</span></div>
+      <div class="kv"><span class="k">浏览器</span><span class="v mono" id="s_browser">-</span></div>
+      <div class="kv"><span class="k">缓存条目</span><span class="v" id="s_cache">-</span></div>
+    </div>
+    <div class="sep"></div>
+    <div class="kv"><span class="k">数据目录</span><span class="v mono" id="s_dir">-</span></div>
+    <div id="s_keys" style="margin-top:12px"></div>
+  </div>
+
+  <h2>操作</h2>
+  <div class="card">
+    <div class="row">
+      <button class="act primary" id="btnOverview">拉取全部数据</button>
+      <button class="act" id="btnRefresh">清缓存并重新认证</button>
+      <button class="act" id="btnStatus">刷新状态</button>
+    </div>
+    <div class="msg info" id="opMsg"></div>
+  </div>
+
+  <h2>数据概览</h2>
+  <div class="card">
+    <div id="overview" class="ovgrid">
+      <p class="hint" style="margin:0">点「拉取全部数据」，把已接入的各类数据一次拉齐。</p>
+    </div>
+    <div class="hint" id="ovAt" style="margin-top:10px"></div>
+  </div>
+
+  <h2>重新导入 Cookie</h2>
+  <div class="card">
+    <div class="hint" style="margin-top:0">
+      推荐按下面六项填写 cookie 值；CASTGC、sid、hwid_cas_sid 从 <code>id1.cloud.huawei.com</code> 域查看，
+      其余三项从健康页面查看。也可继续把 Cookie-Editor 导出的整段 JSON 粘到下方。
+    </div>
+    <div class="cookie-fields">
+      <label class="cookie-field">CASTGC（自动生成两个路径）<input id="cookie_CASTGC" autocomplete="off"></label>
+      <label class="cookie-field">sid<input id="cookie_sid" autocomplete="off"></label>
+      <label class="cookie-field">hwid_cas_sid<input id="cookie_hwid_cas_sid" autocomplete="off"></label>
+      <label class="cookie-field">HuaweiID_CAS_ISCASLOGIN<input id="cookie_HuaweiID_CAS_ISCASLOGIN" autocomplete="off"></label>
+      <label class="cookie-field">CASLOGINSITE<input id="cookie_CASLOGINSITE" autocomplete="off"></label>
+      <label class="cookie-field">LOGINACCSITE<input id="cookie_LOGINACCSITE" autocomplete="off"></label>
+    </div>
+    <textarea id="cookieBox" placeholder='[{"domain":".huawei.com","name":"sid","value":"...","path":"/","secure":true,"httpOnly":true,"sameSite":"no_restriction","expirationDate":1792669201}]'></textarea>
+    <div class="row" style="margin-top:10px">
+      <button class="act primary" id="btnImport">导入</button>
+      <button class="act danger" id="btnClear">清除 cookie</button>
+    </div>
+    <div class="msg" id="ckMsg"></div>
+  </div>
+
+  <p class="hint">
+    首次导入后插件会起一个无头浏览器完成 OAuth 授权（约 30 秒），之后按需取数走纯 HTTP。
+    cookie 过期时重新导出一次即可。<b>别删 <code>browser_profile</code> 目录</b> —— 里面是「信任设备」的浏览器指纹。
+  </p>
+</div>
+
+<!-- bridge SDK：AstrBot 会在响应时把它重写成带 asset_token 的完整 URL -->
+<script src="/api/plugin/page/bridge-sdk.js"></script>
+<script>
+(function(){
+"use strict";
+
+const $ = id => document.getElementById(id);
+const DIAG = {
+  hasBridge: false, inIframe: false, mode: "-", token: "",
+  bridgeSrc: "-", bridgeProbe: "-", lastReq: "-", lastErr: "-",
+};
+let bridge = null;
+let mode = "direct";
+
+/* ---------- 工具 ---------- */
+function inIframe(){ try{ return window.self !== window.top; }catch(e){ return true; } }
+
+function assetToken(){
+  try{
+    const q = new URLSearchParams(location.search);
+    const t = q.get("asset_token");
+    if(t) return t;
+  }catch(e){}
+  return "";
+}
+const TOKEN = assetToken();
+
+function withToken(url){
+  if(!TOKEN) return url;
+  return url + (url.indexOf("?") >= 0 ? "&" : "?") + "asset_token=" + encodeURIComponent(TOKEN);
+}
+
+function record(what, err){
+  DIAG.lastReq = what || DIAG.lastReq;
+  if(err) DIAG.lastErr = String(err && err.message ? err.message : err).slice(0, 300);
+}
+
+/* AstrBot 插件 API 的响应约定是 {status, message, data}，bridge 通常直接给 data；
+   两种形态都兼容，免得再踩一次。 */
+function unwrap(r){
+  if(r && typeof r === "object" && !Array.isArray(r) && "status" in r){
+    if(r.status === "error") throw new Error(r.message || "接口返回错误");
+    if("data" in r) return r.data;
+  }
+  return r;
+}
+
+/* ---------- 通道选择 ---------- */
+const DIRECT_PREFIX = "/api/v1/plugins/extensions/astrbot_plugin_huawei_health/page/";
+
+async function directApi(path, method, body){
+  const url = withToken(DIRECT_PREFIX + path.replace(/^\/+/, ""));
+  record(method + " " + url);
+  const opt = { method, credentials:"include", headers:{} };
+  if(method === "POST" && body){ opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch(url, opt);
+  if(!r.ok){
+    let m = "HTTP " + r.status;
+    try{ const j = await r.json(); if(j && (j.message || j.msg)) m = j.message || j.msg; }catch(e){}
+    const err = new Error(m);
+    record(null, err);
+    throw err;
+  }
+  return await r.json();
+}
+
+async function bridgeApi(path, method, body){
+  const p = "page/" + path.replace(/^\/+/, "");
+  record("bridge " + method + " " + p);
+  try{
+    const r = (method === "GET") ? await bridge.apiGet(p) : await bridge.apiPost(p, body || {});
+    return r;
+  }catch(e){ record(null, e); throw e; }
+}
+
+async function callApi(path, method, body){
+  if(mode === "bridge" && bridge){
+    try{ return await bridgeApi(path, method, body); }
+    catch(e){ console.warn("[华为健康] bridge 调用失败，降级直连", e); }
+  }
+  return directApi(path, method, body);
+}
+const apiGet = p => callApi(p, "GET");
+const apiPost = (p, b) => callApi(p, "POST", b);
+
+async function selectMode(force){
+  DIAG.hasBridge = (typeof window.AstrBotPluginPage !== "undefined") || (typeof window.AstrBotPluginView !== "undefined");
+  DIAG.inIframe = inIframe();
+  bridge = window.AstrBotPluginPage || window.AstrBotPluginView || null;
+
+  if(!DIAG.inIframe){ mode = "direct"; DIAG.mode = mode; return "独立窗口 → 直连"; }
+  if(!bridge){ mode = "direct"; DIAG.mode = mode; return "iframe 内但 bridge 未加载 → 直连"; }
+  try{
+    await Promise.race([
+      bridge.ready(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("bridge.ready() 超时")), 4000)),
+    ]);
+    mode = "bridge";
+    DIAG.mode = mode;
+    return "iframe + bridge → 桥接";
+  }catch(e){
+    record(null, e);
+    mode = "direct";
+    DIAG.mode = mode;
+    return "bridge 未就绪（" + e.message + "）→ 直连";
+  }
+}
+
+/* ---------- 诊断 ---------- */
+function renderDiag(summary){
+  const okBridge = DIAG.mode === "bridge";
+  $("diagSum").innerHTML = '<span class="dot ' + (okBridge ? "ok" : "warn") + '"></span>' +
+    "当前通道：<b>" + DIAG.mode + "</b>　" + (summary || "");
+  $("diagText").textContent = [
+    "页面地址      : " + location.href.slice(0, 200),
+    "运行环境      : " + (DIAG.inIframe ? "iframe（父窗口 = AstrBot WebUI）" : "独立窗口"),
+    "bridge 对象   : " + (DIAG.hasBridge ? "存在（window.AstrBotPlugin" + (window.AstrBotPluginPage ? "Page" : "View") + "）" : "不存在"),
+    "bridge 脚本   : " + DIAG.bridgeSrc,
+    "脚本探测      : " + DIAG.bridgeProbe,
+    "asset_token   : " + (TOKEN ? "有（" + TOKEN.length + " 字符）" : "无"),
+    "API 模式      : " + DIAG.mode,
+    "最近请求      : " + DIAG.lastReq,
+    "最近错误      : " + DIAG.lastErr,
+  ].join("\n");
+}
+
+async function probeBridgeScript(){
+  const el = document.querySelector('script[src*="bridge-sdk"]');
+  DIAG.bridgeSrc = el ? el.src.slice(0, 180) : "页面上没找到 bridge-sdk 标签";
+  if(!el) return;
+  try{
+    const r = await fetch(el.src, { credentials:"include" });
+    DIAG.bridgeProbe = "HTTP " + r.status + (r.ok ? "（脚本可取）" : "（脚本取不到）");
+  }catch(e){
+    DIAG.bridgeProbe = "请求失败：" + e.message;
+  }
+}
+
+/* ---------- 主题 ---------- */
+function applyTheme(t){
+  if(t === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  try{ localStorage.setItem("hw_health_theme", t); }catch(e){}
+}
+(function initTheme(){
+  let t = "auto";
+  try{ t = localStorage.getItem("hw_health_theme") || "auto"; }catch(e){}
+  applyTheme(t);
+  $("themeBtn").onclick = () => {
+    let cur = "auto";
+    try{ cur = localStorage.getItem("hw_health_theme") || "auto"; }catch(e){}
+    applyTheme(cur === "auto" ? "light" : cur === "light" ? "dark" : "auto");
+  };
+})();
+
+/* ---------- 渲染 ---------- */
+function setMsg(el, text, cls){ el.className = "msg " + (cls || "info"); el.textContent = text; }
+
+function renderStatus(d){
+  $("ver").textContent = d.version || "v-";
+  const ck = d.cookie || {};
+  if(ck.error){ $("s_cookie").innerHTML = '<span class="dot err"></span>读取失败'; }
+  else if(!ck.exists){ $("s_cookie").innerHTML = '<span class="dot err"></span>没有，需要导入'; }
+  else { $("s_cookie").innerHTML = '<span class="dot ok"></span>' + ck.count + ' 条 · ' + ck.mtime; }
+
+  const tk = d.token || {};
+  if(tk.cached && tk.left > 0){ $("s_token").innerHTML = '<span class="dot ok"></span>有效，剩 ' + tk.left + ' 秒'; }
+  else if(tk.cached){ $("s_token").innerHTML = '<span class="dot warn"></span>已过期（下次查询自动续）'; }
+  else{ $("s_token").innerHTML = '<span class="dot warn"></span>未缓存'; }
+
+  const br = d.browser || {};
+  $("s_browser").innerHTML = br.found
+    ? '<span class="dot ok"></span>' + (br.path || "").split(/[\\/]/).pop()
+    : '<span class="dot err"></span>未找到';
+  $("s_browser").title = br.path || "";
+
+  $("s_cache").textContent = (d.cache && d.cache.count != null) ? d.cache.count + " 条" : "-";
+  $("s_dir").textContent = d.data_dir || "-";
+
+  const keys = (ck.keys || []);
+  // cookie 名称和域名来自本地导入文件，使用 DOM API 赋值，避免恶意值进入 innerHTML。
+  const keyBox = $("s_keys");
+  keyBox.replaceChildren();
+  if(keys.length){
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for(const label of ["关键 cookie", "域", "到期"]){
+      const th = document.createElement("th");
+      th.textContent = label;
+      headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    for(const k of keys){
+      const row = document.createElement("tr");
+      for(const [value, className] of [[k.name, "mono"], [k.domain || "", "mono"], [k.expires, ""]]){
+        const td = document.createElement("td");
+        if(className) td.className = className;
+        td.textContent = value == null ? "" : String(value);
+        row.appendChild(td);
+      }
+      tbody.appendChild(row);
+    }
+    table.appendChild(tbody);
+    keyBox.appendChild(table);
+  }
+}
+
+async function loadStatus(silent){
+  try{
+    const d = unwrap(await apiGet("status"));
+    renderStatus(d || {});
+    if(!silent) setMsg($("opMsg"), "状态已刷新", "ok");
+  }catch(e){
+    if(!silent) setMsg($("opMsg"), "状态读取失败：" + e.message, "err");
+  }
+  renderDiag();
+}
+
+function renderOverview(d){
+  const box = $("overview");
+  box.innerHTML = "";
+  const items = (d && d.items) || [];
+  if(!items.length){
+    box.innerHTML = '<p class="hint" style="margin:0">没有拿到任何数据项。</p>';
+    return;
+  }
+  for(const it of items){
+    const div = document.createElement("div");
+    div.className = "ovcard" + (it.ok ? "" : " bad");
+    const h = document.createElement("h3");
+    // 标题当前来自服务端常量，但仍用 textContent，避免未来接入动态数据后形成注入面。
+    const dot = document.createElement("span");
+    dot.className = "dot " + (it.ok ? "ok" : "err");
+    h.appendChild(dot);
+    const title = document.createElement("span");
+    title.textContent = it.title || it.key || "";
+    h.appendChild(title);
+    const pre = document.createElement("pre");
+    pre.textContent = it.text || "-";
+    div.appendChild(h);
+    div.appendChild(pre);
+    box.appendChild(div);
+  }
+  $("ovAt").textContent = d.at ? "取数时间 " + d.at : "";
+}
+
+async function doOverview(){
+  const b = $("btnOverview"); b.disabled = true;
+  setMsg($("opMsg"), "正在从华为云端拉取全部数据…", "info");
+  $("overview").innerHTML = '<p class="hint" style="margin:0">取数中…（首次可能需要 30 秒走一次自动认证）</p>';
+  try{
+    const d = unwrap(await apiGet("overview")) || {};
+    renderOverview(d);
+    setMsg($("opMsg"), "取数完成", "ok");
+    loadStatus(true);
+  }catch(e){
+    $("overview").innerHTML = '<p class="hint" style="margin:0">取数失败。</p>';
+    setMsg($("opMsg"), "取数失败：" + e.message, "err");
+  }finally{ b.disabled = false; renderDiag(); }
+}
+
+async function doRefresh(){
+  const b = $("btnRefresh"); b.disabled = true;
+  setMsg($("opMsg"), "正在清缓存并重新认证…", "info");
+  try{
+    unwrap(await apiPost("refresh", {}));
+    setMsg($("opMsg"), "缓存已清空，token 已重新获取", "ok");
+    loadStatus(true);
+  }catch(e){ setMsg($("opMsg"), "失败：" + e.message, "err"); }
+  finally{ b.disabled = false; renderDiag(); }
+}
+
+async function doImport(){
+  const text = $("cookieBox").value.trim();
+  const fieldIds = ["CASTGC", "sid", "hwid_cas_sid", "HuaweiID_CAS_ISCASLOGIN", "CASLOGINSITE", "LOGINACCSITE"];
+  const fields = {};
+  let hasField = false;
+  for(const name of fieldIds){
+    const value = ($("cookie_" + name).value || "").trim();
+    fields[name] = value;
+    if(value) hasField = true;
+  }
+  if(!text && !hasField){ setMsg($("ckMsg"), "请填写六条分项值或粘贴 cookie JSON", "err"); return; }
+  const b = $("btnImport"); b.disabled = true;
+  setMsg($("ckMsg"), "导入中…", "info");
+  try{
+    const d = unwrap(await apiPost("cookie/import", { json: text, fields })) || {};
+    setMsg($("ckMsg"), d.message || ("已导入 " + (d.count || "?") + " 条 cookie"), "ok");
+    $("cookieBox").value = "";
+    for(const name of fieldIds) $("cookie_" + name).value = "";
+    loadStatus(true);
+  }catch(e){ setMsg($("ckMsg"), "导入失败：" + e.message, "err"); }
+  finally{ b.disabled = false; renderDiag(); }
+}
+
+async function doClear(){
+  if(!confirm("确定清除 cookie 文件？清除后需要重新导入才能取数。")) return;
+  const b = $("btnClear"); b.disabled = true;
+  try{
+    const d = unwrap(await apiPost("cookie/clear", {})) || {};
+    setMsg($("ckMsg"), d.message || "cookie 已清除", "ok");
+    loadStatus(true);
+  }catch(e){ setMsg($("ckMsg"), "失败：" + e.message, "err"); }
+  finally{ b.disabled = false; }
+}
+
+/* ---------- 启动 ---------- */
+(async function(){
+  $("btnOverview").onclick = doOverview;
+  $("btnRefresh").onclick = doRefresh;
+  $("btnStatus").onclick = loadStatus;
+  $("btnImport").onclick = doImport;
+  $("btnClear").onclick = doClear;
+  $("btnDiag").onclick = () => {
+    const box = $("diagBox");
+    box.style.display = box.style.display === "none" ? "block" : "none";
+    renderDiag();
+  };
+  $("btnReconnect").onclick = async () => {
+    setMsg($("opMsg"), "重新检测通道…", "info");
+    const s = await selectMode(true);
+    await probeBridgeScript();
+    renderDiag(s);
+    loadStatus();
+  };
+
+  const summary = await selectMode(true);
+  await probeBridgeScript();
+  renderDiag(summary);
+  loadStatus();
+})();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,92 @@
+{
+    "cookie_json": {
+        "description": "Cookie JSON（Cookie-Editor 从华为运动健康网页端导出，整段粘贴）",
+        "hint": "兼容旧配置：整段粘贴 Cookie-Editor JSON。新配置建议填写下面六条分项值；留空则读取插件数据目录下的 hw_cookies.json",
+        "type": "text",
+        "default": ""
+    },
+    "cookie_CASTGC": {
+        "description": "CASTGC（分项 cookie 值）",
+        "hint": "从 .id1.cloud.huawei.com 的 /CAS 或 /UnifiedIDMPortal cookie 中复制，只填值；插件会自动生成两个路径",
+        "type": "string",
+        "default": ""
+    },
+    "cookie_sid": {
+        "description": "sid（分项 cookie 值）",
+        "hint": "从 .id1.cloud.huawei.com 域复制，只填值",
+        "type": "string",
+        "default": ""
+    },
+    "cookie_hwid_cas_sid": {
+        "description": "hwid_cas_sid（分项 cookie 值）",
+        "hint": "从 .id1.cloud.huawei.com 域复制，只填值",
+        "type": "string",
+        "default": ""
+    },
+    "cookie_HuaweiID_CAS_ISCASLOGIN": {
+        "description": "HuaweiID_CAS_ISCASLOGIN（分项 cookie 值）",
+        "hint": "从 .huawei.com 域复制，通常为 true",
+        "type": "string",
+        "default": ""
+    },
+    "cookie_CASLOGINSITE": {
+        "description": "CASLOGINSITE（分项 cookie 值）",
+        "hint": "从 .huawei.com 域复制，只填值",
+        "type": "string",
+        "default": ""
+    },
+    "cookie_LOGINACCSITE": {
+        "description": "LOGINACCSITE（分项 cookie 值）",
+        "hint": "从 .huawei.com 域复制，只填值",
+        "type": "string",
+        "default": ""
+    },
+    "browser_path": {
+        "description": "浏览器可执行文件路径",
+        "hint": "留空自动探测 Edge / Chrome。插件需要一个浏览器来完成「注入 cookie → 自动 OAuth」这一步",
+        "type": "string",
+        "default": ""
+    },
+    "headless": {
+        "description": "无头模式运行浏览器",
+        "hint": "建议开启。首次调试若失败可关闭，能看见浏览器窗口便于排查",
+        "type": "bool",
+        "default": true
+    },
+    "page_timeout": {
+        "description": "认证浏览器页面/CDP 超时秒数",
+        "hint": "默认 90 秒；用于限制浏览器启动、页面等待和 CDP 调用",
+        "type": "int",
+        "default": 90
+    },
+    "token_ttl": {
+        "description": "accessToken 缓存秒数",
+        "hint": "华为 token 约 1 小时有效，默认 3000 秒（50 分钟）留余量",
+        "type": "int",
+        "default": 3000
+    },
+    "data_ttl": {
+        "description": "健康数据缓存秒数",
+        "hint": "同一份数据在此时间内不重复请求华为，默认 600 秒",
+        "type": "int",
+        "default": 600
+    },
+    "warmup": {
+        "description": "启动时后台预热 token",
+        "hint": "开启后插件启动 8 秒会自己拿一次 token，主人第一次提问就不用等浏览器启动（约 30 秒）",
+        "type": "bool",
+        "default": true
+    },
+    "client_id": {
+        "description": "x-client-id",
+        "hint": "华为网页端的应用标识，除非接口变更否则不要改",
+        "type": "string",
+        "default": "106533743"
+    },
+    "api_version": {
+        "description": "x-version",
+        "hint": "华为网页端的版本号，除非接口变更否则不要改",
+        "type": "string",
+        "default": "HealthKitRunningGroupPortal_6.26.4.200"
+    }
+}
