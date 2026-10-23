@@ -22,13 +22,13 @@ try:  # 插件作为包加载
     from .hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS
     from .hw_client import AuthExpired, HuaweiHealthClient, HuaweiHealthError
     from .hw_store import HealthStore
-    from .hw_login import HuaweiLoginManager
+    from .hw_login import HuaweiLoginManager, LoginFlowError
     from .hw_credentials import HuaweiCredentialsStore
 except ImportError:  # 插件目录在 sys.path 里
     from hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS
     from hw_client import AuthExpired, HuaweiHealthClient, HuaweiHealthError
     from hw_store import HealthStore
-    from hw_login import HuaweiLoginManager
+    from hw_login import HuaweiLoginManager, LoginFlowError
     from hw_credentials import HuaweiCredentialsStore
 
 PLUGIN_NAME = "astrbot_plugin_huawei_health"
@@ -129,6 +129,32 @@ class HuaweiHealthPlugin(Star):
             logger=self.logger,
         )
 
+    async def _password_token(self) -> str:
+        """Run or join the single DPAPI-backed auto-login session."""
+        try:
+            await asyncio.to_thread(self.login_manager.start, "auto")
+        except LoginFlowError as exc:
+            messages = {
+                "credentials_missing": "尚未保存账号密码，请先在 WebUI 凭据区保存。",
+                "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式。",
+                "daily_limit": "今日自动登录次数已达上限，请稍后再试。",
+                "cooldown": "自动登录失败冷却中，请稍后再试。",
+            }
+            raise HuaweiAuthError(messages.get(exc.code, "自动登录无法启动，请查看 WebUI 登录状态。")) from exc
+        deadline = time.monotonic() + max(120, int(self.login_manager.session_timeout) + 120)
+        while time.monotonic() < deadline:
+            status = self.login_manager.status()
+            if status.get("state") == "DONE":
+                cached = self.store.get("token") or {}
+                token = cached.get("token")
+                if token:
+                    return token
+                raise HuaweiAuthError("自动登录完成但未拿到有效 token。")
+            if status.get("state") == "FAILED":
+                raise HuaweiAuthError("自动登录失败，请查看 WebUI 登录状态。")
+            await asyncio.sleep(0.5)
+        raise HuaweiAuthError("自动登录等待超时，请重新开始。")
+
     async def _token(self, force: bool = False, stale_token: str = "") -> str:
         """取 accessToken：内存 → SQLite → 起浏览器自动登录。"""
         if not force:
@@ -146,8 +172,13 @@ class HuaweiHealthPlugin(Star):
 
             ttl = int(self.config.get("token_ttl", 3000))
             # 保留认证对象引用，读取页面真实 expireTime；旧页面没有该字段时回退配置 TTL。
-            auth = self.auth
-            token = await asyncio.to_thread(auth.fetch_token)
+            login_manager = getattr(self, "login_manager", None)
+            if getattr(login_manager, "login_mode", "cookie") == "password":
+                token = await self._password_token()
+                auth = self.auth
+            else:
+                auth = self.auth
+                token = await asyncio.to_thread(auth.fetch_token)
             now = time.time()
             actual_expire_at = float(getattr(auth, "token_expire_at", 0.0) or 0.0)
             if actual_expire_at > now:

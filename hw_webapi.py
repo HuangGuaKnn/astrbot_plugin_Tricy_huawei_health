@@ -327,7 +327,7 @@ class HuaweiHealthWebApi:
             "status": "ok", "data": self._credentials_status_data(), "message": "账号密码已加密保存",
         })
 
-    # ---------- 登录会话（v0.4.0 第 2 阶段：验证码与信任选择） ----------
+    # ---------- 登录会话（v0.4.0 第 4 阶段：自动登录与降级） ----------
 
     async def login_start(self):
         p = self.plugin
@@ -339,16 +339,29 @@ class HuaweiHealthWebApi:
             body = {}
         mode = str(body.get("mode") or "manual").strip().lower()
         auto_trust = body.get("auto_trust") if isinstance(body.get("auto_trust"), bool) else None
+        allow_visible_fallback = (
+            body.get("allow_visible_fallback")
+            if isinstance(body.get("allow_visible_fallback"), bool) else None
+        )
         try:
-            data = p.login_manager.start(mode, auto_trust=auto_trust)
+            data = p.login_manager.start(
+                mode, auto_trust=auto_trust, allow_visible_fallback=allow_visible_fallback,
+            )
         except LoginFlowError as exc:
             message = {
                 "trust_invalid": "自动信任选项无效",
-            }.get(exc.code, "当前阶段只支持在可见浏览器窗口中手动完成登录")
+                "fallback_invalid": "可见窗口兜底选项无效",
+                "credentials_missing": "尚未保存账号密码，请先在凭据区保存",
+                "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式",
+                "daily_limit": "今日自动登录次数已达上限，请稍后再试",
+                "cooldown": "自动登录失败冷却中，请稍后再试",
+                "unsupported": "登录模式无效",
+            }.get(exc.code, "登录启动失败，请稍后重试")
+            status = 429 if exc.code in ("daily_limit", "cooldown") else 409
             return json_response({
                 "status": "error",
                 "message": message,
-            }, status_code=400)
+            }, status_code=status)
         return json_response({"status": "ok", "data": data})
 
     async def login_status(self):

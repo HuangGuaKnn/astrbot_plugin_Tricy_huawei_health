@@ -143,15 +143,16 @@
   <h2>账号登录</h2>
   <div class="card">
     <div class="hint" style="margin-top:0">
-      会打开一个独立的可见浏览器窗口。账号和密码仍在窗口中输入；遇到手机验证码时，
-      可以把 6 位验证码填到这里提交。插件只观察登录结果并把新会话保存为 Cookie。
-      账号密码和验证码不会写入状态或日志。
+      默认打开独立的可见浏览器窗口；勾选无头自动登录后，会使用已保存的 DPAPI 凭据自动填入账号密码。
+      遇到手机验证码时，可以把 6 位验证码填到这里提交。账号密码和验证码不会写入状态或日志。
     </div>
     <div class="row" style="margin-top:10px">
       <button class="act primary" id="btnLoginStart">打开浏览器开始登录</button>
       <button class="act danger" id="btnLoginCancel" disabled>取消登录</button>
       <button class="act sm" id="btnLoginStatus">刷新登录状态</button>
       <label class="hint" style="margin:0"><input type="checkbox" id="loginAutoTrust" checked> 自动信任此浏览器</label>
+      <label class="hint" style="margin:0"><input type="checkbox" id="loginUseAuto"> 无头自动登录</label>
+      <label class="hint" style="margin:0"><input type="checkbox" id="loginVisibleFallback"> 自动失败时打开可见窗口</label>
     </div>
     <div class="login-state">
       <span class="left" id="loginState">未开始</span>
@@ -175,7 +176,7 @@
   <div class="card">
     <div class="hint" style="margin-top:0">
       仅在你主动保存后启用账号密码模式。凭据只写入本机 Windows DPAPI 加密文件，页面不会回填密码；
-      当前阶段先完成安全存储，自动填充登录将在下一阶段接入。
+      登录区可选择无头自动登录；遇到验证码仍由 WebUI 提交，自动失败时可选择打开可见窗口兜底。
     </div>
     <div class="credential-fields">
       <label class="credential-field">华为账号<input id="credentialAccount" autocomplete="username"></label>
@@ -501,7 +502,7 @@ async function doRefresh(){
   finally{ b.disabled = false; renderDiag(); }
 }
 
-/* ---------- 账号登录（第 2 阶段：验证码与信任选择） ---------- */
+/* ---------- 账号登录（第 4 阶段：自动登录与降级） ---------- */
 let loginPollTimer = null;
 
 function renderLoginStatus(d){
@@ -524,6 +525,7 @@ function renderLoginStatus(d){
   $("btnLoginSms").disabled = !need.sms;
   document.querySelectorAll("[data-login-trust]").forEach(btn => { btn.disabled = !need.trust; });
   if(typeof d.auto_trust === "boolean") $("loginAutoTrust").checked = d.auto_trust;
+  if(active && d.mode === "auto") $("loginUseAuto").checked = true;
   if(active && !loginPollTimer){
     loginPollTimer = window.setInterval(() => loadLoginStatus(true), 2000);
   }else if(!active && loginPollTimer){
@@ -544,13 +546,15 @@ async function loadLoginStatus(silent){
 
 async function doLoginStart(){
   const b = $("btnLoginStart"); b.disabled = true;
-  setMsg($("loginMsg"), "正在启动可见浏览器…", "info");
+  setMsg($("loginMsg"), $("loginUseAuto").checked ? "正在启动无头自动登录…" : "正在启动可见浏览器…", "info");
   try{
     const d = unwrap(await apiPost("login/start", {
-      mode:"manual", auto_trust:$("loginAutoTrust").checked,
+      mode:$("loginUseAuto").checked ? "auto" : "manual",
+      auto_trust:$("loginAutoTrust").checked,
+      allow_visible_fallback:$("loginVisibleFallback").checked,
     })) || {};
     renderLoginStatus(d);
-    setMsg($("loginMsg"), "浏览器已启动，请按窗口提示完成登录", "ok");
+    setMsg($("loginMsg"), $("loginUseAuto").checked ? "自动登录已启动，等待页面结果" : "浏览器已启动，请按窗口提示完成登录", "ok");
   }catch(e){
     setMsg($("loginMsg"), "登录启动失败：" + e.message, "err");
     loadLoginStatus(true);
