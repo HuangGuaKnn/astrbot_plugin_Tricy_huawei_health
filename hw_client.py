@@ -68,7 +68,7 @@ def _fmt_day(value) -> str:
 
 def _parse_stats(raw: dict) -> dict:
     """把 periodStatistics 的 results + groupResults 压成 {overall, daily}。"""
-    # TODO(v0.3.1)：为纯解析函数补充 fixture 单测，覆盖字段漂移和异常响应。
+    # TODO(v0.3.2)：为纯解析函数补充 fixture 单测，覆盖字段漂移和异常响应。
     overall = {}
     for item in raw.get("results") or []:
         fn = item.get("fieldName")
@@ -87,7 +87,7 @@ def _parse_stats(raw: dict) -> dict:
 
 def _day_window(days: int):
     days = max(1, min(int(days), 730))
-    # TODO(v0.3.1)：显式使用 Asia/Shanghai 日历，当前契约仍固定传 +0800。
+    # TODO(v0.3.2)：显式使用 Asia/Shanghai 日历，当前契约仍固定传 +0800。
     today = datetime.date.today()
     start = today - datetime.timedelta(days=days - 1)
     return start.strftime("%Y%m%d"), today.strftime("%Y%m%d")
@@ -213,7 +213,7 @@ class HuaweiHealthClient:
 
     def sleep_records(self, days: int = 7) -> list:
         """睡眠明细（GET /healthRecords，纳秒窗口）。"""
-        # TODO(v0.3.1)：按 startTime 排序并按睡眠夜晚语义取最近记录。
+        # TODO(v0.3.2)：按 startTime 排序并按睡眠夜晚语义取最近记录。
         days = max(1, min(int(days), 730))
         now = datetime.datetime.now()
         start = now - datetime.timedelta(days=days)
@@ -273,7 +273,7 @@ class HuaweiHealthClient:
         """储备心率区间阈值（GET /sampleConfigs）。"""
         raw = self._get("/sampleConfigs", params={
             "type": HR_ZONE_CONFIG_TYPE, "id": HR_ZONE_CONFIG_ID})
-        # TODO(v0.3.1)：核实华为端区间字段的真实语义和上下界，避免仅凭字段名推断顺序。
+        # TODO(v0.3.2)：核实华为端区间字段的真实语义和上下界，避免仅凭字段名推断顺序。
         for item in (raw.get("sampleConfigs") or []):
             cfg = item.get("configData")
             if not cfg:

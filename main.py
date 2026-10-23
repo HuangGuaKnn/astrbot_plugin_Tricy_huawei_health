@@ -256,7 +256,7 @@ class HuaweiHealthPlugin(Star):
 
     def _metric_text(self, parsed: dict, unit: str, days: int, name: str,
                      count_label: str = "条") -> str:
-        # TODO(v0.3.1)：逐日输出补充 min/count，当前仅保留既有 avg/max 口径。
+        # TODO(v0.3.2)：逐日输出补充 min/count，当前仅保留既有 avg/max 口径。
         overall = parsed.get("overall") or {}
         daily = parsed.get("daily") or []
         if not overall and not daily:

@@ -90,7 +90,7 @@ def cookies_from_fields(fields) -> list:
 
 
 def parse_cookie_fields(text: str) -> dict:
-    """解析「名称=值」或按六项顺序填写的多行文本。"""
+    """解析「名称=值/名称:值」或按六项顺序填写的多行文本。"""
     lines = [line.strip() for line in str(text or "").splitlines()
              if line.strip() and not line.strip().startswith("#")]
     if not lines:
@@ -98,13 +98,22 @@ def parse_cookie_fields(text: str) -> dict:
     fields = {}
     named = False
     ordered = []
+    known = {_cookie_field_key(n) for n, _, _ in MIN_COOKIE_SPECS}
     for line in lines:
-        if "=" in line:
-            key, value = line.split("=", 1)
-            if _cookie_field_key(key) in {_cookie_field_key(n) for n, _, _ in MIN_COOKIE_SPECS}:
+        # 只有分隔符左侧归一化后命中已知名称，才把该行视为键值行；
+        # 否则整行保留为纯值，避免 CASTGC 等带 base64 padding 的值错位。
+        handled = False
+        for separator in ("=", ":", "："):
+            if separator not in line:
+                continue
+            key, value = line.split(separator, 1)
+            if _cookie_field_key(key) in known:
                 fields[key.strip()] = value.strip()
                 named = True
-                continue
+                handled = True
+                break
+        if handled:
+            continue
         ordered.append(line)
     if not named:
         for (name, _, _), value in zip(MIN_COOKIE_SPECS, ordered):
@@ -546,6 +555,11 @@ class HuaweiAuth:
                 proc.wait(timeout=3)
             except Exception:
                 pass
+        # Edge 的启动器可能在 taskkill 前已自行退出，按 profile 路径补清真正的浏览器进程。
+        try:
+            self._cleanup_orphan_browsers()
+        except Exception:
+            pass
 
     def _js(self, ws, expr: str):
         r = self._call(ws, "Runtime.evaluate", {
