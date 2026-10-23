@@ -22,10 +22,12 @@ try:  # 插件作为包加载
     from .hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS
     from .hw_client import AuthExpired, HuaweiHealthClient, HuaweiHealthError
     from .hw_store import HealthStore
+    from .hw_login import HuaweiLoginManager
 except ImportError:  # 插件目录在 sys.path 里
     from hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS
     from hw_client import AuthExpired, HuaweiHealthClient, HuaweiHealthError
     from hw_store import HealthStore
+    from hw_login import HuaweiLoginManager
 
 PLUGIN_NAME = "astrbot_plugin_huawei_health"
 DEFAULT_CLIENT_ID = "106533743"
@@ -56,7 +58,7 @@ def _data_dir() -> str:
     PLUGIN_NAME,
     "Knn",
     "把华为运动健康（网页端）的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot",
-    "v0.3.1",
+    "v0.4.0",
 )
 class HuaweiHealthPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -72,6 +74,7 @@ class HuaweiHealthPlugin(Star):
         # generation 用于阻止刷新后旧请求把结果写回缓存。
         self._cache_generation = {}
         self._warmup_task = None
+        self.login_manager = HuaweiLoginManager(self)
         self.logger = logger
 
     async def initialize(self):
@@ -665,4 +668,6 @@ class HuaweiHealthPlugin(Star):
                 await self._warmup_task
             except asyncio.CancelledError:
                 pass
+        if self.login_manager:
+            await asyncio.to_thread(self.login_manager.stop)
         self.logger.info("[华为健康] 插件已卸载/停用。")

@@ -12,6 +12,11 @@ import time
 
 from astrbot.api.web import json_response, request
 
+try:
+    from .hw_login import LoginFlowError
+except ImportError:
+    from hw_login import LoginFlowError
+
 PAGE_PREFIX = "astrbot_plugin_huawei_health/page"
 
 #: cookie 里最关键的几个（决定「信任设备」是否还在）
@@ -34,6 +39,12 @@ class HuaweiHealthWebApi:
         reg(f"{PAGE_PREFIX}/cookie/import", self.import_cookie, ["POST"], "导入 cookie")
         reg(f"{PAGE_PREFIX}/cookie/clear", self.clear_cookie, ["POST"], "清除 cookie")
         reg(f"{PAGE_PREFIX}/refresh", self.refresh, ["POST"], "清缓存并重新认证")
+        reg(f"{PAGE_PREFIX}/login/start", self.login_start, ["POST"], "开始网页登录")
+        reg(f"{PAGE_PREFIX}/login/status", self.login_status, ["GET"], "网页登录状态")
+        reg(f"{PAGE_PREFIX}/login/account", self.login_account, ["POST"], "提交网页登录账号")
+        reg(f"{PAGE_PREFIX}/login/sms", self.login_sms, ["POST"], "提交网页登录验证码")
+        reg(f"{PAGE_PREFIX}/login/trust", self.login_trust, ["POST"], "提交网页登录信任选择")
+        reg(f"{PAGE_PREFIX}/login/cancel", self.login_cancel, ["POST"], "取消网页登录")
 
     # ---------- 工具 ----------
 
@@ -68,7 +79,7 @@ class HuaweiHealthWebApi:
         p = self.plugin
         data = {
             # 页面状态版本与插件元数据统一，避免前端误判部署版本。
-            "version": "v0.3.1",
+            "version": "v0.4.0",
             "data_dir": p.data_dir,
             "cookie_file": p.cookie_file,
             "browser": self._browser(),
@@ -232,3 +243,49 @@ class HuaweiHealthWebApi:
         except Exception as exc:
             return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         return json_response({"status": "ok", "message": "缓存已清空，并已重新拿到最新 token"})
+
+    # ---------- 登录会话（v0.4.0 第 1 阶段：可见浏览器人工操作） ----------
+
+    async def login_start(self):
+        p = self.plugin
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        mode = str(body.get("mode") or "manual").strip().lower()
+        try:
+            data = p.login_manager.start(mode)
+        except LoginFlowError:
+            return json_response({
+                "status": "error",
+                "message": "当前阶段只支持在可见浏览器窗口中手动完成登录",
+            }, status_code=400)
+        return json_response({"status": "ok", "data": data})
+
+    async def login_status(self):
+        return json_response({"status": "ok", "data": self.plugin.login_manager.status()})
+
+    async def login_account(self):
+        # 账号密码暂不经过插件接口；第 1 阶段统一在可见浏览器窗口内输入。
+        return json_response({
+            "status": "error",
+            "message": "当前阶段请在已打开的浏览器窗口中输入账号和密码",
+        }, status_code=409)
+
+    async def login_sms(self):
+        return json_response({
+            "status": "error",
+            "message": "当前阶段请在浏览器窗口中输入验证码",
+        }, status_code=409)
+
+    async def login_trust(self):
+        return json_response({
+            "status": "error",
+            "message": "当前阶段请在浏览器窗口中选择信任方式",
+        }, status_code=409)
+
+    async def login_cancel(self):
+        data = await asyncio.to_thread(self.plugin.login_manager.cancel)
+        return json_response({"status": "ok", "data": data, "message": "登录已取消"})

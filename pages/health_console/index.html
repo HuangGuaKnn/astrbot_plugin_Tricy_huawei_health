@@ -91,6 +91,9 @@
   .ovcard h3{font-size:12.5px;font-weight:600;margin:0 0 8px;display:flex;align-items:center;gap:6px;color:var(--fg)}
   .ovcard pre{background:none;border:none;padding:0;font-size:12px;line-height:1.62}
   .ovcard.bad h3{color:var(--err)}
+  .login-state{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:13px}
+  .login-state .left{color:var(--muted)}
+  .login-state .deadline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted);font-size:12px}
 </style>
 </head>
 <body>
@@ -130,6 +133,25 @@
       <button class="act" id="btnStatus">刷新状态</button>
     </div>
     <div class="msg info" id="opMsg"></div>
+  </div>
+
+  <h2>账号登录</h2>
+  <div class="card">
+    <div class="hint" style="margin-top:0">
+      当前阶段会打开一个独立的可见浏览器窗口。请在窗口中完成账号、密码、验证码和信任设备操作；
+      插件只观察登录结果并把新会话保存为 Cookie。账号密码不会通过本页面发送给插件。
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="act primary" id="btnLoginStart">打开浏览器开始登录</button>
+      <button class="act danger" id="btnLoginCancel" disabled>取消登录</button>
+      <button class="act sm" id="btnLoginStatus">刷新登录状态</button>
+    </div>
+    <div class="login-state">
+      <span class="left" id="loginState">未开始</span>
+      <span class="deadline" id="loginDeadline"></span>
+    </div>
+    <div class="msg info" id="loginMsg"></div>
+    <p class="hint" id="loginHint" style="margin-bottom:0">登录会话只允许同时存在一个。</p>
   </div>
 
   <h2>数据概览</h2>
@@ -443,6 +465,65 @@ async function doRefresh(){
   finally{ b.disabled = false; renderDiag(); }
 }
 
+/* ---------- 账号登录（第 1 阶段：可见浏览器人工操作） ---------- */
+let loginPollTimer = null;
+
+function renderLoginStatus(d){
+  d = d || {};
+  const state = d.state || "IDLE";
+  const labels = {
+    IDLE:"未开始", LAUNCHING:"正在启动浏览器", NEED_CRED:"等待浏览器内完成登录",
+    SUBMITTING:"正在等待华为页面处理", NEED_SMS:"等待验证码", NEED_TRUST:"等待信任选择",
+    FINALIZING:"正在保存会话", DONE:"登录成功", FAILED:"登录失败或已取消",
+  };
+  $("loginState").textContent = labels[state] || state;
+  const left = Number(d.deadline_left || 0);
+  $("loginDeadline").textContent = left > 0 ? "剩余 " + left + " 秒" : "";
+  $("loginHint").textContent = d.message || "登录会话只允许同时存在一个。";
+  const active = !["IDLE", "DONE", "FAILED"].includes(state);
+  $("btnLoginStart").disabled = active;
+  $("btnLoginCancel").disabled = !active;
+  if(active && !loginPollTimer){
+    loginPollTimer = window.setInterval(() => loadLoginStatus(true), 2000);
+  }else if(!active && loginPollTimer){
+    window.clearInterval(loginPollTimer);
+    loginPollTimer = null;
+  }
+}
+
+async function loadLoginStatus(silent){
+  try{
+    const d = unwrap(await apiGet("login/status")) || {};
+    renderLoginStatus(d);
+    if(!silent && d.state) setMsg($("loginMsg"), "登录状态已刷新", "ok");
+  }catch(e){
+    if(!silent) setMsg($("loginMsg"), "登录状态读取失败：" + e.message, "err");
+  }
+}
+
+async function doLoginStart(){
+  const b = $("btnLoginStart"); b.disabled = true;
+  setMsg($("loginMsg"), "正在启动可见浏览器…", "info");
+  try{
+    const d = unwrap(await apiPost("login/start", {mode:"manual"})) || {};
+    renderLoginStatus(d);
+    setMsg($("loginMsg"), "浏览器已启动，请按窗口提示完成登录", "ok");
+  }catch(e){
+    setMsg($("loginMsg"), "登录启动失败：" + e.message, "err");
+    loadLoginStatus(true);
+  }finally{ renderDiag(); }
+}
+
+async function doLoginCancel(){
+  const b = $("btnLoginCancel"); b.disabled = true;
+  try{
+    const d = unwrap(await apiPost("login/cancel", {})) || {};
+    renderLoginStatus(d);
+    setMsg($("loginMsg"), "登录已取消", "ok");
+  }catch(e){ setMsg($("loginMsg"), "取消登录失败：" + e.message, "err"); }
+  finally{ renderDiag(); }
+}
+
 async function doImport(){
   const text = $("cookieBox").value.trim();
   const fieldIds = ["CASTGC", "sid", "hwid_cas_sid", "HuaweiID_CAS_ISCASLOGIN", "CASLOGINSITE", "LOGINACCSITE"];
@@ -482,6 +563,9 @@ async function doClear(){
   $("btnOverview").onclick = doOverview;
   $("btnRefresh").onclick = doRefresh;
   $("btnStatus").onclick = loadStatus;
+  $("btnLoginStart").onclick = doLoginStart;
+  $("btnLoginCancel").onclick = doLoginCancel;
+  $("btnLoginStatus").onclick = () => loadLoginStatus(false);
   $("btnImport").onclick = doImport;
   $("btnClear").onclick = doClear;
   $("btnDiag").onclick = () => {
@@ -501,6 +585,7 @@ async function doClear(){
   await probeBridgeScript();
   renderDiag(summary);
   loadStatus();
+  loadLoginStatus(true);
 })();
 })();
 </script>

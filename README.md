@@ -1,12 +1,12 @@
 # 华为运动健康 · AstrBot 插件
 
-版本：v0.3.1
+版本：v0.4.0
 
 把华为运动健康**网页端**的睡眠 / 静息心率 / HRV / 运动记录 / 跑力数据接进 AstrBot，
 让皮莉卡能按需查询主人的身体状况。
 
 数据源：`health.cloud.huawei.com`（华为运动健康云 / 训练营网页端）
-认证：注入 cookie → 自动走 OAuth（华为认「信任设备」，无二次验证）→ accessToken
+认证：默认注入 cookie → 自动走 OAuth；WebUI 也可打开可见浏览器手动完成登录 → accessToken
 取数：纯 HTTP，**不需要浏览器常开**，也不需要手机 / 手表 / ADB
 
 ---
@@ -73,6 +73,7 @@ cookie 也可以直接用文件：`data/plugin_data/astrbot_plugin_huawei_health
 |---|---|
 | 通道状态 | cookie 条数 / 更新时间、token 剩余秒数、浏览器探测结果、缓存条数、数据目录 |
 | 关键 cookie 表 | `sid` / `hwid_cas_sid` / `CASTGC` 的域与到期日，一眼看出「信任设备」还剩多久 |
+| 账号登录 | 打开独立可见浏览器，在窗口内手动完成账号、密码、验证码和信任设备操作；登录成功后自动保存新 Cookie |
 | 操作 | 拉取概览 · 清缓存并重新认证 · 刷新状态 |
 | 数据概览 | 静息心率 / 睡眠 / HRV 的取数结果 + 取数时间 |
 | 重新导入 Cookie | 六条分项值或 Cookie-Editor JSON 导入（自动作废 token 缓存）；也可一键清除 cookie |

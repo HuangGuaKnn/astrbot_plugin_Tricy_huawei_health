@@ -1,7 +1,7 @@
 name: astrbot_plugin_huawei_health
 display_name: 华为运动健康
-desc: 把华为运动健康网页端的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot，让皮莉卡看得见主人的身体状况。cookie 注入 + OAuth 自动登录，按需抓取。
+desc: 把华为运动健康网页端的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot，让皮莉卡看得见主人的身体状况。支持 Cookie 注入和 WebUI 可见浏览器登录，按需抓取。
 # 与 main.py 注册信息和 WebUI 状态保持一致。
-version: v0.3.1
+version: v0.4.0
 author: Knn
 repo: ""
