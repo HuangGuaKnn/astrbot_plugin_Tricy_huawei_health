@@ -87,8 +87,13 @@
   #diagBox{margin-top:8px}
 
   .ovgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:10px}
+  .ovbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
   .ovcard{border:1px solid var(--line);border-radius:8px;padding:12px 14px;background:var(--code)}
-  .ovcard h3{font-size:12.5px;font-weight:600;margin:0 0 8px;display:flex;align-items:center;gap:6px;color:var(--fg)}
+  .ovcard h3{font-size:12.5px;font-weight:600;margin:0 0 8px;display:flex;align-items:center;gap:6px;color:var(--fg);
+    cursor:pointer;user-select:none}
+  .ovcard h3 .caret{margin-left:auto;font-size:10px;color:var(--muted)}
+  .ovcard.collapsed h3{margin-bottom:0}
+  .ovcard.collapsed pre{display:none}
   .ovcard pre{background:none;border:none;padding:0;font-size:12px;line-height:1.62}
   .ovcard.bad h3{color:var(--err)}
   .login-state{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:13px}
@@ -133,7 +138,6 @@
   <h2>操作</h2>
   <div class="card">
     <div class="row">
-      <button class="act primary" id="btnOverview">拉取全部数据</button>
       <button class="act" id="btnRefresh">清缓存并重新认证</button>
       <button class="act" id="btnStatus">刷新状态</button>
     </div>
@@ -193,10 +197,15 @@
 
   <h2>数据概览</h2>
   <div class="card">
+    <div class="ovbar">
+      <button class="act primary" id="btnOverview">拉取全部数据</button>
+      <button class="act sm" id="btnOvToggle">全部收起</button>
+      <span class="hint" id="ovAt" style="margin:0"></span>
+    </div>
+    <div class="msg" id="ovMsg"></div>
     <div id="overview" class="ovgrid">
       <p class="hint" style="margin:0">点「拉取全部数据」，把已接入的各类数据一次拉齐。</p>
     </div>
-    <div class="hint" id="ovAt" style="margin-top:10px"></div>
   </div>
 
   <h2>重新导入 Cookie</h2>
@@ -467,8 +476,17 @@ function renderOverview(d){
     const title = document.createElement("span");
     title.textContent = it.title || it.key || "";
     h.appendChild(title);
+    const caret = document.createElement("span");
+    caret.className = "caret";
+    caret.textContent = "▾";
+    h.appendChild(caret);
     const pre = document.createElement("pre");
     pre.textContent = it.text || "-";
+    // 点标题即可折叠单张卡片，数据多时方便逐项浏览。
+    h.addEventListener("click", () => {
+      const collapsed = div.classList.toggle("collapsed");
+      caret.textContent = collapsed ? "▸" : "▾";
+    });
     div.appendChild(h);
     div.appendChild(pre);
     box.appendChild(div);
@@ -478,16 +496,16 @@ function renderOverview(d){
 
 async function doOverview(){
   const b = $("btnOverview"); b.disabled = true;
-  setMsg($("opMsg"), "正在从华为云端拉取全部数据…", "info");
-  $("overview").innerHTML = '<p class="hint" style="margin:0">取数中…（首次可能需要 30 秒走一次自动认证）</p>';
+  setMsg($("ovMsg"), "正在从华为云端拉取全部数据…（首次可能需要 30 秒走一次自动认证）", "info");
+  $("overview").innerHTML = '<p class="hint" style="margin:0">取数中…</p>';
   try{
     const d = unwrap(await apiGet("overview")) || {};
     renderOverview(d);
-    setMsg($("opMsg"), "取数完成", "ok");
+    setMsg($("ovMsg"), "取数完成", "ok");
     loadStatus(true);
   }catch(e){
     $("overview").innerHTML = '<p class="hint" style="margin:0">取数失败。</p>';
-    setMsg($("opMsg"), "取数失败：" + e.message, "err");
+    setMsg($("ovMsg"), "取数失败：" + e.message, "err");
   }finally{ b.disabled = false; renderDiag(); }
 }
 
@@ -685,6 +703,17 @@ async function doClear(){
 /* ---------- 启动 ---------- */
 (async function(){
   $("btnOverview").onclick = doOverview;
+  $("btnOvToggle").onclick = () => {
+    const cards = [...document.querySelectorAll("#overview .ovcard")];
+    if(!cards.length) return;
+    const anyOpen = cards.some(c => !c.classList.contains("collapsed"));
+    cards.forEach(c => {
+      c.classList.toggle("collapsed", anyOpen);
+      const caret = c.querySelector(".caret");
+      if(caret) caret.textContent = anyOpen ? "▸" : "▾";
+    });
+    $("btnOvToggle").textContent = anyOpen ? "全部展开" : "全部收起";
+  };
   $("btnRefresh").onclick = doRefresh;
   $("btnStatus").onclick = loadStatus;
   $("btnLoginStart").onclick = doLoginStart;
