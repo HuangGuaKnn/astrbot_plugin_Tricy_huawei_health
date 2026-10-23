@@ -244,7 +244,7 @@ class HuaweiHealthWebApi:
             return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         return json_response({"status": "ok", "message": "缓存已清空，并已重新拿到最新 token"})
 
-    # ---------- 登录会话（v0.4.0 第 1 阶段：可见浏览器人工操作） ----------
+    # ---------- 登录会话（v0.4.0 第 2 阶段：验证码与信任选择） ----------
 
     async def login_start(self):
         p = self.plugin
@@ -255,12 +255,16 @@ class HuaweiHealthWebApi:
         if not isinstance(body, dict):
             body = {}
         mode = str(body.get("mode") or "manual").strip().lower()
+        auto_trust = body.get("auto_trust") if isinstance(body.get("auto_trust"), bool) else None
         try:
-            data = p.login_manager.start(mode)
-        except LoginFlowError:
+            data = p.login_manager.start(mode, auto_trust=auto_trust)
+        except LoginFlowError as exc:
+            message = {
+                "trust_invalid": "自动信任选项无效",
+            }.get(exc.code, "当前阶段只支持在可见浏览器窗口中手动完成登录")
             return json_response({
                 "status": "error",
-                "message": "当前阶段只支持在可见浏览器窗口中手动完成登录",
+                "message": message,
             }, status_code=400)
         return json_response({"status": "ok", "data": data})
 
@@ -275,16 +279,42 @@ class HuaweiHealthWebApi:
         }, status_code=409)
 
     async def login_sms(self):
-        return json_response({
-            "status": "error",
-            "message": "当前阶段请在浏览器窗口中输入验证码",
-        }, status_code=409)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        code = body.get("code") if isinstance(body, dict) else ""
+        try:
+            data = self.plugin.login_manager.submit_sms(code)
+        except LoginFlowError as exc:
+            message = {
+                "sms_invalid": "验证码必须是 6 位数字",
+                "sms_unavailable": "当前登录状态不需要提交验证码",
+                "sms_busy": "上一条验证码正在提交，请稍候",
+            }.get(exc.code, "验证码提交失败，请稍后重试")
+            status = 400 if exc.code == "sms_invalid" else 409
+            return json_response({"status": "error", "message": message}, status_code=status)
+        return json_response({"status": "ok", "data": data, "message": "验证码已提交"})
 
     async def login_trust(self):
-        return json_response({
-            "status": "error",
-            "message": "当前阶段请在浏览器窗口中选择信任方式",
-        }, status_code=409)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        choice = body.get("trust") if isinstance(body, dict) else ""
+        if isinstance(choice, bool):
+            choice = "true" if choice else "false"
+        try:
+            data = self.plugin.login_manager.submit_trust(choice)
+        except LoginFlowError as exc:
+            message = {
+                "trust_invalid": "信任选择无效",
+                "trust_unavailable": "当前登录状态不需要选择信任方式",
+                "trust_busy": "上一条信任选择正在提交，请稍候",
+            }.get(exc.code, "信任选择提交失败，请稍后重试")
+            status = 400 if exc.code == "trust_invalid" else 409
+            return json_response({"status": "error", "message": message}, status_code=status)
+        return json_response({"status": "ok", "data": data, "message": "信任选择已提交"})
 
     async def login_cancel(self):
         data = await asyncio.to_thread(self.plugin.login_manager.cancel)

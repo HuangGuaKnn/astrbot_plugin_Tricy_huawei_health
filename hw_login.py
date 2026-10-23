@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-"""华为运动健康 WebUI 登录会话（v0.4.0 第 1 阶段）。
+"""华为运动健康 WebUI 登录会话（v0.4.0 第 2 阶段）。
 
-这一阶段只提供路线 A：打开一个可见的独立浏览器，由主人在窗口中完成账号、
-密码、验证码和信任设备操作；插件只负责观察会话、收取最终 cookie 并写入现有
-的 ``hw_cookies.json``。账号密码不会经过插件接口，也不会进入日志或状态响应。
+当前仍使用路线 A 的可见浏览器，账号密码在窗口内输入；验证码可从 WebUI
+提交，信任设备支持自动选择或 WebUI 手动选择。插件只负责观察会话、收取最终
+cookie 并写入现有的 ``hw_cookies.json``。账号密码和验证码不会进入日志或状态响应。
 """
 
 import json
 import os
+import queue
+import re
 import subprocess
 import threading
 import time
@@ -73,8 +75,14 @@ class HuaweiLoginSession:
         self.manager = manager
         self.plugin = manager.plugin
         self.mode = mode
+        self.auto_trust = bool(manager.auto_trust)
         self._lock = threading.RLock()
         self._cancel = threading.Event()
+        self._wake = threading.Event()
+        self._actions = queue.Queue()
+        self._pending_action = ""
+        self._sms_action_sent = False
+        self._trust_action_sent = False
         self._state = "IDLE"
         self._message = STATE_MESSAGES["IDLE"]
         self._deadline = 0.0
@@ -99,6 +107,7 @@ class HuaweiLoginSession:
 
     def cancel(self):
         self._cancel.set()
+        self._wake.set()
         with self._lock:
             if self._state not in ("DONE", "FAILED"):
                 self._set_state("FAILED", "登录已取消")
@@ -110,6 +119,7 @@ class HuaweiLoginSession:
             return {
                 "state": state,
                 "mode": self.mode,
+                "auto_trust": self.auto_trust,
                 "message": self._message,
                 "deadline_left": left,
                 "need": {
@@ -243,6 +253,7 @@ class HuaweiLoginSession:
 
     def _wait_for_completion(self):
         while not self._cancel.is_set():
+            self._process_action()
             with self._lock:
                 deadline = self._deadline
             if deadline and time.time() >= deadline:
@@ -257,7 +268,74 @@ class HuaweiLoginSession:
                 self._finish(token)
                 return
             self._update_page_state()
-            time.sleep(1)
+            self._wake.wait(1)
+            self._wake.clear()
+
+    def submit_sms(self, code: str) -> dict:
+        code = str(code or "").strip()
+        if not re.fullmatch(r"\d{6}", code):
+            raise LoginFlowError("sms_invalid")
+        with self._lock:
+            if self._state != "NEED_SMS":
+                raise LoginFlowError("sms_unavailable")
+        if not self._enqueue_action("sms", code):
+            raise LoginFlowError("sms_busy")
+        return self.snapshot()
+
+    def submit_trust(self, choice: str) -> dict:
+        choice = str(choice or "").strip().lower()
+        if choice not in ("true", "false", "later"):
+            raise LoginFlowError("trust_invalid")
+        with self._lock:
+            if self._state != "NEED_TRUST":
+                raise LoginFlowError("trust_unavailable")
+        if not self._enqueue_action("trust", choice):
+            raise LoginFlowError("trust_busy")
+        return self.snapshot()
+
+    def _enqueue_action(self, kind: str, payload: str) -> bool:
+        with self._lock:
+            if self._pending_action:
+                return False
+            self._pending_action = kind
+            self._actions.put((kind, payload))
+            self._wake.set()
+            return True
+
+    def _process_action(self):
+        try:
+            kind, payload = self._actions.get_nowait()
+        except queue.Empty:
+            return
+        with self._lock:
+            self._pending_action = ""
+        try:
+            if kind == "sms":
+                result = self._auth._js(self._ws, self._sms_submit_script(payload))
+            elif kind == "trust":
+                result = self._auth._js(self._ws, self._trust_submit_script(payload))
+            else:
+                return
+        except Exception:
+            result = "error"
+        if kind == "sms":
+            if result not in ("submitted", "filled"):
+                self._sms_action_sent = False
+                with self._lock:
+                    self._set_state("NEED_SMS", "验证码输入框尚未准备好，请稍后重试")
+            else:
+                self._sms_action_sent = True
+                with self._lock:
+                    self._set_state("SUBMITTING")
+        elif kind == "trust":
+            if result != "clicked":
+                self._trust_action_sent = False
+                with self._lock:
+                    self._set_state("NEED_TRUST", "信任选择窗口已变化，请重新选择")
+            else:
+                self._trust_action_sent = True
+                with self._lock:
+                    self._set_state("SUBMITTING")
 
     def _update_page_state(self):
         try:
@@ -267,10 +345,22 @@ class HuaweiLoginSession:
             info = {}
         with self._lock:
             current = self._state
-            if info.get("sms") and current != "NEED_SMS":
-                self._set_state("NEED_SMS")
-            elif info.get("trust") and current != "NEED_TRUST":
-                self._set_state("NEED_TRUST")
+            if info.get("sms"):
+                if info.get("sms_error"):
+                    self._sms_action_sent = False
+                    self._set_state("NEED_SMS", "验证码校验失败，请重新输入")
+                elif current != "NEED_SMS" and not self._sms_action_sent:
+                    self._set_state("NEED_SMS")
+            elif info.get("trust"):
+                if current == "NEED_TRUST":
+                    return
+                if self.auto_trust and not self._pending_action and not self._trust_action_sent:
+                    self._pending_action = "trust"
+                    self._actions.put(("trust", "true"))
+                    self._set_state("SUBMITTING")
+                    self._wake.set()
+                elif not self.auto_trust and not self._trust_action_sent:
+                    self._set_state("NEED_TRUST")
             elif current in ("NEED_SMS", "NEED_TRUST") and not info.get("sms") and not info.get("trust"):
                 self._set_state("SUBMITTING")
 
@@ -283,8 +373,40 @@ class HuaweiLoginSession:
             "const text=[...document.querySelectorAll('span.hwid-vertical-align,button')].filter(visible)"
             ".map(e=>(e.innerText||e.textContent||'').trim());"
             "const trust=text.some(t=>/信任此浏览器|信任该浏览器/.test(t));"
-            "return JSON.stringify({sms,trust});})()"
+            "const body=(document.body&&document.body.innerText)||'';"
+            "const sms_error=sms&&/验证码.{0,6}(错误|不正确|失败)|校验失败/.test(body);"
+            "return JSON.stringify({sms,trust,sms_error});})()"
         )
+
+    @staticmethod
+    def _sms_submit_script(code: str) -> str:
+        code_json = json.dumps(code, ensure_ascii=False)
+        return (
+            "(()=>{const code=%s;const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+            "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';};"
+            "const els=[...document.querySelectorAll('input[type=tel]')].filter(visible).slice(0,6);"
+            "if(els.length<6)return 'missing';"
+            "for(let i=0;i<6;i++){const e=els[i],d=Object.getOwnPropertyDescriptor(e.constructor.prototype,'value');"
+            "if(!d||!d.set)return 'setter';d.set.call(e,code[i]);e.dispatchEvent(new Event('input',{bubbles:true}));}"
+            "const btn=[...document.querySelectorAll('span.hwid-vertical-align,button')].filter(visible)"
+            ".find(e=>/^(确定|确认|登录)$/.test((e.innerText||e.textContent||'').trim()));"
+            "if(btn){btn.click();return 'submitted';}return 'filled';})()"
+        ) % code_json
+
+    @staticmethod
+    def _trust_submit_script(choice: str) -> str:
+        pattern = {
+            "true": "^(?:信任此浏览器|信任该浏览器|信任)$",
+            "false": "^(?:不信任)$",
+            "later": "^(?:稍后再说)$",
+        }[choice]
+        return (
+            "(()=>{const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+            "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';};"
+            "const els=[...document.querySelectorAll('span.hwid-vertical-align,button')].filter(visible);"
+            "const btn=els.find(e=>/(%s)/.test((e.innerText||e.textContent||'').trim()));"
+            "if(btn){btn.click();return 'clicked';}return 'missing';})()"
+        ) % pattern
 
     def _finish(self, token: str):
         with self._lock:
@@ -323,6 +445,14 @@ class HuaweiLoginSession:
             self._set_state("DONE")
 
     def _cleanup(self):
+        # 取消或结束时丢弃尚未发送的验证码/信任选项，避免会话对象继续持有敏感输入。
+        try:
+            while True:
+                self._actions.get_nowait()
+        except queue.Empty:
+            pass
+        with self._lock:
+            self._pending_action = ""
         try:
             if self._ws is not None:
                 try:
@@ -351,6 +481,37 @@ class HuaweiLoginManager:
         self.plugin = plugin
         self._lock = threading.RLock()
         self._session = None
+        self.login_config_path = os.path.join(plugin.data_dir, "login_config.json")
+        self.auto_trust = True
+        self._load_login_config()
+
+    def _load_login_config(self):
+        try:
+            with open(self.login_config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("auto_trust"), bool):
+                self.auto_trust = data["auto_trust"]
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save_login_config(self):
+        data = {"mode": "cookie", "auto_trust": bool(self.auto_trust),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        parent = os.path.dirname(self.login_config_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        tmp = self.login_config_path + ".tmp.%d.%d" % (os.getpid(), threading.get_ident())
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.login_config_path)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
 
     def status(self) -> dict:
         with self._lock:
@@ -358,6 +519,7 @@ class HuaweiLoginManager:
                 return {
                     "state": "IDLE",
                     "mode": "manual",
+                    "auto_trust": self.auto_trust,
                     "message": STATE_MESSAGES["IDLE"],
                     "deadline_left": 0,
                     "need": {"account": False, "sms": False, "trust": False},
@@ -365,12 +527,17 @@ class HuaweiLoginManager:
                 }
             return self._session.snapshot()
 
-    def start(self, mode: str = "manual") -> dict:
+    def start(self, mode: str = "manual", auto_trust=None) -> dict:
         mode = str(mode or "manual").strip().lower()
         if mode not in ("manual", "auto"):
             raise LoginFlowError("unsupported")
         if mode == "auto":
             raise LoginFlowError("unsupported")
+        if auto_trust is not None:
+            if not isinstance(auto_trust, bool):
+                raise LoginFlowError("trust_invalid")
+            self.auto_trust = auto_trust
+            self._save_login_config()
         with self._lock:
             if self._session is not None:
                 current = self._session.snapshot()
@@ -380,6 +547,20 @@ class HuaweiLoginManager:
             self._session = session
             session.start()
             return session.snapshot()
+
+    def submit_sms(self, code: str) -> dict:
+        with self._lock:
+            session = self._session
+        if session is None:
+            raise LoginFlowError("sms_unavailable")
+        return session.submit_sms(code)
+
+    def submit_trust(self, choice: str) -> dict:
+        with self._lock:
+            session = self._session
+        if session is None:
+            raise LoginFlowError("trust_unavailable")
+        return session.submit_trust(choice)
 
     def cancel(self) -> dict:
         with self._lock:

@@ -138,19 +138,31 @@
   <h2>账号登录</h2>
   <div class="card">
     <div class="hint" style="margin-top:0">
-      当前阶段会打开一个独立的可见浏览器窗口。请在窗口中完成账号、密码、验证码和信任设备操作；
-      插件只观察登录结果并把新会话保存为 Cookie。账号密码不会通过本页面发送给插件。
+      会打开一个独立的可见浏览器窗口。账号和密码仍在窗口中输入；遇到手机验证码时，
+      可以把 6 位验证码填到这里提交。插件只观察登录结果并把新会话保存为 Cookie。
+      账号密码和验证码不会写入状态或日志。
     </div>
     <div class="row" style="margin-top:10px">
       <button class="act primary" id="btnLoginStart">打开浏览器开始登录</button>
       <button class="act danger" id="btnLoginCancel" disabled>取消登录</button>
       <button class="act sm" id="btnLoginStatus">刷新登录状态</button>
+      <label class="hint" style="margin:0"><input type="checkbox" id="loginAutoTrust" checked> 自动信任此浏览器</label>
     </div>
     <div class="login-state">
       <span class="left" id="loginState">未开始</span>
       <span class="deadline" id="loginDeadline"></span>
     </div>
     <div class="msg info" id="loginMsg"></div>
+    <div class="row" style="margin-top:10px">
+      <input id="loginSmsCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+             placeholder="6 位验证码" style="width:150px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;font:13px ui-monospace,SFMono-Regular,Consolas,monospace">
+      <button class="act" id="btnLoginSms" disabled>提交验证码</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="act sm" data-login-trust="true" disabled>信任此浏览器</button>
+      <button class="act sm" data-login-trust="false" disabled>不信任</button>
+      <button class="act sm" data-login-trust="later" disabled>稍后再说</button>
+    </div>
     <p class="hint" id="loginHint" style="margin-bottom:0">登录会话只允许同时存在一个。</p>
   </div>
 
@@ -370,7 +382,7 @@ function renderStatus(d){
   $("s_dir").textContent = d.data_dir || "-";
 
   const keys = (ck.keys || []);
-  // cookie 名称和域名来自本地导入文件，使用 DOM API 赋值，避免恶意值进入 innerHTML。
+  // cookie 名称和域名来自本地导入文件，使用 DOM API 赋值，避免恶意值被当作 HTML 解析。
   const keyBox = $("s_keys");
   keyBox.replaceChildren();
   if(keys.length){
@@ -465,7 +477,7 @@ async function doRefresh(){
   finally{ b.disabled = false; renderDiag(); }
 }
 
-/* ---------- 账号登录（第 1 阶段：可见浏览器人工操作） ---------- */
+/* ---------- 账号登录（第 2 阶段：验证码与信任选择） ---------- */
 let loginPollTimer = null;
 
 function renderLoginStatus(d){
@@ -483,6 +495,11 @@ function renderLoginStatus(d){
   const active = !["IDLE", "DONE", "FAILED"].includes(state);
   $("btnLoginStart").disabled = active;
   $("btnLoginCancel").disabled = !active;
+  const need = d.need || {};
+  $("loginSmsCode").disabled = !need.sms;
+  $("btnLoginSms").disabled = !need.sms;
+  document.querySelectorAll("[data-login-trust]").forEach(btn => { btn.disabled = !need.trust; });
+  if(typeof d.auto_trust === "boolean") $("loginAutoTrust").checked = d.auto_trust;
   if(active && !loginPollTimer){
     loginPollTimer = window.setInterval(() => loadLoginStatus(true), 2000);
   }else if(!active && loginPollTimer){
@@ -505,7 +522,9 @@ async function doLoginStart(){
   const b = $("btnLoginStart"); b.disabled = true;
   setMsg($("loginMsg"), "正在启动可见浏览器…", "info");
   try{
-    const d = unwrap(await apiPost("login/start", {mode:"manual"})) || {};
+    const d = unwrap(await apiPost("login/start", {
+      mode:"manual", auto_trust:$("loginAutoTrust").checked,
+    })) || {};
     renderLoginStatus(d);
     setMsg($("loginMsg"), "浏览器已启动，请按窗口提示完成登录", "ok");
   }catch(e){
@@ -522,6 +541,29 @@ async function doLoginCancel(){
     setMsg($("loginMsg"), "登录已取消", "ok");
   }catch(e){ setMsg($("loginMsg"), "取消登录失败：" + e.message, "err"); }
   finally{ renderDiag(); }
+}
+
+async function doLoginSms(){
+  const code = $("loginSmsCode").value.trim();
+  if(!/^\d{6}$/.test(code)){ setMsg($("loginMsg"), "请输入 6 位数字验证码", "err"); return; }
+  const b = $("btnLoginSms"); b.disabled = true;
+  try{
+    const d = unwrap(await apiPost("login/sms", {code})) || {};
+    renderLoginStatus(d);
+    setMsg($("loginMsg"), "验证码已提交，等待华为页面响应", "ok");
+  }catch(e){ setMsg($("loginMsg"), "验证码提交失败：" + e.message, "err"); }
+  finally{ $("loginSmsCode").value = ""; loadLoginStatus(true); renderDiag(); }
+}
+
+async function doLoginTrust(choice){
+  const buttons = document.querySelectorAll("[data-login-trust]");
+  buttons.forEach(btn => { btn.disabled = true; });
+  try{
+    const d = unwrap(await apiPost("login/trust", {trust:choice})) || {};
+    renderLoginStatus(d);
+    setMsg($("loginMsg"), "信任选择已提交", "ok");
+  }catch(e){ setMsg($("loginMsg"), "信任选择失败：" + e.message, "err"); }
+  finally{ loadLoginStatus(true); renderDiag(); }
 }
 
 async function doImport(){
@@ -566,6 +608,10 @@ async function doClear(){
   $("btnLoginStart").onclick = doLoginStart;
   $("btnLoginCancel").onclick = doLoginCancel;
   $("btnLoginStatus").onclick = () => loadLoginStatus(false);
+  $("btnLoginSms").onclick = doLoginSms;
+  document.querySelectorAll("[data-login-trust]").forEach(btn => {
+    btn.onclick = () => doLoginTrust(btn.getAttribute("data-login-trust"));
+  });
   $("btnImport").onclick = doImport;
   $("btnClear").onclick = doClear;
   $("btnDiag").onclick = () => {

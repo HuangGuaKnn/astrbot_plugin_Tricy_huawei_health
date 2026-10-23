@@ -73,13 +73,16 @@ cookie 也可以直接用文件：`data/plugin_data/astrbot_plugin_huawei_health
 |---|---|
 | 通道状态 | cookie 条数 / 更新时间、token 剩余秒数、浏览器探测结果、缓存条数、数据目录 |
 | 关键 cookie 表 | `sid` / `hwid_cas_sid` / `CASTGC` 的域与到期日，一眼看出「信任设备」还剩多久 |
-| 账号登录 | 打开独立可见浏览器，在窗口内手动完成账号、密码、验证码和信任设备操作；登录成功后自动保存新 Cookie |
+| 账号登录 | 打开独立可见浏览器，在窗口内手动输入账号密码；验证码可从 WebUI 提交，信任设备支持自动或手动选择；成功后自动保存新 Cookie |
 | 操作 | 拉取概览 · 清缓存并重新认证 · 刷新状态 |
 | 数据概览 | 静息心率 / 睡眠 / HRV 的取数结果 + 取数时间 |
 | 重新导入 Cookie | 六条分项值或 Cookie-Editor JSON 导入（自动作废 token 缓存）；也可一键清除 cookie |
 
 技术：走 AstrBot 的 bridge SDK（`window.AstrBotPluginPage`），iframe 内用 bridge、
 独立窗口降级直连 `/api/v1/plugins/extensions/<plugin>/page/...`；主题跟随系统并支持手动切换。
+
+登录相关的非敏感选项保存在插件数据目录的 `login_config.json`（当前包含 `auto_trust`）。
+账号密码不会写入插件配置、WebUI 状态或日志；DPAPI 加密凭据和全自动账号密码登录将在后续阶段加入。
 
 ### 开发踩坑（2026-10-22 实测）
 
