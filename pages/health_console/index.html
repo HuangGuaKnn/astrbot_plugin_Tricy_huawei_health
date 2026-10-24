@@ -147,7 +147,7 @@
   <h2>账号登录</h2>
   <div class="card">
     <div class="hint" style="margin-top:0">
-      默认打开独立的可见浏览器窗口；勾选无头自动登录后，会使用已保存的 DPAPI 凭据自动填入账号密码。
+      默认使用已保存的 DPAPI 凭据做<b>无头自动登录</b>（不弹窗口）；需要自己输账号密码时，取消勾选「无头自动登录」即可。
       遇到手机验证码时，可以把 6 位验证码填到这里提交。账号密码和验证码不会写入状态或日志。
     </div>
     <div class="row" style="margin-top:10px">
@@ -155,7 +155,7 @@
       <button class="act danger" id="btnLoginCancel" disabled>取消登录</button>
       <button class="act sm" id="btnLoginStatus">刷新登录状态</button>
       <label class="hint" style="margin:0"><input type="checkbox" id="loginAutoTrust" checked> 自动信任此浏览器</label>
-      <label class="hint" style="margin:0"><input type="checkbox" id="loginUseAuto"> 无头自动登录</label>
+      <label class="hint" style="margin:0"><input type="checkbox" id="loginUseAuto" checked> 无头自动登录</label>
       <label class="hint" style="margin:0"><input type="checkbox" id="loginVisibleFallback"> 自动失败时打开可见窗口</label>
     </div>
     <div class="login-state">
