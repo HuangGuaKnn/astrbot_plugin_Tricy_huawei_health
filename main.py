@@ -132,7 +132,7 @@ class HuaweiHealthPlugin(Star):
     async def _password_token(self) -> str:
         """Run or join the single DPAPI-backed auto-login session."""
         try:
-            await asyncio.to_thread(self.login_manager.start, "auto")
+            await asyncio.to_thread(lambda: self.login_manager.start("auto", manual=False))
         except LoginFlowError as exc:
             messages = {
                 "credentials_missing": "尚未保存账号密码，请先在 WebUI 凭据区保存。",

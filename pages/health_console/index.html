@@ -161,6 +161,7 @@
     <div class="login-state">
       <span class="left" id="loginState">未开始</span>
       <span class="deadline" id="loginDeadline"></span>
+      <span class="hint" id="loginQuota" style="margin:0"></span>
     </div>
     <div class="msg info" id="loginMsg"></div>
     <div class="row" style="margin-top:10px">
@@ -522,6 +523,7 @@ async function doRefresh(){
 
 /* ---------- 账号登录（第 4 阶段：自动登录与降级） ---------- */
 let loginPollTimer = null;
+let loginAutoTouched = false;
 
 function renderLoginStatus(d){
   d = d || {};
@@ -543,7 +545,13 @@ function renderLoginStatus(d){
   $("btnLoginSms").disabled = !need.sms;
   document.querySelectorAll("[data-login-trust]").forEach(btn => { btn.disabled = !need.trust; });
   if(typeof d.auto_trust === "boolean") $("loginAutoTrust").checked = d.auto_trust;
-  if(active && d.mode === "auto") $("loginUseAuto").checked = true;
+  // 未手动改过时跟随服务端保存的偏好；用户改过就不再覆盖，避免 2 秒轮询把勾选弹回去。
+  if(typeof d.prefer_auto === "boolean" && !loginAutoTouched) $("loginUseAuto").checked = d.prefer_auto;
+  if(typeof d.daily_limit === "number"){
+    const used = Number(d.daily_used || 0), limit = Number(d.daily_limit || 0);
+    $("loginQuota").textContent = limit > 0
+      ? "取数自动登录 " + used + "/" + limit + " 次（手动点登录不计入）" : "";
+  }
   if(active && !loginPollTimer){
     loginPollTimer = window.setInterval(() => loadLoginStatus(true), 2000);
   }else if(!active && loginPollTimer){
@@ -570,6 +578,7 @@ async function doLoginStart(){
       mode:$("loginUseAuto").checked ? "auto" : "manual",
       auto_trust:$("loginAutoTrust").checked,
       allow_visible_fallback:$("loginVisibleFallback").checked,
+      prefer_auto:$("loginUseAuto").checked,
     })) || {};
     renderLoginStatus(d);
     setMsg($("loginMsg"), $("loginUseAuto").checked ? "自动登录已启动，等待页面结果" : "浏览器已启动，请按窗口提示完成登录", "ok");
@@ -717,6 +726,7 @@ async function doClear(){
   $("btnRefresh").onclick = doRefresh;
   $("btnStatus").onclick = loadStatus;
   $("btnLoginStart").onclick = doLoginStart;
+  $("loginUseAuto").addEventListener("change", () => { loginAutoTouched = true; });
   $("btnLoginCancel").onclick = doLoginCancel;
   $("btnLoginStatus").onclick = () => loadLoginStatus(false);
   $("btnLoginSms").onclick = doLoginSms;

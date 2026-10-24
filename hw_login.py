@@ -83,10 +83,11 @@ class LoginFlowError(Exception):
 class HuaweiLoginSession:
     """单个浏览器登录会话；自动模式与人工模式共用验证码/信任状态机。"""
 
-    def __init__(self, manager, mode: str = "manual"):
+    def __init__(self, manager, mode: str = "manual", manual: bool = False):
         self.manager = manager
         self.plugin = manager.plugin
         self.mode = mode
+        self.manual = bool(manual)
         self.auto_trust = bool(manager.auto_trust)
         self._auto_attempted = mode == "auto"
         self._fallback_used = False
@@ -217,13 +218,13 @@ class HuaweiLoginSession:
             if not self._cancel.is_set():
                 if not self._try_visible_fallback(exc.code):
                     self._fail(exc.code)
-                    if self._auto_attempted:
+                    if self._auto_attempted and not self.manual:
                         self._record_auto_failure()
         except Exception:
             if not self._cancel.is_set():
                 if not self._try_visible_fallback("failed"):
                     self._fail("failed")
-                    if self._auto_attempted:
+                    if self._auto_attempted and not self.manual:
                         self._record_auto_failure()
         finally:
             self._cleanup()
@@ -645,6 +646,7 @@ class HuaweiLoginManager:
         self.login_config_path = os.path.join(plugin.data_dir, "login_config.json")
         self.login_mode = "cookie"
         self.auto_trust = True
+        self.prefer_auto = True
         self.daily_limit = LOGIN_DEFAULTS["daily_limit"]
         self.session_timeout = LOGIN_DEFAULTS["session_timeout"]
         self.allow_visible_fallback = LOGIN_DEFAULTS["allow_visible_fallback"]
@@ -671,6 +673,8 @@ class HuaweiLoginManager:
                     pass
                 if isinstance(data.get("allow_visible_fallback"), bool):
                     self.allow_visible_fallback = data["allow_visible_fallback"]
+                if isinstance(data.get("prefer_auto"), bool):
+                    self.prefer_auto = data["prefer_auto"]
                 attempts = data.get("attempts")
                 if isinstance(attempts, list):
                     self._attempts = [
@@ -692,6 +696,7 @@ class HuaweiLoginManager:
             "daily_limit": self.daily_limit,
             "session_timeout": self.session_timeout,
             "allow_visible_fallback": bool(self.allow_visible_fallback),
+            "prefer_auto": bool(self.prefer_auto),
             "attempts": list(self._attempts),
             "failure_cooldown_until": self.failure_cooldown_until,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -750,7 +755,7 @@ class HuaweiLoginManager:
     def status(self) -> dict:
         with self._lock:
             if self._session is None:
-                return {
+                data = {
                     "state": "IDLE",
                     "mode": "manual",
                     "auto_trust": self.auto_trust,
@@ -759,12 +764,24 @@ class HuaweiLoginManager:
                     "need": {"account": False, "sms": False, "trust": False},
                     "updated_at": "-",
                 }
-            return self._session.snapshot()
+            else:
+                data = self._session.snapshot()
+            self._prune_attempts()
+            data["prefer_auto"] = bool(self.prefer_auto)
+            data["daily_used"] = len(self._attempts)
+            data["daily_limit"] = int(self.daily_limit)
+            return data
 
-    def start(self, mode: str = "manual", auto_trust=None, allow_visible_fallback=None) -> dict:
+    def start(self, mode: str = "manual", auto_trust=None, allow_visible_fallback=None,
+              manual: bool = False, prefer_auto=None) -> dict:
         mode = str(mode or "manual").strip().lower()
         if mode not in ("manual", "auto"):
             raise LoginFlowError("unsupported")
+        if prefer_auto is not None:
+            if not isinstance(prefer_auto, bool):
+                raise LoginFlowError("prefer_invalid")
+            self.prefer_auto = prefer_auto
+            self._save_login_config()
         if auto_trust is not None:
             if not isinstance(auto_trust, bool):
                 raise LoginFlowError("trust_invalid")
@@ -790,9 +807,10 @@ class HuaweiLoginManager:
                     raise LoginFlowError("credentials_unavailable")
                 except CredentialsError:
                     raise LoginFlowError("credentials_missing")
-                self._check_auto_gate()
-                self._record_auto_attempt()
-            session = HuaweiLoginSession(self, mode=mode)
+                if not manual:
+                    self._check_auto_gate()
+                    self._record_auto_attempt()
+            session = HuaweiLoginSession(self, mode=mode, manual=manual)
             self._session = session
             session.start()
             return session.snapshot()

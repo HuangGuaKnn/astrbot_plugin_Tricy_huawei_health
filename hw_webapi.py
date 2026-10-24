@@ -343,14 +343,19 @@ class HuaweiHealthWebApi:
             body.get("allow_visible_fallback")
             if isinstance(body.get("allow_visible_fallback"), bool) else None
         )
+        prefer_auto = body.get("prefer_auto") if isinstance(body.get("prefer_auto"), bool) else None
         try:
+            # 用户在 WebUI 主动点「开始登录」不占用每日自动登录额度，
+            # 只有取数路径触发的自动登录才计入额度与失败冷却。
             data = p.login_manager.start(
                 mode, auto_trust=auto_trust, allow_visible_fallback=allow_visible_fallback,
+                manual=True, prefer_auto=prefer_auto,
             )
         except LoginFlowError as exc:
             message = {
                 "trust_invalid": "自动信任选项无效",
                 "fallback_invalid": "可见窗口兜底选项无效",
+                "prefer_invalid": "无头自动登录选项无效",
                 "credentials_missing": "尚未保存账号密码，请先在凭据区保存",
                 "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式",
                 "daily_limit": "今日自动登录次数已达上限，请稍后再试",
