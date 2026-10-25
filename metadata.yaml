@@ -5,3 +5,13 @@ desc: 把华为运动健康网页端的睡眠 / 静息心率 / HRV / 训练数�
 version: v0.4.1
 author: Knn
 repo: "https://github.com/HuangGuaKnn/astrbot_plugin_Tricy_huawei_health"
+
+# 应用市场检索用标签（中英混合，便于中文与英文搜索命中）
+category: integrations
+tags:
+  - 华为
+  - 健康
+  - 运动数据
+  - huawei
+  - health
+  - wearable
