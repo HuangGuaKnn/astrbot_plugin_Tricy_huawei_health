@@ -95,7 +95,7 @@ class LoginNeedsHuman(HuaweiAuthError):
 # 版本号与 metadata、WebUI 状态和 README 保持一致，便于升级后核对。
 @register(
     PLUGIN_NAME,
-    "Knn",
+    "HuangGuaKnn",
     "把华为运动健康（网页端）的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot",
     "v0.4.1",
 )
