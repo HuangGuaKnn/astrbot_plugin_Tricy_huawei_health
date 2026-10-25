@@ -89,7 +89,7 @@ class HuaweiHealthWebApi:
         manager = getattr(p, "login_manager", None)
         data = {
             # 页面状态版本与插件元数据统一，避免前端误判部署版本。
-            "version": "v0.4.1",
+            "version": "v0.4.2",
             "data_dir": p.data_dir,
             "cookie_file": p.cookie_file,
             "login_mode": getattr(manager, "login_mode", "cookie"),

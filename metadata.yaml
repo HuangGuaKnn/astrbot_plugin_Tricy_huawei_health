@@ -2,7 +2,7 @@ name: astrbot_plugin_Tricy_huawei_health
 display_name: 华为运动健康
 desc: 把华为运动健康网页端的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot，支持 Cookie 注入与账号密码两种登录方式，按需抓取。
 # 与 main.py 注册信息和 WebUI 状态保持一致。
-version: v0.4.1
+version: v0.4.2
 author: HuangGuaKnn
 repo: "https://github.com/HuangGuaKnn/astrbot_plugin_Tricy_huawei_health"
 

@@ -97,7 +97,7 @@ class LoginNeedsHuman(HuaweiAuthError):
     PLUGIN_NAME,
     "HuangGuaKnn",
     "把华为运动健康（网页端）的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot",
-    "v0.4.1",
+    "v0.4.2",
 )
 class HuaweiHealthPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):

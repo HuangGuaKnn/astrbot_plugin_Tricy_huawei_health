@@ -17,7 +17,7 @@ body:
     attributes:
       label: 插件版本
       description: 在 WebUI 状态区或 metadata.yaml 里能看到
-      placeholder: v0.4.1
+      placeholder: v0.4.2
     validations:
       required: true
 
