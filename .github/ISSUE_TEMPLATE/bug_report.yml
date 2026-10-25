@@ -1,0 +1,102 @@
+name: Bug 报告
+description: 登录失败、取数异常、WebUI 打不开等功能性问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 提交前请先看这三条
+
+        1. **不要粘贴 cookie、账号、密码、验证码、accessToken** —— 这些等同于你的登录凭证。
+        2. 先跑一次 `health_status` 工具（或看 WebUI「通道状态」），把输出贴到下面第 6 项。
+        3. 先看一遍 README 的「常见问题」，很多问题那里已有答案。
+
+  - type: input
+    id: plugin_version
+    attributes:
+      label: 插件版本
+      description: 在 WebUI 状态区或 metadata.yaml 里能看到
+      placeholder: v0.4.1
+    validations:
+      required: true
+
+  - type: input
+    id: astrbot_version
+    attributes:
+      label: AstrBot 版本
+      placeholder: v4.29.1
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: 运行环境
+      description: 操作系统 + Python 版本，例如「Windows 11 / Python 3.12.12」
+      placeholder: Windows 11 / Python 3.12.12
+    validations:
+      required: true
+
+  - type: dropdown
+    id: login_mode
+    attributes:
+      label: 登录方式
+      options:
+        - Cookie 注入（六条分项或整段 JSON）
+        - 账号密码（DPAPI）
+        - 两者都试过
+        - 还没配置
+    validations:
+      required: true
+
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: 问题类型
+      options:
+        - 登录失败（拿不到 token）
+        - 能登录但取数为空
+        - 取到的数据不对（数值/日期异常）
+        - WebUI 页面打不开或报错
+        - 插件加载失败
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: health_status
+    attributes:
+      label: health_status 输出
+      description: 在对话里问「健康数据通道通不通」，或看 WebUI 的通道状态区，把结果贴上来
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 WebUI 控制台
+        2. 勾选「无头自动登录」并点开始登录
+        3. 输入验证码后……
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: 插件日志（`data/logs/astrbot.log` 中带 `[华为健康]` 的行）。**贴之前请自行确认里没有 cookie / token / 手机号**
+      render: text
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已确认上面所有内容里都不含 cookie、账号、密码、验证码、accessToken 等敏感信息
+          required: true
+        - label: 我已查阅 README 的「常见问题」并尝试过其中的排查步骤
+          required: true

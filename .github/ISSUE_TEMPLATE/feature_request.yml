@@ -1,0 +1,40 @@
+name: 功能建议
+description: 希望增加新的数据项、新的使用方式或体验改进
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 想要什么
+      description: 一句话说清诉求
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: 使用场景
+      description: 你在什么情况下会用到它？现在是怎么绕过去的？
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 大致属于哪一类
+      options:
+        - 新的健康数据项
+        - 展示 / 排版改进
+        - 登录与凭据体验
+        - 缓存 / 性能
+        - 文档
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充说明（可选）
+      render: text

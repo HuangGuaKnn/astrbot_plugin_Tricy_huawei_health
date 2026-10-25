@@ -1,0 +1,79 @@
+name: 数据缺失 / 华为改版反馈
+description: 登录正常但某类数据拿不到、字段缺失或数值明显不对（多半是华为接口或页面改版）
+title: "[数据] "
+labels: ["data", "upstream-change"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 这一类问题最需要先分清「真的没数据」还是「接口改版了」
+
+        插件的判据是：**响应非空但关键字段不在** = 改版（会抛 `SchemaDrift`）；**响应本身为空** = 真的没数据。
+        所以下面几个问题请尽量如实填写。
+
+  - type: dropdown
+    id: data_type
+    attributes:
+      label: 哪类数据出问题
+      options:
+        - 睡眠
+        - 静息心率
+        - 睡眠 HRV
+        - 压力
+        - 体重
+        - 心率区间
+        - 运动能力 / 预测成绩
+        - 个人纪录
+        - 运动记录
+        - 全部都没数据
+    validations:
+      required: true
+
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: 症状
+      options:
+        - 完全没有数据（提示最近 N 天无记录）
+        - 有数据但某些字段缺失
+        - 数值明显不对（例如体重显示成均值、时长单位错）
+        - 直接报错
+        - 之前正常，某天突然开始不对
+    validations:
+      required: true
+
+  - type: dropdown
+    id: official
+    attributes:
+      label: 华为官方网页端能看到这份数据吗
+      description: 打开 health.cloud.huawei.com 用同一个账号查看同类数据
+      options:
+        - 能看到，且数值正常
+        - 能看到，但数值与插件显示不同
+        - 官方网页端也没有
+        - 还没去看
+    validations:
+      required: true
+
+  - type: input
+    id: last_ok
+    attributes:
+      label: 最后一次正常是什么时候（大致即可）
+      placeholder: 2026-10-24 晚上
+
+  - type: textarea
+    id: output
+    attributes:
+      label: 具体输出
+      description: 把工具返回的那段文字贴上来（可在对话里问「我今天的睡眠怎么样」）
+      render: text
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 以上内容不含 cookie / token / 账号密码 / 手机号等敏感信息
+          required: true
