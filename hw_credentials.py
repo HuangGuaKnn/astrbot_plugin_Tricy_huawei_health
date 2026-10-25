@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -36,6 +37,70 @@ class DPAPIUnavailableError(CredentialsError):
 
 class CredentialsCorruptError(CredentialsError):
     """Raised when the credentials file is not a valid protected payload."""
+
+
+class CredentialsLockedError(CredentialsError):
+    """Raised when the credentials file exists but cannot be read (lock / ACL)."""
+
+
+def harden_file_permissions(path: str) -> None:
+    """Best-effort 0600 for a secret file on POSIX; no-op on Windows.
+
+    ``open(path, "w")`` yields ``0666 & ~umask`` (usually 0644), which is more
+    permissive than ``tempfile.mkstemp`` (0600).  Secret files must not be
+    readable by other local users.
+    """
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def harden_dir_permissions(dir_path: str) -> str:
+    """Best-effort: stop the plugin data dir from inheriting broad ACLs.
+
+    On Windows we drop inheritance and grant only the current user, SYSTEM and
+    Administrators.  This needs no elevation for a directory the user owns and
+    is a no-op if ``icacls`` is unavailable.
+
+    Returns "" on success, otherwise a short human-readable reason (the caller
+    logs it — silently "succeeding" while the ACL is unchanged is worse than
+    failing loudly).
+
+    Note: ``/inheritance:r`` only removes **inherited** ACEs; explicit grants
+    someone added by hand stay.  README documents this.
+    """
+    if not dir_path or not os.path.isdir(dir_path):
+        return "目录不存在"
+    if os.name != "nt":
+        try:
+            os.chmod(dir_path, 0o700)
+            return ""
+        except OSError as exc:
+            return "chmod 失败：%s" % exc
+    user = os.environ.get("USERNAME") or ""
+    if not user:
+        return "读不到 USERNAME，跳过 ACL 收紧"
+    try:
+        proc = subprocess.run(
+            [
+                "icacls", dir_path, "/inheritance:r",
+                "/grant:r", user + ":(OI)(CI)F",
+                "SYSTEM:(OI)(CI)F",
+                "Administrators:(OI)(CI)F",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return "icacls 无法执行：%s" % exc
+    if proc.returncode != 0:
+        return "icacls 返回码 %d（账户名与 SID 可能对不上）" % proc.returncode
+    return ""
 
 
 class _DATA_BLOB(ctypes.Structure):
@@ -108,17 +173,30 @@ def _unprotect(data: bytes) -> bytes:
 
 
 def mask_account(account: str) -> str:
-    """Return a server-generated display mask without exposing the secret."""
+    """Return a display mask that never reveals the whole secret.
+
+    Invariant (covered by tests): stripping ``*`` from the result must leave
+    strictly fewer characters than the input, for every input length.
+    """
     value = str(account or "").strip()
     if not value:
         return ""
-    if value.isdigit() and len(value) >= 7:
-        return value[:3] + "****" + value[-4:]
     if "@" in value:
-        local, domain = value.split("@", 1)
-        shown = local[:1] + "***" if local else "***"
-        return shown + "@" + domain
-    if len(value) <= 2:
+        local, _, domain = value.partition("@")
+        head, dot, tld = domain.rpartition(".")
+        if dot and head:
+            shown_domain = "*" * max(1, len(head)) + "." + tld
+        else:
+            shown_domain = "*" * len(domain)
+        # Only show one leading char of a reasonably long local part.
+        shown_local = local[:1] if len(local) > 3 else ""
+        return (shown_local + "***" if shown_local else "***") + "@" + shown_domain
+    if value.isdigit():
+        if len(value) <= 8:
+            # 3 + 4 == 7 used to cover the whole string for 7-digit accounts.
+            return "*" * len(value)
+        return value[:2] + "****" + value[-2:]
+    if len(value) <= 4:
         return "*" * len(value)
     return value[:1] + "***" + value[-1:]
 
@@ -162,6 +240,7 @@ class HuaweiCredentialsStore:
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(tmp, self.path)
+                harden_file_permissions(self.path)
             finally:
                 try:
                     os.unlink(tmp)
@@ -177,7 +256,9 @@ class HuaweiCredentialsStore:
                 with open(self.path, "rb") as stream:
                     raw = stream.read()
             except OSError as exc:
-                raise CredentialsError("cannot read credentials") from exc
+                # Locked / permission denied is NOT "never saved" — callers must
+                # be able to tell the user to close whatever holds the file.
+                raise CredentialsLockedError("cannot read credentials") from exc
         if not raw.startswith(MAGIC) or len(raw) <= len(MAGIC):
             raise CredentialsCorruptError("credentials file is invalid")
         try:
@@ -206,12 +287,17 @@ class HuaweiCredentialsStore:
         Even when a caller passes ``masked=False`` this method never exposes an
         account or credential value.  There is intentionally no unmasked
         status mode.
+
+        ``state`` distinguishes the three cases the UI must tell apart:
+        ``absent`` / ``ok`` / ``corrupt`` / ``locked`` / ``unavailable``.
         """
         result: Dict[str, Any] = {
             "mode": "cookie",
             "password_set": False,
             "account_masked": "",
             "updated_at": None,
+            "state": "absent",
+            "error": "",
         }
         if not os.path.isfile(self.path):
             return result
@@ -220,10 +306,23 @@ class HuaweiCredentialsStore:
         except DPAPIUnavailableError:
             # Keep status safe and useful on non-Windows hosts; callers can
             # inspect ``available`` without receiving any ciphertext.
+            result["state"] = "unavailable"
+            result["error"] = "当前系统不支持 Windows DPAPI"
+            return result
+        except CredentialsLockedError:
+            result["state"] = "locked"
+            result["error"] = "凭据文件被占用或无权读取"
+            return result
+        except CredentialsCorruptError:
+            result["state"] = "corrupt"
+            result["error"] = "凭据文件损坏或无法解密，请重新保存"
             return result
         except CredentialsError:
+            result["state"] = "corrupt"
+            result["error"] = "凭据读取失败"
             return result
         result["mode"] = "password"
+        result["state"] = "ok"
         result["password_set"] = bool(value.get("password"))
         result["account_masked"] = mask_account(value.get("account", ""))
         try:
@@ -238,6 +337,7 @@ CredentialsStore = HuaweiCredentialsStore
 
 
 __all__ = [
-    "CredentialsError", "CredentialsCorruptError", "DPAPIUnavailableError",
-    "HuaweiCredentialsStore", "CredentialsStore", "mask_account",
+    "CredentialsError", "CredentialsCorruptError", "CredentialsLockedError",
+    "DPAPIUnavailableError", "HuaweiCredentialsStore", "CredentialsStore",
+    "mask_account", "harden_file_permissions", "harden_dir_permissions",
 ]

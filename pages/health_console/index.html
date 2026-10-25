@@ -165,8 +165,8 @@
     </div>
     <div class="msg info" id="loginMsg"></div>
     <div class="row" style="margin-top:10px">
-      <input id="loginSmsCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
-             placeholder="6 位验证码" style="width:150px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;font:13px ui-monospace,SFMono-Regular,Consolas,monospace">
+      <input id="loginSmsCode" inputmode="numeric" autocomplete="one-time-code" maxlength="8"
+             placeholder="验证码（4~8 位）" style="width:170px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;font:13px ui-monospace,SFMono-Regular,Consolas,monospace">
       <button class="act" id="btnLoginSms" disabled>提交验证码</button>
     </div>
     <div class="row" style="margin-top:8px">
@@ -264,11 +264,6 @@ function assetToken(){
 }
 const TOKEN = assetToken();
 
-function withToken(url){
-  if(!TOKEN) return url;
-  return url + (url.indexOf("?") >= 0 ? "&" : "?") + "asset_token=" + encodeURIComponent(TOKEN);
-}
-
 function record(what, err){
   DIAG.lastReq = what || DIAG.lastReq;
   if(err) DIAG.lastErr = String(err && err.message ? err.message : err).slice(0, 300);
@@ -285,10 +280,10 @@ function unwrap(r){
 }
 
 /* ---------- 通道选择 ---------- */
-const DIRECT_PREFIX = "/api/v1/plugins/extensions/astrbot_plugin_huawei_health/page/";
+const DIRECT_PREFIX = "/api/v1/plugins/extensions/astrbot_plugin_Tricy_huawei_health/page/";
 
 async function directApi(path, method, body){
-  const url = withToken(DIRECT_PREFIX + path.replace(/^\/+/, ""));
+  const url = DIRECT_PREFIX + path.replace(/^\/+/, "");
   record(method + " " + url);
   const opt = { method, credentials:"include", headers:{} };
   if(method === "POST" && body){ opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
@@ -348,8 +343,14 @@ async function selectMode(force){
 /* ---------- 诊断 ---------- */
 function renderDiag(summary){
   const okBridge = DIAG.mode === "bridge";
-  $("diagSum").innerHTML = '<span class="dot ' + (okBridge ? "ok" : "warn") + '"></span>' +
-    "当前通道：<b>" + DIAG.mode + "</b>　" + (summary || "");
+  // summary 里可能带 bridge.ready() 的 e.message，用 DOM API 赋值而不是 innerHTML。
+  $("diagSum").replaceChildren();
+  const dot = document.createElement("span");
+  dot.className = "dot " + (okBridge ? "ok" : "warn");
+  $("diagSum").appendChild(dot);
+  const tail = document.createElement("span");
+  tail.textContent = "当前通道：" + DIAG.mode + "　" + (summary || "");
+  $("diagSum").appendChild(tail);
   $("diagText").textContent = [
     "页面地址      : " + location.href.slice(0, 200),
     "运行环境      : " + (DIAG.inIframe ? "iframe（父窗口 = AstrBot WebUI）" : "独立窗口"),
@@ -424,7 +425,7 @@ function renderStatus(d){
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
-    for(const label of ["关键 cookie", "域", "到期"]){
+    for(const label of ["关键 cookie", "域", "路径", "到期"]){
       const th = document.createElement("th");
       th.textContent = label;
       headRow.appendChild(th);
@@ -434,7 +435,9 @@ function renderStatus(d){
     const tbody = document.createElement("tbody");
     for(const k of keys){
       const row = document.createElement("tr");
-      for(const [value, className] of [[k.name, "mono"], [k.domain || "", "mono"], [k.expires, ""]]){
+      // CASTGC 有 /CAS 与 /UnifiedIDMPortal 两条，靠「路径」列区分，否则是两行同名。
+      for(const [value, className] of [[k.name, "mono"], [k.domain || "", "mono"],
+                                       [k.path || "/", "mono"], [k.expires, ""]]){
         const td = document.createElement("td");
         if(className) td.className = className;
         td.textContent = value == null ? "" : String(value);
@@ -550,7 +553,11 @@ function renderLoginStatus(d){
   if(typeof d.daily_limit === "number"){
     const used = Number(d.daily_used || 0), limit = Number(d.daily_limit || 0);
     $("loginQuota").textContent = limit > 0
-      ? "取数自动登录 " + used + "/" + limit + " 次（手动点登录不计入）" : "";
+      ? "取数自动登录失败 " + used + "/" + limit + " 次（手动点登录不计入）" : "";
+  }
+  // v0.4.1：把失败冷却显示出来，否则用户只看到「冷却中」却不知道还剩多久。
+  if(Number(d.cooldown_left || 0) > 0){
+    $("loginQuota").textContent += " ｜ 失败冷却还剩 " + Math.round(Number(d.cooldown_left) / 60) + " 分钟";
   }
   if(active && !loginPollTimer){
     loginPollTimer = window.setInterval(() => loadLoginStatus(true), 2000);
@@ -599,8 +606,8 @@ async function doLoginCancel(){
 }
 
 async function doLoginSms(){
-  const code = $("loginSmsCode").value.trim();
-  if(!/^\d{6}$/.test(code)){ setMsg($("loginMsg"), "请输入 6 位数字验证码", "err"); return; }
+  const code = $("loginSmsCode").value.replace(/\s+/g, "");
+  if(!/^\d{4,8}$/.test(code)){ setMsg($("loginMsg"), "请输入 4~8 位数字验证码", "err"); return; }
   const b = $("btnLoginSms"); b.disabled = true;
   try{
     const d = unwrap(await apiPost("login/sms", {code})) || {};
@@ -625,6 +632,12 @@ async function doLoginTrust(choice){
 function renderCredentialsStatus(d){
   d = d || {};
   const mode = d.mode === "password" ? "账号密码模式" : "Cookie 模式";
+  const state = d.state || (d.password_set ? "ok" : "absent");
+  if(state === "corrupt" || state === "locked" || state === "unavailable"){
+    // 不再把「文件损坏 / 被占用」谎报成「未保存」——否则用户会反复保存却永远登不上。
+    $("credentialState").textContent = mode + " · " + (d.error || "凭据不可用");
+    return;
+  }
   if(d.password_set){
     const account = d.account_masked || "已保存账号";
     const at = d.updated_at && d.updated_at !== "-" ? " · " + d.updated_at : "";

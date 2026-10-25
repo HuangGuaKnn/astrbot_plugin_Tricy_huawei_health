@@ -3,7 +3,7 @@
 
 页面位于 pages/health_console/，由 AstrBot 的 PluginPageService 自动挂载。
 前端通过 bridge（window.AstrBotPluginPage）调用本模块注册的接口，
-route 前缀：astrbot_plugin_huawei_health/page/...
+route 前缀：astrbot_plugin_Tricy_huawei_health/page/...
 """
 
 import asyncio
@@ -19,13 +19,18 @@ except ImportError:
     from hw_login import LoginFlowError
     from hw_credentials import CredentialsError, DPAPIUnavailableError
 
-PAGE_PREFIX = "astrbot_plugin_huawei_health/page"
+PAGE_PREFIX = "astrbot_plugin_Tricy_huawei_health/page"
 
-#: cookie 里最关键的几个（决定「信任设备」是否还在）
-KEY_COOKIES = (
-    "sid", "hwid_cas_sid", "CASTGC", "HuaweiID_CAS_ISCASLOGIN",
-    "HUAWEI_ID_CAS_ISCASLOGIN", "__uni__uid",
-)
+#: cookie 里最关键的几个（决定「信任设备」是否还在）。
+#: v0.4.1：与 hw_auth.MIN_COOKIE_SPECS 统一——v0.4.0 这里列了两个永远配不出来的名字
+#: （HUAWEI_ID_CAS_ISCASLOGIN / __uni__uid），而 CASLOGINSITE / LOGINACCSITE 配了却
+#: 永远显示不出来。
+try:
+    from .hw_auth import MIN_COOKIE_SPECS
+except ImportError:
+    from hw_auth import MIN_COOKIE_SPECS
+
+KEY_COOKIES = tuple(name for name, _, _ in MIN_COOKIE_SPECS)
 
 
 class HuaweiHealthWebApi:
@@ -43,12 +48,12 @@ class HuaweiHealthWebApi:
         reg(f"{PAGE_PREFIX}/refresh", self.refresh, ["POST"], "清缓存并重新认证")
         reg(f"{PAGE_PREFIX}/login/start", self.login_start, ["POST"], "开始网页登录")
         reg(f"{PAGE_PREFIX}/login/status", self.login_status, ["GET"], "网页登录状态")
-        reg(f"{PAGE_PREFIX}/login/account", self.login_account, ["POST"], "提交网页登录账号")
         reg(f"{PAGE_PREFIX}/login/sms", self.login_sms, ["POST"], "提交网页登录验证码")
         reg(f"{PAGE_PREFIX}/login/trust", self.login_trust, ["POST"], "提交网页登录信任选择")
         reg(f"{PAGE_PREFIX}/login/cancel", self.login_cancel, ["POST"], "取消网页登录")
         reg(f"{PAGE_PREFIX}/credentials", self.credentials_write, ["POST"], "保存账号密码凭据")
         reg(f"{PAGE_PREFIX}/credentials/status", self.credentials_status, ["GET"], "账号密码凭据状态")
+        # v0.4.1：删掉 login/account —— 注册了但前端从不调用，且 handler 恒返回 409。
 
     # ---------- 工具 ----------
 
@@ -81,11 +86,13 @@ class HuaweiHealthWebApi:
 
     async def get_status(self):
         p = self.plugin
+        manager = getattr(p, "login_manager", None)
         data = {
             # 页面状态版本与插件元数据统一，避免前端误判部署版本。
-            "version": "v0.4.0",
+            "version": "v0.4.1",
             "data_dir": p.data_dir,
             "cookie_file": p.cookie_file,
+            "login_mode": getattr(manager, "login_mode", "cookie"),
             "browser": self._browser(),
             "config": {
                 "headless": bool(p.config.get("headless", True)),
@@ -109,6 +116,9 @@ class HuaweiHealthWebApi:
                         cinfo["keys"].append({
                             "name": c.get("name"),
                             "domain": c.get("domain"),
+                            # CASTGC 有 /CAS 和 /UnifiedIDMPortal 两条，不给 path 列
+                            # 页面上会出现两行一模一样的名字。
+                            "path": c.get("path") or "/",
                             "expires": self._fmt_ts(c.get("expires")),
                         })
             except Exception as exc:
@@ -136,61 +146,13 @@ class HuaweiHealthWebApi:
         return json_response({"status": "ok", "data": data})
 
     async def overview(self):
-        """把所有已接入的数据项一次拉齐，给 WebUI 的「概览窗口」用。"""
+        """把所有已接入的数据项一次拉齐，给 WebUI 的「概览窗口」用。
+
+        与 LLM 的 `health_overview` 共用 `main._overview_items()`：同一份项目定义、
+        同样的并发上限、同样的整体超时兜底（v0.4.0 这里是复制粘贴的一份实现）。
+        """
         p = self.plugin
-        async def add(key, title, producer, ttl=600):
-            try:
-                text = await p._cached("ov:%s" % key, producer, ttl=ttl)
-                return {"key": key, "title": title, "ok": True, "text": text}
-            except Exception as exc:
-                return {"key": key, "title": title, "ok": False, "text": p._err(exc)}
-
-        def fmt_acts(acts):
-            if not acts:
-                return "最近 30 天没有运动记录"
-            lines = ["最近 30 天共 %d 条：" % len(acts)]
-            for a in acts[:5]:
-                def v(*ks):
-                    for k in ks:
-                        if a.get(k) is not None:
-                            return a[k]
-                    return None
-                when = ""
-                ts = v("endTime", "startTime")
-                try:
-                    ms = int(ts)
-                    ms = ms / 1e6 if ms > 1e13 else ms
-                    when = time.strftime("%m-%d %H:%M", time.localtime(ms / 1000))
-                except Exception:
-                    when = str(ts)
-                bits = [when]
-                if v("activityType") is not None:
-                    bits.append("类型%s" % v("activityType"))
-                if v("distance"):
-                    bits.append("距离%s" % v("distance"))
-                if v("duration"):
-                    bits.append("时长%s" % v("duration"))
-                lines.append("  " + " ｜ ".join(str(b) for b in bits))
-            return "\n".join(lines)
-
-        # 最多同时请求 3 项，避免 WebUI 总览串行等待过久。
-        sem = asyncio.Semaphore(3)
-        async def limited(*args, **kwargs):
-            async with sem:
-                return await add(*args, **kwargs)
-        # gather 按传入顺序返回，保证并发后页面卡片顺序与原串行版本一致。
-        items = await asyncio.gather(
-            limited("heart", "静息心率（近 7 天）", lambda c: p._metric_text(c.resting_heart_rate(7), "bpm", 7, "静息心率", count_label="天")),
-            limited("sleep", "睡眠（近 7 晚）", lambda c: p._sleep_text(c.sleep_records(7), 7)),
-            limited("hrv", "睡眠 HRV", lambda c: p._metric_text(c.hrv_stats(7), "", 7, "HRV")),
-            limited("stress", "压力（近 7 天）", lambda c: p._metric_text(c.stress_stats(7), "", 7, "压力")),
-            limited("weight", "体重", lambda c: p._fmt_weight(c.body_weight(1095))),
-            limited("zones", "心率区间（储备心率）", lambda c: p._fmt_zones(c.heart_rate_zones())),
-            limited("perf", "运动能力与预测成绩", lambda c: p._fmt_perf(c.athletic_performance()), ttl=3600),
-            limited("pb", "个人纪录", lambda c: p._fmt_pb(c.personal_bests("running")), ttl=3600),
-            limited("acts", "近期运动", lambda c: fmt_acts(c.activities(30, 5))),
-        )
-
+        items = await p._overview_items()
         return json_response({"status": "ok", "data": {
             "items": items,
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -212,6 +174,7 @@ class HuaweiHealthWebApi:
             return json_response({"status": "error", "message": "cookie 内容为空"},
                                  status_code=400)
         try:
+            # v0.4.1：与磁盘上已有的 cookie 合并 + 补齐 CASTGC 两条路径 + 缺关键项直接报错。
             n = p.auth.import_cookie_sources(text, fields)
         except Exception as exc:
             return json_response({"status": "error", "message": str(exc)}, status_code=400)
@@ -220,7 +183,7 @@ class HuaweiHealthWebApi:
         p.logger.info("[华为健康] WebUI 导入了 %d 条 cookie" % n)
         return json_response({
             "status": "ok",
-            "message": "已导入 %d 条 cookie，token 缓存已作废，下次查询会重新认证" % n,
+            "message": "已导入 %d 条 cookie（已与现有 cookie 合并），token 缓存已作废，下次查询会重新认证" % n,
             "count": n,
         })
 
@@ -272,6 +235,11 @@ class HuaweiHealthWebApi:
             "password_set": password_set,
             "account_masked": str(raw.get("account_masked") or ""),
             "updated_at": updated_at,
+            # v0.4.1：区分「没保存 / 已保存 / 损坏 / 被占用 / 不支持 DPAPI」，
+            # 不再把损坏的文件谎报成「未保存」。
+            "state": str(raw.get("state") or "absent"),
+            "error": str(raw.get("error") or ""),
+            "available": bool(getattr(store, "available", False)) if store is not None else False,
         }
 
     async def credentials_status(self):
@@ -294,6 +262,10 @@ class HuaweiHealthWebApi:
             try:
                 store.clear()
                 self.plugin.login_manager.set_login_mode("cookie")
+                try:
+                    self.plugin.login_manager.clear_cooldown()
+                except Exception:
+                    pass
             except (CredentialsError, LoginFlowError):
                 return json_response({"status": "error", "message": "凭据清除失败，请稍后重试"}, status_code=500)
             return json_response({
@@ -313,6 +285,12 @@ class HuaweiHealthWebApi:
         try:
             store.save(account, password)
             self.plugin.login_manager.set_login_mode("password")
+            # 用户刚把密码改对：把 6 小时失败冷却立刻清掉，否则提示会自相矛盾
+            # （「请重新保存账号密码」→ 保存完 → 「冷却中，请稍后再试」）。
+            try:
+                self.plugin.login_manager.clear_cooldown()
+            except Exception:
+                pass
         except DPAPIUnavailableError:
             return json_response({
                 "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
@@ -347,9 +325,14 @@ class HuaweiHealthWebApi:
         try:
             # 用户在 WebUI 主动点「开始登录」不占用每日自动登录额度，
             # 只有取数路径触发的自动登录才计入额度与失败冷却。
-            data = p.login_manager.start(
-                mode, auto_trust=auto_trust, allow_visible_fallback=allow_visible_fallback,
-                manual=True, prefer_auto=prefer_auto,
+            # manager.start() 里有文件 fsync + DPAPI 解密，别在事件循环线程上跑。
+            await asyncio.to_thread(
+                p.login_manager.start,
+                mode,
+                auto_trust=auto_trust,
+                allow_visible_fallback=allow_visible_fallback,
+                manual=True,
+                prefer_auto=prefer_auto,
             )
         except LoginFlowError as exc:
             message = {
@@ -358,7 +341,9 @@ class HuaweiHealthWebApi:
                 "prefer_invalid": "无头自动登录选项无效",
                 "credentials_missing": "尚未保存账号密码，请先在凭据区保存",
                 "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式",
-                "daily_limit": "今日自动登录次数已达上限，请稍后再试",
+                "credentials_corrupt": "账号密码凭据已损坏，请在凭据区重新保存",
+                "credentials_locked": "账号密码凭据被占用或无权读取，请稍后重试",
+                "daily_limit": "今日自动登录失败次数已达上限，请稍后再试",
                 "cooldown": "自动登录失败冷却中，请稍后再试",
                 "unsupported": "登录模式无效",
             }.get(exc.code, "登录启动失败，请稍后重试")
@@ -367,17 +352,12 @@ class HuaweiHealthWebApi:
                 "status": "error",
                 "message": message,
             }, status_code=status)
-        return json_response({"status": "ok", "data": data})
+        # v0.4.1：返回体与 /login/status 统一（原来用 session.snapshot()，
+        # 少 daily_used / daily_limit / prefer_auto，点完登录那一次额度行不刷新）。
+        return json_response({"status": "ok", "data": p.login_manager.status()})
 
     async def login_status(self):
         return json_response({"status": "ok", "data": self.plugin.login_manager.status()})
-
-    async def login_account(self):
-        # 账号密码暂不经过插件接口；第 1 阶段统一在可见浏览器窗口内输入。
-        return json_response({
-            "status": "error",
-            "message": "当前阶段请在已打开的浏览器窗口中输入账号和密码",
-        }, status_code=409)
 
     async def login_sms(self):
         try:
@@ -389,7 +369,7 @@ class HuaweiHealthWebApi:
             data = self.plugin.login_manager.submit_sms(code)
         except LoginFlowError as exc:
             message = {
-                "sms_invalid": "验证码必须是 6 位数字",
+                "sms_invalid": "验证码必须是 4~8 位数字",
                 "sms_unavailable": "当前登录状态不需要提交验证码",
                 "sms_busy": "上一条验证码正在提交，请稍候",
             }.get(exc.code, "验证码提交失败，请稍后重试")

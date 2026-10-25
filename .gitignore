@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时产物（含个人凭据，切勿提交）
+credentials.bin
+hw_cookies.json
+hw_cookies.json.bak*
+login_config.json
+health.db
+health.db-wal
+health.db-shm
+browser_profile/
+login_browser_profile/
+*.log
+
+# 打包产物
+*.zip

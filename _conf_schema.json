@@ -73,9 +73,21 @@
     },
     "warmup": {
         "description": "启动时后台预热 token",
-        "hint": "开启后插件启动 8 秒会自己拿一次 token，主人第一次提问就不用等浏览器启动（约 30 秒）",
+        "hint": "开启后插件启动 8 秒会自己拿一次 token，首次查询就不用等浏览器启动（约 30 秒）",
         "type": "bool",
         "default": true
+    },
+    "login_daily_limit": {
+        "description": "账号密码模式每日自动登录失败次数上限",
+        "hint": "只统计「失败」次数，成功登录会归还名额。默认 3；调大意味着更频繁地自动登录，触发华为风控的风险也更高",
+        "type": "int",
+        "default": 3
+    },
+    "timezone": {
+        "description": "取数用的时区偏移",
+        "hint": "华为接口的 startDay/endDay 口径。默认 +0800；不在东八区时改成 +0900 / -0500 这类写法",
+        "type": "string",
+        "default": "+0800"
     },
     "client_id": {
         "description": "x-client-id",

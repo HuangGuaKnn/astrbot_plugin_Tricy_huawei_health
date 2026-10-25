@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
-"""astrbot_plugin_huawei_health —— 把华为运动健康接进 AstrBot
+"""astrbot_plugin_Tricy_huawei_health —— 把华为运动健康接进 AstrBot
 
 数据源：health.cloud.huawei.com（华为运动健康网页端）
 认证：注入浏览器 cookie → 自动走 OAuth（信任设备，无二次验证）→ accessToken
 取数：纯 HTTP（不需要浏览器常开）
 
 2026-10-22 实机验证通过的链路，见 hw_auth.py 顶部注释。
+
+v0.4.1 修复（对应检测报告 P0-1 / P1-1 / P1-8 / P1-10 / P2-1 / P2-2 / P2-3 / P2-4 /
+P2-5 / P2-6 / P2-7 / P2-13 / P2-14 / P3-1 / P3-2 / P3-3）：
+    - 启动时不再用配置快照覆盖认证回写的滚续 cookie（只按配置指纹判重导入）；
+    - 账号密码模式：额度语义改为「失败次数」、成功归还、失败可回退 cookie 路线；
+    - ``_token`` 统一 ``compute_expire_at``，``_password_token`` 不再空等 420 秒；
+    - 数据层引入 ``SchemaDrift``，把「接口改版」和「真的没数据」分开；
+    - 体重「最新」不再等于均值、运动记录的距离/时长补上单位；
+    - 配置/参数类型守卫，非数字不再把 TypeError 抛给用户。
 """
 
 import asyncio
@@ -19,21 +28,28 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 try:  # 插件作为包加载
-    from .hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS
-    from .hw_client import AuthExpired, HuaweiHealthClient, HuaweiHealthError
+    from .hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS, compute_expire_at
+    from .hw_client import (
+        AuthExpired, HuaweiHealthClient, HuaweiHealthError, SchemaDrift,
+        format_distance_m, format_duration_ms, format_duration_s,
+    )
     from .hw_store import HealthStore
     from .hw_login import HuaweiLoginManager, LoginFlowError
-    from .hw_credentials import HuaweiCredentialsStore
+    from .hw_credentials import HuaweiCredentialsStore, harden_dir_permissions
 except ImportError:  # 插件目录在 sys.path 里
-    from hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS
-    from hw_client import AuthExpired, HuaweiHealthClient, HuaweiHealthError
+    from hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS, compute_expire_at
+    from hw_client import (
+        AuthExpired, HuaweiHealthClient, HuaweiHealthError, SchemaDrift,
+        format_distance_m, format_duration_ms, format_duration_s,
+    )
     from hw_store import HealthStore
     from hw_login import HuaweiLoginManager, LoginFlowError
-    from hw_credentials import HuaweiCredentialsStore
+    from hw_credentials import HuaweiCredentialsStore, harden_dir_permissions
 
-PLUGIN_NAME = "astrbot_plugin_huawei_health"
+PLUGIN_NAME = "astrbot_plugin_Tricy_huawei_health"
 DEFAULT_CLIENT_ID = "106533743"
 DEFAULT_VERSION = "HealthKitRunningGroupPortal_6.26.4.200"
+DEFAULT_TIMEZONE = "+0800"
 
 # v0.3.1 对齐实际装饰器注册结果，health_overview 也属于可用工具。
 TOOL_NAMES = [
@@ -55,12 +71,33 @@ def _data_dir() -> str:
     return path
 
 
+def _int_cfg(value, default: int, lo: int = None, hi: int = None) -> int:
+    """配置/参数取值守卫：非数字不要变成裸 TypeError 抛给用户。"""
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        out = default
+    if lo is not None and out < lo:
+        out = lo
+    if hi is not None and out > hi:
+        out = hi
+    return out
+
+
+class LoginNeedsHuman(HuaweiAuthError):
+    """自动登录正等着用户在 WebUI 里输入验证码/账号密码/信任选择。
+
+    单独一个类型，是因为这种「失败」**不该**被 cookie 回退盖掉——用户需要的是
+    「去 WebUI 输验证码」，而不是「重新导出 cookie」。
+    """
+
+
 # 版本号与 metadata、WebUI 状态和 README 保持一致，便于升级后核对。
 @register(
     PLUGIN_NAME,
     "Knn",
     "把华为运动健康（网页端）的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot",
-    "v0.4.0",
+    "v0.4.1",
 )
 class HuaweiHealthPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -78,9 +115,28 @@ class HuaweiHealthPlugin(Star):
         self._cache_generation = {}
         self._warmup_task = None
         self.login_manager = HuaweiLoginManager(self)
+        # 允许用插件配置覆盖登录额度（默认 3 次/天，语义是「失败次数」）。
+        limit = config.get("login_daily_limit")
+        if limit is not None:
+            try:
+                self.login_manager.daily_limit = max(1, min(10, int(limit)))
+            except (TypeError, ValueError):
+                pass
         self.logger = logger
 
     async def initialize(self):
+        # 数据目录里有真实会话凭据，收紧 ACL（Windows）/ 0700（POSIX），失败不影响功能。
+        try:
+            reason = await asyncio.to_thread(harden_dir_permissions, self.data_dir)
+            if reason:
+                self.logger.warning("[华为健康] 收紧数据目录权限失败：%s" % reason)
+        except Exception as exc:
+            self.logger.warning("[华为健康] 收紧数据目录权限失败：%s" % exc)
+        # 清掉崩溃残留的明文 cookie 临时文件。
+        try:
+            await asyncio.to_thread(self.auth.purge_stale_tmp)
+        except Exception:
+            pass
         # 配置同时兼容旧整段 JSON 和新分条值，避免升级后必须重新导出全部 cookie。
         raw = (self.config.get("cookie_json") or "").strip()
         fields = {
@@ -89,8 +145,15 @@ class HuaweiHealthPlugin(Star):
         }
         if raw or any(str(value or "").strip() for value in fields.values()):
             try:
-                n = self.auth.import_cookie_sources(raw, fields)
-                self.logger.info("[华为健康] 已从配置导入 %d 条 cookie" % n)
+                # only_if_changed：配置没变就什么都不做。否则每次插件启动都会用
+                # 几天前的配置快照整份覆盖 hw_cookies.json，把认证回写的滚续结果
+                # （含 OAuth 期间下发的 __uni__uid / JSESSIONID）冲掉。
+                n = await asyncio.to_thread(
+                    self.auth.import_cookie_sources, raw, fields, True)
+                if n:
+                    self.logger.info("[华为健康] 已从配置导入 %d 条 cookie（配置有变更）" % n)
+                else:
+                    self.logger.info("[华为健康] 配置里的 cookie 未变化，保留现有 cookie 文件")
             except Exception as exc:
                 self.logger.warning("[华为健康] 配置里的 cookie 解析失败：%s" % exc)
         self.logger.info("[华为健康] 插件已就绪，数据目录：%s" % self.data_dir)
@@ -104,7 +167,7 @@ class HuaweiHealthPlugin(Star):
             self.logger.info("[华为健康] WebUI 页面 API 已注册")
         except Exception as exc:
             self.logger.warning("[华为健康] WebUI API 注册失败：%s" % exc)
-        # 后台预热 token：主人第一次提问就不用等 30 多秒的浏览器启动
+        # 后台预热 token：首次查询就不用等 30 多秒的浏览器启动
         if self.config.get("warmup", True):
             self._warmup_task = asyncio.create_task(self._warmup())
 
@@ -125,38 +188,80 @@ class HuaweiHealthPlugin(Star):
             profile_dir=os.path.join(self.data_dir, "browser_profile"),
             browser_path=(self.config.get("browser_path") or "").strip(),
             headless=bool(self.config.get("headless", True)),
-            page_timeout=self.config.get("page_timeout", 90),
+            page_timeout=_int_cfg(self.config.get("page_timeout"), 90, 1, 600),
             logger=self.logger,
         )
 
     async def _password_token(self) -> str:
-        """Run or join the single DPAPI-backed auto-login session."""
+        """跑（或加入）唯一的 DPAPI 自动登录会话，拿到 token。
+
+        v0.4.1 的两个关键变化：
+          1. 需要人工介入（验证码 / 账号密码 / 信任选择）时**立刻返回**可行动的
+             提示，不再占着插件锁空等 420 秒（AstrBot 的工具超时只有 120 秒）；
+          2. 真正超时才 cancel 会话——v0.4.0 放弃后会话继续跑，下一次调用
+             ``manager.start()`` 又拿到同一个非终态会话，再等 420 秒。
+        """
+        manager = self.login_manager
+
+        def fail(message: str, code: str = "") -> HuaweiAuthError:
+            exc = HuaweiAuthError(message)
+            # 带上 code，_token() 才能决定「要不要回退 cookie」以及怎么拼提示。
+            exc.code = code
+            return exc
+
         try:
-            await asyncio.to_thread(lambda: self.login_manager.start("auto", manual=False))
+            await asyncio.to_thread(lambda: manager.start("auto", manual=False))
         except LoginFlowError as exc:
             messages = {
                 "credentials_missing": "尚未保存账号密码，请先在 WebUI 凭据区保存。",
+                "credentials_corrupt": "账号密码凭据已损坏，请在 WebUI 重新保存。",
+                "credentials_locked": "账号密码凭据被占用或无权读取，请稍后重试。",
                 "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式。",
-                "daily_limit": "今日自动登录次数已达上限，请稍后再试。",
+                "daily_limit": "今日自动登录失败次数已达上限，请稍后再试。",
                 "cooldown": "自动登录失败冷却中，请稍后再试。",
             }
-            raise HuaweiAuthError(messages.get(exc.code, "自动登录无法启动，请查看 WebUI 登录状态。")) from exc
-        deadline = time.monotonic() + max(120, int(self.login_manager.session_timeout) + 120)
+            raise fail(messages.get(exc.code, "自动登录无法启动，请查看 WebUI 登录状态。"),
+                       exc.code) from exc
+
+        # 一次工具调用最多等这么久；再长就会撞上 AstrBot 的 120 秒工具超时。
+        timeout = _int_cfg(manager.session_timeout, 300, 60, 1800)
+        deadline = time.monotonic() + min(100, max(60, timeout))
+        state = "IDLE"
         while time.monotonic() < deadline:
-            status = self.login_manager.status()
-            if status.get("state") == "DONE":
+            status = manager.status()
+            state = status.get("state") or "IDLE"
+            if state == "DONE":
                 cached = self.store.get("token") or {}
                 token = cached.get("token")
                 if token:
                     return token
-                raise HuaweiAuthError("自动登录完成但未拿到有效 token。")
-            if status.get("state") == "FAILED":
-                raise HuaweiAuthError("自动登录失败，请查看 WebUI 登录状态。")
+                raise fail("自动登录完成但未拿到有效 token。", "no_token")
+            if state == "FAILED":
+                raise fail(
+                    "自动登录失败：%s" % (status.get("message") or "请查看 WebUI 登录状态"),
+                    "session_failed")
+            if state in ("NEED_SMS", "NEED_CRED", "NEED_TRUST"):
+                break
             await asyncio.sleep(0.5)
-        raise HuaweiAuthError("自动登录等待超时，请重新开始。")
+        else:
+            # 等满也没结果：真正超时，把会话收掉，别让它继续占着浏览器和额度。
+            try:
+                await asyncio.to_thread(manager.cancel)
+            except Exception:
+                pass
+            raise fail("自动登录等待超时，已取消本次会话，请重新开始。", "timeout")
+
+        hint = {
+            "NEED_SMS": "手机验证码",
+            "NEED_CRED": "账号密码",
+            "NEED_TRUST": "是否信任此浏览器",
+        }.get(state, "登录")
+        raise LoginNeedsHuman(
+            "自动登录需要你输入%s。请打开 WebUI 控制台的「账号登录」区完成，"
+            "完成后再问一次即可（会话会保留 5 分钟）。" % hint)
 
     async def _token(self, force: bool = False, stale_token: str = "") -> str:
-        """取 accessToken：内存 → SQLite → 起浏览器自动登录。"""
+        """取 accessToken：SQLite → 起浏览器自动登录（v0.4.1 起没有内存级缓存）。"""
         if not force:
             cached = self.store.get("token")
             if cached and cached.get("token") and cached.get("expire_at", 0) > time.time():
@@ -170,24 +275,40 @@ class HuaweiHealthPlugin(Star):
                 if not force or (stale_token and cached.get("token") != stale_token):
                     return cached["token"]
 
-            ttl = int(self.config.get("token_ttl", 3000))
-            # 保留认证对象引用，读取页面真实 expireTime；旧页面没有该字段时回退配置 TTL。
+            ttl = _int_cfg(self.config.get("token_ttl"), 3000, 0, 86400)
             login_manager = getattr(self, "login_manager", None)
-            if getattr(login_manager, "login_mode", "cookie") == "password":
-                token = await self._password_token()
-                auth = self.auth
+            mode = getattr(login_manager, "login_mode", "cookie")
+            auth = self.auth
+            if mode == "password":
+                try:
+                    token = await self._password_token()
+                except LoginNeedsHuman:
+                    # 需要用户去 WebUI 输验证码：这是可行动提示，不能被 cookie 回退盖掉。
+                    raise
+                except HuaweiAuthError as exc:
+                    # v0.4.0 是二选一：password 失败就整体失败，即使 cookie 完好可用。
+                    if not os.path.exists(self.cookie_file):
+                        raise
+                    self.logger.warning("[华为健康] 账号密码登录不可用（%s），退回 cookie 路线" % exc)
+                    auth = self.auth
+                    try:
+                        token = await asyncio.to_thread(auth.fetch_token)
+                    except Exception as fallback_exc:
+                        # 两条路线都失败时**合并**两条原因：只报 cookie 那句会把用户
+                        # 引去「重新导出 cookie」，而他其实是在用账号密码模式。
+                        raise HuaweiAuthError(
+                            "%s；另外 cookie 路线也不可用：%s"
+                            % (exc, fallback_exc)) from fallback_exc
             else:
-                auth = self.auth
                 token = await asyncio.to_thread(auth.fetch_token)
+
             now = time.time()
-            actual_expire_at = float(getattr(auth, "token_expire_at", 0.0) or 0.0)
-            if actual_expire_at > now:
-                # 提前半分钟失效，避免刚好在请求边界使用过期 token。
-                expire_at = actual_expire_at - 30
-                if ttl > 0:
-                    expire_at = min(expire_at, now + ttl)
+            stored = self.store.get("token") or {}
+            if mode == "password" and stored.get("token") == token and stored.get("expire_at"):
+                # _finish 已经用页面真实 expireTime 写过一次，别用 now+ttl 覆盖它。
+                expire_at = float(stored["expire_at"])
             else:
-                expire_at = now + ttl
+                expire_at = compute_expire_at(getattr(auth, "token_expire_at", 0.0), ttl, now)
             self.store.set("token", {
                 "token": token,
                 "expire_at": expire_at,
@@ -201,15 +322,21 @@ class HuaweiHealthPlugin(Star):
             token,
             client_id=(self.config.get("client_id") or DEFAULT_CLIENT_ID).strip(),
             version=(self.config.get("api_version") or DEFAULT_VERSION).strip(),
+            timezone=(self.config.get("timezone") or DEFAULT_TIMEZONE).strip(),
         )
 
     async def _cached(self, key: str, producer, ttl: int = None, force: bool = False):
         """带缓存地跑 producer(client)。401 时自动重认证重试一次。"""
         if not force:
             hit = self.store.get(key)
-            if hit is not None:
+            # producer 可能合法地返回 None，用 has() 区分「缓存了 None」和「没缓存」。
+            if hit is not None or self.store.has(key):
                 return hit
-        ttl = int(self.config.get("data_ttl", 600)) if ttl is None else ttl
+        ttl = _int_cfg(self.config.get("data_ttl"), 600, 0, 86400) if ttl is None else ttl
+        # data_ttl=0 表示「彻底关掉数据缓存」：连总览/perf 那种显式 TTL 也要让路，
+        # 否则用户以为关掉了、实际还在读 10 分钟前的数据。
+        if _int_cfg(self.config.get("data_ttl"), 600, 0, 86400) <= 0:
+            ttl = 0
         # 同一 key 共用一个任务；刷新通过 generation 使旧任务结果失效。
         task = self._cache_inflight.get(key)
         if task is None or task.done():
@@ -229,7 +356,9 @@ class HuaweiHealthPlugin(Star):
                     except AuthExpired:
                         self.logger.warning("[华为健康] token 失效，重新认证…")
                         result = await run(True, stale_token=used_token)
-                    if self._cache_generation.get(key, 0) == generation:
+                    if self._cache_generation.get(key, 0) == generation and ttl > 0:
+                        # ttl <= 0 表示「不缓存」：v0.4.0 会把 data_ttl=0 写成
+                        # expire_at=0，反而变成**永不过期**。
                         self.store.set(key, result, ttl=ttl)
                     return result
                 finally:
@@ -240,21 +369,38 @@ class HuaweiHealthPlugin(Star):
             self._cache_inflight[key] = task
         return await asyncio.shield(task)
 
-    def _clear_health_cache(self):
-        """清 cookie 时同步废弃全部健康缓存，防止新账号读到旧账号数据。"""
+    def _clear_health_cache(self, strict: bool = False):
+        """清 cookie 时同步废弃全部健康缓存，防止新账号读到旧账号数据。
+
+        ``strict=True`` 时把清理失败上抛：静默 fail-open 会让「导入 cookie」看起来
+        成功，实际还在命中上一个账号的数据（数据库被占用时就会发生）。
+        """
         # 同时推进所有正在运行的 key；这些任务即使完成，也不能把旧账号结果写回。
         keys = set(self._cache_generation) | set(self._cache_inflight)
         for key in keys:
             self._cache_generation[key] = self._cache_generation.get(key, 0) + 1
-        for key in list(self.store.keys()):
-            if key != "token":
-                self.store.delete(key)
+        try:
+            # 一条 SQL 清完（v0.4.0 是 keys() + 逐 key delete()，N+1 条连接，
+            # 300 个 key 会在事件循环线程上卡 5.6 秒）。
+            self.store.clear_except("token")
+        except Exception as exc:
+            self.logger.warning("[华为健康] 清理健康缓存失败：%s" % exc)
+            if strict:
+                raise HuaweiHealthError("健康缓存清理失败（%s），请重试" % exc) from exc
+
+    def _clear_auth_cache_blocking(self):
+        """一个线程任务里按顺序做两件事：先删 token，再清缓存。
+
+        v0.4.1 第二版是两次 ``to_thread``，中间新开了调度窗口（另一个协程可能在
+        这中间把旧 token 读回来）；合并成一次调用也顺带让清理失败能上抛。
+        """
+        self.store.delete("token")
+        self._clear_health_cache(strict=True)
 
     async def _invalidate_auth_cache(self):
         """在认证锁内清理凭证和健康缓存，避免并发认证完成后把旧 token 写回来。"""
         async with self._lock:
-            self._clear_health_cache()
-            self.store.delete("token")
+            await asyncio.to_thread(self._clear_auth_cache_blocking)
 
     @staticmethod
     def _err(exc: Exception) -> str:
@@ -262,6 +408,8 @@ class HuaweiHealthPlugin(Star):
             return "拿不到登录态：%s" % exc
         if isinstance(exc, AuthExpired):
             return "登录态失效了，请重新导入 cookie。"
+        if isinstance(exc, SchemaDrift):
+            return ("华为接口结构变了（%s）。这通常意味着华为网页端改版，请升级插件。" % exc)
         if isinstance(exc, HuaweiHealthError):
             return "华为接口报错：%s" % exc
         return "出错了：%s: %s" % (type(exc).__name__, exc)
@@ -351,10 +499,19 @@ class HuaweiHealthPlugin(Star):
                 return None
 
             start = rec.get("startTime")
+            end = rec.get("endTime")
             try:
                 day = datetime.datetime.fromtimestamp(int(start) / 1e9).strftime("%m-%d")
             except Exception:
                 day = "?"
+            span = ""
+            try:
+                if start and end:
+                    t0 = datetime.datetime.fromtimestamp(int(start) / 1e9)
+                    t1 = datetime.datetime.fromtimestamp(int(end) / 1e9)
+                    span = " %s→%s" % (t0.strftime("%H:%M"), t1.strftime("%H:%M"))
+            except Exception:
+                span = ""
             total = val("all_sleep_time", "allSleepTime")
             score = val("sleep_score", "sleepScore")
             deep = val("deep_sleep_time", "deepSleepTime")
@@ -380,20 +537,15 @@ class HuaweiHealthPlugin(Star):
             if wakeup is not None:
                 bits.append("夜醒 %s 次" % wakeup)
             tag = "（小睡）" if cls._is_nap(rec) else ""
-            lines.append("  %s%s  %s" % (day, tag, "，".join(bits) if bits else "有记录但字段未识别"))
+            lines.append("  %s%s%s  %s" % (
+                day, tag, span, "，".join(bits) if bits else "有记录但字段未识别"))
         return "最近睡眠：\n" + "\n".join(lines)
 
     # ---------- 其它数据项的格式化 ----------
 
     @staticmethod
     def _fmt_duration(sec) -> str:
-        try:
-            sec = int(sec)
-        except (TypeError, ValueError):
-            return "-"
-        h, r = divmod(sec, 3600)
-        m, s = divmod(r, 60)
-        return "%d:%02d:%02d" % (h, m, s) if h else "%d:%02d" % (m, s)
+        return format_duration_s(sec)
 
     @classmethod
     def _fmt_perf(cls, d: dict) -> str:
@@ -476,57 +628,205 @@ class HuaweiHealthPlugin(Star):
 
     @staticmethod
     def _fmt_weight(parsed: dict) -> str:
+        """体重概览。
+
+        v0.4.1：不再读 ``statistics["last"]``——``STRATEGY`` 里从来没有 ``LAST``，
+        服务端不会返回这个字段，v0.4.0 的「最新」其实一直是区间均值。
+        现在用「按天明细的最后一天」作为最近一天的值；**只有那一天真的有这个字段**
+        才标「最近一天（日期）」，否则老老实实写「均」。
+        """
         overall = parsed.get("overall") or {}
         daily = parsed.get("daily") or []
         if not overall and not daily:
             return "没有体重记录"
+        last = daily[-1] if daily else {}
         lines = []
         for field, st in overall.items():
-            # 「最新」以按天明细的最后一条为准（服务端的 last 不保证按日期序）
-            latest = st.get("last", st.get("avg"))
-            if daily:
-                v = (daily[-1] or {}).get(field)
-                if isinstance(v, dict) and v.get("last") is not None:
-                    latest = v.get("last")
-            lines.append("%s：最新 %s kg ｜ 均 %s ｜ 共 %s 条" % (
-                field, latest, st.get("avg"), st.get("count")))
+            latest = st.get("avg")
+            label = "均"
+            day_stats = last.get(field) if isinstance(last, dict) else None
+            if isinstance(day_stats, dict) and (day_stats.get("avg") is not None
+                                                or day_stats.get("max") is not None):
+                latest = day_stats.get("avg", day_stats.get("max"))
+                if last.get("day"):
+                    label = "最近一天（%s）" % last["day"]
+            lines.append("%s：%s %s kg ｜ 均 %s ｜ 共 %s 条" % (
+                field, label, latest, st.get("avg"), st.get("count")))
+        # 日明细只打印 overall 里出现过的字段，避免把桶里别的指标当体重
         for item in daily[-5:]:
             day = item.get("day")
-            for field, st in item.items():
-                if field == "day" or not isinstance(st, dict):
-                    continue
-                lines.append("  %s  %s kg" % (day, st.get("last", st.get("avg"))))
-                break
+            for field in overall:
+                st = item.get(field)
+                if isinstance(st, dict):
+                    lines.append("  %s  %s kg" % (day, st.get("avg", st.get("max", "-"))))
+                    break
         return "\n".join(lines)
+
+    @classmethod
+    def _fmt_acts(cls, acts: list, days: int = 30, limit: int = 5) -> str:
+        """运动记录列表（距离按米、时长按毫秒换算后带单位输出）。"""
+        if not acts:
+            return "最近 %d 天没有运动记录" % days
+        lines = ["最近 %d 天共 %d 条：" % (days, len(acts))]
+        for a in acts[:limit]:
+            def v(*ks):
+                for k in ks:
+                    if a.get(k) is not None:
+                        return a[k]
+                return None
+            when = ""
+            ts = v("endTime", "startTime")
+            try:
+                ms = int(ts)
+                ms = ms / 1e6 if ms > 1e13 else ms
+                when = time.strftime("%m-%d %H:%M", time.localtime(ms / 1000))
+            except Exception:
+                when = str(ts)
+            bits = [when]
+            if v("activityType") is not None:
+                bits.append("类型%s" % v("activityType"))
+            if v("distance"):
+                bits.append("距离%s" % format_distance_m(v("distance")))
+            if v("duration"):
+                bits.append("时长%s" % format_duration_ms(v("duration")))
+            if v("avgHeartRate", "averageHeartRate"):
+                bits.append("均心率%s" % v("avgHeartRate", "averageHeartRate"))
+            lines.append("  " + " ｜ ".join(str(b) for b in bits if b))
+        return "\n".join(lines)
+
+    # ================= 内部：总览 =================
+
+    #: 总览的 9 项数据（key, 标题, 缓存秒数）。LLM 工具与 WebUI 共用这一份定义。
+    OVERVIEW_ITEMS = (
+        ("heart", "静息心率（近 7 天）", 600),
+        ("sleep", "睡眠（近 7 晚）", 600),
+        ("hrv", "睡眠 HRV", 600),
+        ("stress", "压力（近 7 天）", 600),
+        ("weight", "体重", 600),
+        ("zones", "心率区间", 600),
+        ("perf", "运动能力与预测成绩", 3600),
+        ("pb", "个人纪录", 3600),
+        ("acts", "近期运动", 600),
+    )
+    #: 总览的整体预算。单次 HTTP 最坏 95 秒、并发上限 3 → 3 轮最坏 285 秒，
+    #: 远超 AstrBot 的 120 秒工具超时，所以这里必须自己兜一个上限。
+    OVERVIEW_TIMEOUT = 90
+
+    def _overview_producers(self) -> dict:
+        return {
+            "heart": lambda c: self._metric_text(
+                c.resting_heart_rate(7), "bpm", 7, "静息心率", count_label="天"),
+            "sleep": lambda c: self._sleep_text(c.sleep_records(7), 7),
+            "hrv": lambda c: self._metric_text(c.hrv_stats(7), "", 7, "HRV"),
+            "stress": lambda c: self._metric_text(c.stress_stats(7), "", 7, "压力"),
+            "weight": lambda c: self._fmt_weight(c.body_weight(1095)),
+            "zones": lambda c: self._fmt_zones(c.heart_rate_zones()),
+            "perf": lambda c: self._fmt_perf(c.athletic_performance()),
+            "pb": lambda c: self._fmt_pb(c.personal_bests("running")),
+            "acts": lambda c: self._fmt_acts(c.activities(30, 5), 30, 5),
+        }
+
+    async def _overview_items(self, timeout: int = None):
+        """并发拉齐总览，返回 [{key,title,ok,text}]；单项失败/超时不影响其它项。"""
+        timeout = self.OVERVIEW_TIMEOUT if timeout is None else timeout
+        producers = self._overview_producers()
+        # 最多同时请求 3 项，缩短总耗时并控制华为接口压力。
+        sem = asyncio.Semaphore(3)
+
+        async def one(key, title, ttl):
+            async with sem:
+                try:
+                    text = await self._cached("ov:%s" % key, producers[key], ttl=ttl)
+                    return {"key": key, "title": title, "ok": True, "text": text}
+                except Exception as exc:
+                    return {"key": key, "title": title, "ok": False, "text": self._err(exc)}
+
+        tasks = [asyncio.create_task(one(key, title, ttl))
+                 for key, title, ttl in self.OVERVIEW_ITEMS]
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        results = []
+        for (key, title, _ttl), task in zip(self.OVERVIEW_ITEMS, tasks):
+            if task not in done:
+                results.append({"key": key, "title": title, "ok": False,
+                                "text": "取数超时（超过 %d 秒），请稍后重试" % timeout})
+                continue
+            exc = task.exception()
+            if exc is not None:
+                results.append({"key": key, "title": title, "ok": False, "text": self._err(exc)})
+            else:
+                results.append(task.result())
+        return results
 
     # ================= LLM 工具 =================
 
     @filter.llm_tool(name="health_status")
     async def health_status(self, event: AstrMessageEvent):
-        """检查华为运动健康数据通道的状态：cookie 有没有、token 还能用多久。
+        """检查华为运动健康数据通道的状态：用哪种登录方式、凭据/cookie 齐不齐、token 还能用多久。
 
-        主人问「健康数据通道通不通」「你的健康数据还能用吗」时用这个。
+        用户问「健康数据通道通不通」「健康数据还能用吗」时用这个。
         """
+        manager = self.login_manager
+        mode = getattr(manager, "login_mode", "cookie")
         has_cookie = os.path.exists(self.cookie_file)
         cached = self.store.get("token") or {}
         left = int(cached.get("expire_at", 0) - time.time()) if cached.get("expire_at") else 0
-        lines = [
-            "cookie 文件：%s" % ("有（%s）" % self.cookie_file if has_cookie else "没有，需要导入"),
-            "token 缓存：%s" % ("有效，剩 %d 秒" % left if left > 0 else "无 / 已过期"),
-        ]
-        if has_cookie:
+        lines = []
+        if mode == "password":
+            # v0.4.0 在 password 模式下也只看 cookie 文件，恒定输出「没有，需要导入」。
+            lines.append("登录方式：账号密码（DPAPI 加密保存）")
             try:
-                await self._token()
-                lines.append("实测：可以正常拿到 token ✓")
+                st = self.credentials.status() if self.credentials else {}
+            except Exception:
+                st = {}
+            state_label = {
+                "ok": "已保存", "absent": "未保存", "corrupt": "文件损坏，需重新保存",
+                "locked": "被占用或无权读取", "unavailable": "当前系统不支持 DPAPI",
+            }.get(st.get("state") or "", "未知")
+            lines.append("凭据：%s%s" % (
+                state_label,
+                ("（%s）" % st["account_masked"]) if st.get("account_masked") else ""))
+            session = manager.status()
+            lines.append("登录会话：%s %s" % (session.get("state"), session.get("message") or ""))
+            if session.get("cooldown_left"):
+                lines.append("失败冷却：还剩 %d 秒" % int(session["cooldown_left"]))
+            lines.append("今日自动登录失败次数：%s/%s" % (
+                session.get("daily_used"), session.get("daily_limit")))
+        else:
+            lines.append("登录方式：Cookie")
+            lines.append("cookie 文件：%s" % (
+                "有（%s）" % self.cookie_file if has_cookie else "没有，需要导入"))
+        lines.append("token 缓存：%s" % ("有效，剩 %d 秒" % left if left > 0 else "无 / 已过期"))
+
+        # 实测连通性：有缓存 token 就用一个**实测可用**的取数端点验一次
+        # （静息心率近 1 天）。不要用 /user/basicInfos —— 那是 v0.4.0 里从未被
+        # 真实调用过的死代码，403/404 会被渲染成「实测失败」，把用户吓去查通道。
+        token = cached.get("token")
+        if token and left > 0:
+            try:
+                client = HuaweiHealthClient(
+                    token,
+                    client_id=(self.config.get("client_id") or DEFAULT_CLIENT_ID).strip(),
+                    version=(self.config.get("api_version") or DEFAULT_VERSION).strip(),
+                    timezone=(self.config.get("timezone") or DEFAULT_TIMEZONE).strip(),
+                )
+                await asyncio.to_thread(client.resting_heart_rate, 1)
+                lines.append("实测：token 可用 ✓")
+            except AuthExpired:
+                lines.append("实测：token 已失效（下次查询会自动续）")
             except Exception as exc:
-                lines.append("实测失败：%s" % self._err(exc))
+                # 探针端点自己出问题 ≠ 通道坏了，别让用户去排查错方向。
+                lines.append("实测：无法验证（探针接口异常：%s），不代表取数不可用" % self._err(exc))
+        else:
+            lines.append("实测：跳过（没有有效缓存 token，下次查询会自动认证）")
         return "\n".join(lines)
 
     @filter.llm_tool(name="health_today")
     async def health_today(self, event: AstrMessageEvent):
-        """查看主人今天的健康概况：今天的静息心率、最近一晚睡眠、近期运动记录。
+        """查看今天的健康概况：今天的静息心率、最近一晚睡眠、近期运动记录。
 
-        主人问「我今天身体怎么样」「我昨晚睡得怎么样」「我的心率如何」时优先用这个。
+        用户问「今天身体怎么样」「昨晚睡得怎么样」「心率如何」时优先用这个。
         """
         parts = []
         try:
@@ -553,41 +853,19 @@ class HuaweiHealthPlugin(Star):
     async def health_overview(self, event: AstrMessageEvent):
         """一次性查看全部已接入的健康数据：静息心率、睡眠、睡眠 HRV、压力、体重、心率区间、运动能力与预测成绩、个人纪录、近期运动。
 
-        主人问「我的健康状况整体怎么样」「把能看的都给我看看」「健康总览」时用这个。
+        用户问「健康状况整体怎么样」「把能看的都给我看看」「健康总览」时用这个。
         """
-        async def add(key, title, producer, ttl=600):
-            try:
-                text = await self._cached("ov:%s" % key, producer, ttl=ttl)
-                return "【%s】\n%s" % (title, text)
-            except Exception as exc:
-                return "【%s】%s" % (title, self._err(exc))
-
-        # 最多同时请求 3 项，缩短总览耗时并控制华为接口压力。
-        sem = asyncio.Semaphore(3)
-        async def limited(*args, **kwargs):
-            async with sem:
-                return await add(*args, **kwargs)
-        # gather 按传入顺序返回，保证并发后总览展示顺序仍稳定。
-        parts = await asyncio.gather(
-            limited("heart", "静息心率（近 7 天）", lambda c: self._metric_text(c.resting_heart_rate(7), "bpm", 7, "静息心率", count_label="天")),
-            limited("sleep", "睡眠（近 7 晚）", lambda c: self._sleep_text(c.sleep_records(7), 7)),
-            limited("hrv", "睡眠 HRV", lambda c: self._metric_text(c.hrv_stats(7), "", 7, "HRV")),
-            limited("stress", "压力（近 7 天）", lambda c: self._metric_text(c.stress_stats(7), "", 7, "压力")),
-            limited("weight", "体重", lambda c: self._fmt_weight(c.body_weight(1095))),
-            limited("zones", "心率区间", lambda c: self._fmt_zones(c.heart_rate_zones())),
-            limited("perf", "运动能力与预测成绩", lambda c: self._fmt_perf(c.athletic_performance()), ttl=3600),
-            limited("pb", "个人纪录", lambda c: self._fmt_pb(c.personal_bests("running")), ttl=3600),
-        )
-        return "\n\n".join(parts)
+        items = await self._overview_items()
+        return "\n\n".join("【%s】\n%s" % (i["title"], i["text"]) for i in items)
 
     @filter.llm_tool(name="health_sleep")
     async def health_sleep(self, event: AstrMessageEvent, days: int = 7):
-        """查看最近 N 天的睡眠记录（每晚的上床/入睡/醒来、深浅睡与 REM 分段、总分）。
+        """查看最近 N 天的睡眠记录（每晚的入睡/醒来时间、深浅睡与 REM 分段、总分）。
 
         Args:
             days(number): 查询天数，默认 7，范围 1~30
         """
-        days = max(1, min(int(days or 7), 30))
+        days = _int_cfg(days, 7, 1, 30)
         try:
             sl = await self._cached("sleep:%d" % days, lambda c: c.sleep_records(days))
             return self._sleep_text(sl, days)
@@ -601,7 +879,7 @@ class HuaweiHealthPlugin(Star):
         Args:
             days(number): 查询天数，默认 7，范围 1~90
         """
-        days = max(1, min(int(days or 7), 90))
+        days = _int_cfg(days, 7, 1, 90)
         out = []
         try:
             hr = await self._cached("hr:%d" % days, lambda c: c.resting_heart_rate(days))
@@ -623,8 +901,8 @@ class HuaweiHealthPlugin(Star):
             days(number): 回溯天数，默认 30，范围 1~365
             limit(number): 最多返回几条，默认 10，范围 1~50
         """
-        days = max(1, min(int(days or 30), 365))
-        limit = max(1, min(int(limit or 10), 50))
+        days = _int_cfg(days, 30, 1, 365)
+        limit = _int_cfg(limit, 10, 1, 50)
         try:
             acts = await self._cached("act:%d:%d" % (days, limit),
                                       lambda c: c.activities(days, limit))
@@ -632,40 +910,13 @@ class HuaweiHealthPlugin(Star):
             return self._err(exc)
         if not acts:
             return "最近 %d 天没有运动记录。" % days
-        lines = ["最近 %d 天运动记录（%d 条）：" % (days, len(acts))]
-        for a in acts[:limit]:
-            def val(*keys):
-                for k in keys:
-                    if a.get(k) is not None:
-                        return a[k]
-                return None
-
-            ts = val("endTime", "startTime")
-            when = ""
-            if ts:
-                try:
-                    ms = int(ts)
-                    ms = ms / 1e6 if ms > 1e13 else ms
-                    when = datetime.datetime.fromtimestamp(ms / 1000).strftime("%m-%d %H:%M")
-                except Exception:
-                    when = str(ts)
-            bits = [when]
-            if val("activityType") is not None:
-                bits.append("类型%s" % val("activityType"))
-            if val("distance"):
-                bits.append("距离%s" % val("distance"))
-            if val("duration"):
-                bits.append("时长%s" % val("duration"))
-            if val("avgHeartRate", "averageHeartRate"):
-                bits.append("均心率%s" % val("avgHeartRate", "averageHeartRate"))
-            lines.append("  " + " | ".join(str(b) for b in bits if b))
-        return "\n".join(lines)
+        return self._fmt_acts(acts, days, limit)
 
     @filter.llm_tool(name="health_performance")
     async def health_performance(self, event: AstrMessageEvent):
         """查看运动能力评估（跑力指数、预测成绩）与跑步个人纪录。
 
-        主人问「我跑力多少」「半马能跑多久」「我的 PB」时用这个。
+        用户问「跑力多少」「半马能跑多久」「PB 是多少」时用这个。
         """
         out = []
         try:
@@ -683,9 +934,9 @@ class HuaweiHealthPlugin(Star):
 
     @filter.llm_tool(name="health_refresh")
     async def health_refresh(self, event: AstrMessageEvent):
-        """清空本地缓存并强制重新拉取最新数据（token 也一起刷新）。
+        """清空本地缓存并强制重新认证（token 也一起刷新）。数据在下次查询时重新拉取。
 
-        主人问「刷新一下最新的健康数据」时用这个。
+        用户问「刷新一下最新的健康数据」时用这个。
         """
         # 刷新时推进 generation，避免尚未结束的旧请求覆盖刷新后的缓存。
         await self._invalidate_auth_cache()
