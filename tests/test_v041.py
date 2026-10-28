@@ -189,13 +189,23 @@ class TestCookieImport(unittest.TestCase):
                          ["user-edited", "user-edited"])
 
     def test_cookie_file_is_encrypted(self):
-        """P1-12：磁盘上不能出现明文 cookie 值。"""
+        """P1-12：Windows 上磁盘不得出现明文 cookie；其它平台按设计降级为 0600 明文。
+
+        DPAPI 是 Windows API，Linux/macOS 上 ``_serialize_cookies`` 会退回明文
+        （见 hw_auth 的分支），因此这里断言的是「当前平台的正确行为」：
+        Windows 必须加密且无明文值，其它平台必须明文 + 0600（不可被其他用户读取）。
+        """
         a = make_auth()
         a.import_cookie_sources("", SIX)
         with open(a.cookie_file, "rb") as f:
             raw = f.read()
-        self.assertTrue(raw.startswith(hw_auth.COOKIE_MAGIC))
-        self.assertNotIn(b"castgc-value", raw)
+        if sys.platform == "win32":
+            self.assertTrue(raw.startswith(hw_auth.COOKIE_MAGIC))
+            self.assertNotIn(b"castgc-value", raw)
+        else:
+            self.assertFalse(raw.startswith(hw_auth.COOKIE_MAGIC))
+            mode = os.stat(a.cookie_file).st_mode & 0o777
+            self.assertEqual(mode, 0o600, "非 Windows 平台必须收紧到 0600")
         self.assertEqual(len(a.load_cookies()), 7)
 
     def test_plaintext_legacy_file_still_readable(self):
@@ -297,6 +307,7 @@ class TestCredentialsStatus(unittest.TestCase):
     def test_absent(self):
         self.assertEqual(self.store.status()["state"], "absent")
 
+    @unittest.skipIf(sys.platform != "win32", "Windows DPAPI only")
     def test_ok_after_save(self):
         self.store.save("13800138000", "pw")
         st = self.store.status()
@@ -304,6 +315,7 @@ class TestCredentialsStatus(unittest.TestCase):
         self.assertTrue(st["password_set"])
         self.assertNotIn("13800138000", json.dumps(st, ensure_ascii=False))
 
+    @unittest.skipIf(sys.platform != "win32", "Windows DPAPI only")
     def test_corrupt_is_not_reported_as_absent(self):
         with open(self.store.path, "wb") as f:
             f.write(b"HWCRED1\x00garbage")
@@ -317,6 +329,7 @@ class TestCredentialsStatus(unittest.TestCase):
         with self.assertRaises(hw_credentials.CredentialsCorruptError):
             self.store.load()
 
+    @unittest.skipIf(sys.platform != "win32", "Windows DPAPI only")
     def test_no_plaintext_on_disk(self):
         self.store.save("acct-sentinel", "pw-sentinel")
         with open(self.store.path, "rb") as f:
@@ -1304,6 +1317,7 @@ class TestOverviewIncludesActs(unittest.TestCase):
 class TestHealthStatus(unittest.TestCase):
     """P2-13：password 模式不再恒报「没有 cookie」。"""
 
+    @unittest.skipIf(sys.platform != "win32", "Windows DPAPI only")
     def test_password_mode_reports_credentials(self):
         plugin = make_plugin()
         plugin.login_manager.login_mode = "password"
