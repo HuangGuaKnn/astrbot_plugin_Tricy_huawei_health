@@ -22,6 +22,11 @@ import time
 from ctypes import wintypes
 from typing import Any, Dict
 
+try:  # 插件作为包加载
+    from .hw_privacy import redact_error
+except ImportError:  # 插件目录在 sys.path 里
+    from hw_privacy import redact_error
+
 
 MAGIC = b"HWCRED1\0"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
@@ -79,7 +84,7 @@ def harden_dir_permissions(dir_path: str) -> str:
             os.chmod(dir_path, 0o700)
             return ""
         except OSError as exc:
-            return "chmod 失败：%s" % exc
+            return "chmod 失败：%s" % redact_error(exc)
     user = os.environ.get("USERNAME") or ""
     if not user:
         return "读不到 USERNAME，跳过 ACL 收紧"
@@ -97,7 +102,7 @@ def harden_dir_permissions(dir_path: str) -> str:
             check=False,
         )
     except Exception as exc:
-        return "icacls 无法执行：%s" % exc
+        return "icacls 无法执行：%s" % redact_error(exc)
     if proc.returncode != 0:
         return "icacls 返回码 %d（账户名与 SID 可能对不上）" % proc.returncode
     return ""

@@ -46,9 +46,37 @@ except ImportError:  # pragma: no cover - 取决于部署环境
 try:
     from .hw_credentials import harden_file_permissions, _protect, _unprotect
     from .hw_credentials import DPAPIUnavailableError
+    from .hw_privacy import redact_error
 except ImportError:
     from hw_credentials import harden_file_permissions, _protect, _unprotect
     from hw_credentials import DPAPIUnavailableError
+    from hw_privacy import redact_error
+
+
+def _cdp_endpoint_for_error(url):
+    """保留 ``scheme://host:port`` 供排查，只洗掉路径与查询串。
+
+    CDP 目标地址异常的诊断价值全在 host:port 上——它决定了是端口没起来、
+    还是被别的东西占了。整串交给 ``redact_error`` 会被「任意 URL」规则抹成
+    ``[remote URL]``，把 host:port 一起丢掉，等于把这条错误变成无用信息。
+    所以这里只对 host 段做兜底脱敏（万一 host 里混进异常字符），路径与
+    查询串（可能带一次性 token）直接丢弃。
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return redact_error(url)
+    if not hostname:
+        return redact_error(url)
+    endpoint = "%s://%s" % (parts.scheme or "ws", redact_error(hostname))
+    if port is not None:
+        endpoint += ":%d" % port
+    return endpoint
+
 
 TRAINING_CAMP_URL = "https://health.cloud.huawei.com/TrainingCamp"
 
@@ -438,7 +466,7 @@ class HuaweiAuth:
         except Exception as exc:
             if not self._plaintext_warned:
                 self._plaintext_warned = True
-                self._log("warning", "cookie 加密失败（%s），退回明文保存" % exc)
+                self._log("warning", "cookie 加密失败（%s），退回明文保存" % redact_error(exc))
             return payload
 
     def _deserialize_cookies(self, raw: bytes):
@@ -537,7 +565,7 @@ class HuaweiAuth:
                 f.write(digest)
             harden_file_permissions(self._marker_path())
         except OSError as exc:
-            self._log("warning", "写入 cookie 配置指纹失败：%s" % exc)
+            self._log("warning", "写入 cookie 配置指纹失败：%s" % redact_error(exc))
 
     def purge_stale_tmp(self) -> int:
         """清掉崩溃残留的临时文件（里面是明文 cookie，clear_cookies 也不清）。"""
@@ -679,7 +707,7 @@ class HuaweiAuth:
             )
             time.sleep(0.2)
         except Exception as exc:
-            self._log("warning", "孤儿浏览器清理失败：%s" % exc)
+            self._log("warning", "孤儿浏览器清理失败：%s" % redact_error(exc))
 
     def _cleanup_orphan_browsers_posix(self):
         """Linux/macOS：v0.4.0 这里是空实现，孤儿浏览器会占住 SingletonLock。"""
@@ -759,7 +787,7 @@ class HuaweiAuth:
         try:
             proc = subprocess.Popen(args, **popen_kwargs)
         except Exception as exc:
-            self._log("warning", "浏览器启动失败：%s" % exc)
+            self._log("warning", "浏览器启动失败：%s" % redact_error(exc))
             raise HuaweiAuthError("浏览器进程启动失败") from exc
         ws = None
         try:
@@ -794,7 +822,7 @@ class HuaweiAuth:
                     if self.save_cookies([normalize_cookie(c) for c in fresh], cookie_mtime_ns):
                         self._log("info", "cookie 已回写：%d → %d 条" % (len(cookies), len(fresh)))
             except Exception as exc:  # 回写失败不影响本次取数
-                self._log("warning", "cookie 回写失败：%s" % exc)
+                self._log("warning", "cookie 回写失败：%s" % redact_error(exc))
 
             # 页面提供的过期时间优先用于后续缓存 TTL；旧页面没有该字段时保留安全默认值。
             expire = self._js(ws, "sessionStorage.getItem('expireTime')")
@@ -807,7 +835,8 @@ class HuaweiAuth:
             return token
         except Exception as exc:
             self._mark_failure()
-            self._log("warning", "认证失败，耗时 %.1f 秒：%s" % (time.monotonic() - started, exc))
+            self._log("warning", "认证失败，耗时 %.1f 秒：%s"
+                      % (time.monotonic() - started, redact_error(exc)))
             raise
         finally:
             try:
@@ -848,7 +877,7 @@ class HuaweiAuth:
             raise HuaweiAuthError("浏览器里没有可用页面目标")
         url = pages[0].get("webSocketDebuggerUrl") or ""
         if not url.startswith("ws://127.0.0.1:") and not url.startswith("ws://localhost:"):
-            raise HuaweiAuthError("CDP 目标地址异常：%s" % url[:80])
+            raise HuaweiAuthError("CDP 目标地址异常：%s" % _cdp_endpoint_for_error(url))
         ws = websocket.create_connection(
             url, timeout=self.page_timeout, suppress_origin=True
         )
@@ -865,7 +894,8 @@ class HuaweiAuth:
         except Exception as exc:
             # 对端已关时 send() 也会立刻抛。这里不分类的话，调用方拿到的是裸
             # WebSocketConnectionClosedException，"浏览器已关闭"分支永远不可达。
-            raise HuaweiAuthError("CDP 连接已断开：%s: %s" % (type(exc).__name__, exc)) from exc
+            raise HuaweiAuthError("CDP 连接已断开：%s: %s"
+                                  % (type(exc).__name__, redact_error(exc))) from exc
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -876,14 +906,15 @@ class HuaweiAuth:
                 name = type(exc).__name__
                 if "Timeout" in name:
                     continue
-                raise HuaweiAuthError("CDP 连接已断开：%s: %s" % (name, exc)) from exc
+                raise HuaweiAuthError("CDP 连接已断开：%s: %s"
+                                      % (name, redact_error(exc))) from exc
             try:
                 msg = json.loads(raw)
             except Exception:
                 continue
             if msg.get("id") == mid:
                 if msg.get("error"):
-                    raise HuaweiAuthError("CDP 调用失败：%s" % msg["error"])
+                    raise HuaweiAuthError("CDP 调用失败：%s" % redact_error(msg["error"]))
                 return msg
         raise HuaweiAuthError("CDP 调用超时：%s（%.1f 秒）" % (method, timeout))
 

@@ -1,0 +1,129 @@
+name: Plugin checks
+
+# 全部分支都要跑：推特性分支时也要有反馈，不能只在 main 上触发。
+on:
+  push:
+  pull_request:
+
+# 最小权限：只需要读代码。
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 单元测试与打包（Python ${{ matrix.python-version }}）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # 隐私闸门放在最前面：还没装依赖、还没产生任何构建产物，
+      # 此时源码树的状态最能代表「即将被提交/发布的东西」。
+      - name: 隐私闸门（源码树）
+        run: python scripts/privacy_gate.py --repository .
+
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt pytest
+
+      - name: 跑 178 个验收测试
+        run: python -m pytest tests -q
+
+      - name: 编译检查
+        run: python -m compileall -q .
+
+      - name: 构建发布包
+        run: python scripts/build_release.py --output-dir dist
+
+      # 打包脚本内部已经调用过 assert_archive_clean()；这一步是对 CI 可见的
+      # 独立复核，防止将来有人用 --skip-privacy 绕过而没人发现。
+      - name: 隐私闸门（发布包）
+        run: python scripts/privacy_gate.py --archive dist/*.zip
+
+      - name: 上传发布包（仅 3.12）
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: astrbot_plugin_Tricy_huawei_health
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # 拉真实 AstrBot 源码安装，验证插件依赖的 API 契约没有漂移。
+  # 两条通道：最低支持版本（来自 metadata.yaml 的 astrbot_version 下限）+ 最新稳定 v4.x。
+  astrbot-runner-contract:
+    name: AstrBot 契约测试（${{ matrix.channel }}）
+    runs-on: ubuntu-latest
+    # 比 test job 长：要从源码 pip install 整个 AstrBot。
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: ["minimum-supported", "latest-stable-4x"]
+
+    steps:
+      - name: 检出插件
+        uses: actions/checkout@v4
+        with:
+          path: astrbot_plugin_Tricy_huawei_health
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 解析 AstrBot 参照版本
+        id: astrbot_ref
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ASTRBOT_CHANNEL: ${{ matrix.channel }}
+        run: |
+          set -euo pipefail
+          if [ "$ASTRBOT_CHANNEL" = "minimum-supported" ]; then
+            ref="$(python astrbot_plugin_Tricy_huawei_health/scripts/resolve_astrbot_ref.py --field minimum)"
+          else
+            ref="$(python astrbot_plugin_Tricy_huawei_health/scripts/resolve_astrbot_ref.py --field latest-stable-4x)"
+          fi
+          case "$ref" in
+            v4.*) ;;
+            *) echo "解析出的 AstrBot ref 不是 v4.x：$ref" >&2; exit 1 ;;
+          esac
+          echo "AstrBot ref = $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: 检出 AstrBot ${{ steps.astrbot_ref.outputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: AstrBotDevs/AstrBot
+          ref: ${{ steps.astrbot_ref.outputs.ref }}
+          path: astrbot-runtime
+
+      - name: 安装 AstrBot 与插件依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./astrbot-runtime
+          python -m pip install -r ./astrbot_plugin_Tricy_huawei_health/requirements.txt
+
+      # 静态 AST 检查：确认 register / filter.llm_tool / webapi / logger 等签名未变，
+      # 不 import 插件，所以即使插件代码本身有问题也能给出「契约是否漂移」的独立信号。
+      - name: 检查 API 契约
+        run: >-
+          python astrbot_plugin_Tricy_huawei_health/scripts/check_astrbot_runner_contract.py
+          --astrbot-root ./astrbot-runtime
+
+      # 真实导入冒烟：能 import、能实例化、8 个 LLM 工具能注册。
+      - name: 导入冒烟
+        run: >-
+          python astrbot_plugin_Tricy_huawei_health/scripts/check_astrbot_runtime_smoke.py
+          --plugin-root astrbot_plugin_Tricy_huawei_health
+          --astrbot-path ./astrbot-runtime

@@ -36,6 +36,7 @@ try:  # 插件作为包加载
     from .hw_store import HealthStore
     from .hw_login import HuaweiLoginManager, LoginFlowError
     from .hw_credentials import HuaweiCredentialsStore, harden_dir_permissions
+    from .hw_privacy import redact_error
 except ImportError:  # 插件目录在 sys.path 里
     from hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS, compute_expire_at
     from hw_client import (
@@ -45,6 +46,7 @@ except ImportError:  # 插件目录在 sys.path 里
     from hw_store import HealthStore
     from hw_login import HuaweiLoginManager, LoginFlowError
     from hw_credentials import HuaweiCredentialsStore, harden_dir_permissions
+    from hw_privacy import redact_error
 
 PLUGIN_NAME = "astrbot_plugin_Tricy_huawei_health"
 DEFAULT_CLIENT_ID = "106533743"
@@ -129,9 +131,9 @@ class HuaweiHealthPlugin(Star):
         try:
             reason = await asyncio.to_thread(harden_dir_permissions, self.data_dir)
             if reason:
-                self.logger.warning("[华为健康] 收紧数据目录权限失败：%s" % reason)
+                self.logger.warning("[华为健康] 收紧数据目录权限失败：%s" % redact_error(reason))
         except Exception as exc:
-            self.logger.warning("[华为健康] 收紧数据目录权限失败：%s" % exc)
+            self.logger.warning("[华为健康] 收紧数据目录权限失败：%s" % redact_error(exc))
         # 清掉崩溃残留的明文 cookie 临时文件。
         try:
             await asyncio.to_thread(self.auth.purge_stale_tmp)
@@ -155,7 +157,7 @@ class HuaweiHealthPlugin(Star):
                 else:
                     self.logger.info("[华为健康] 配置里的 cookie 未变化，保留现有 cookie 文件")
             except Exception as exc:
-                self.logger.warning("[华为健康] 配置里的 cookie 解析失败：%s" % exc)
+                self.logger.warning("[华为健康] 配置里的 cookie 解析失败：%s" % redact_error(exc))
         self.logger.info("[华为健康] 插件已就绪，数据目录：%s" % self.data_dir)
         # 注册 WebUI 页面 API（页面在 pages/health_console/）
         try:
@@ -166,7 +168,7 @@ class HuaweiHealthPlugin(Star):
             HuaweiHealthWebApi(self).register()
             self.logger.info("[华为健康] WebUI 页面 API 已注册")
         except Exception as exc:
-            self.logger.warning("[华为健康] WebUI API 注册失败：%s" % exc)
+            self.logger.warning("[华为健康] WebUI API 注册失败：%s" % redact_error(exc))
         # 后台预热 token：首次查询就不用等 30 多秒的浏览器启动
         if self.config.get("warmup", True):
             self._warmup_task = asyncio.create_task(self._warmup())
@@ -177,7 +179,7 @@ class HuaweiHealthPlugin(Star):
             await self._token()
             self.logger.info("[华为健康] token 预热完成，后续查询可秒回")
         except Exception as exc:
-            self.logger.warning("[华为健康] token 预热失败（不影响后续使用）：%s" % exc)
+            self.logger.warning("[华为健康] token 预热失败（不影响后续使用）：%s" % redact_error(exc))
 
     # ================= 内部：认证 / 客户端 =================
 
@@ -289,7 +291,8 @@ class HuaweiHealthPlugin(Star):
                     # v0.4.0 是二选一：password 失败就整体失败，即使 cookie 完好可用。
                     if not os.path.exists(self.cookie_file):
                         raise
-                    self.logger.warning("[华为健康] 账号密码登录不可用（%s），退回 cookie 路线" % exc)
+                    self.logger.warning("[华为健康] 账号密码登录不可用（%s），退回 cookie 路线"
+                                        % redact_error(exc))
                     auth = self.auth
                     try:
                         token = await asyncio.to_thread(auth.fetch_token)
@@ -384,9 +387,10 @@ class HuaweiHealthPlugin(Star):
             # 300 个 key 会在事件循环线程上卡 5.6 秒）。
             self.store.clear_except("token")
         except Exception as exc:
-            self.logger.warning("[华为健康] 清理健康缓存失败：%s" % exc)
+            self.logger.warning("[华为健康] 清理健康缓存失败：%s" % redact_error(exc))
             if strict:
-                raise HuaweiHealthError("健康缓存清理失败（%s），请重试" % exc) from exc
+                raise HuaweiHealthError(
+                    "健康缓存清理失败（%s），请重试" % redact_error(exc)) from exc
 
     def _clear_auth_cache_blocking(self):
         """一个线程任务里按顺序做两件事：先删 token，再清缓存。
@@ -404,15 +408,18 @@ class HuaweiHealthPlugin(Star):
 
     @staticmethod
     def _err(exc: Exception) -> str:
+        # 异常原文可能带 cookie / accessToken / 本机路径（浏览器启动失败时
+        # OSError 里就有 profile 的绝对路径），统一洗过再交给用户和 LLM。
+        reason = redact_error(exc)
         if isinstance(exc, HuaweiAuthError):
-            return "拿不到登录态：%s" % exc
+            return "拿不到登录态：%s" % reason
         if isinstance(exc, AuthExpired):
             return "登录态失效了，请重新导入 cookie。"
         if isinstance(exc, SchemaDrift):
-            return ("华为接口结构变了（%s）。这通常意味着华为网页端改版，请升级插件。" % exc)
+            return ("华为接口结构变了（%s）。这通常意味着华为网页端改版，请升级插件。" % reason)
         if isinstance(exc, HuaweiHealthError):
-            return "华为接口报错：%s" % exc
-        return "出错了：%s: %s" % (type(exc).__name__, exc)
+            return "华为接口报错：%s" % reason
+        return "出错了：%s: %s" % (type(exc).__name__, reason)
 
     # ================= 内部：格式化 =================
 

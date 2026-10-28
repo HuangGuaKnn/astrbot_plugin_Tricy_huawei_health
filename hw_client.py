@@ -19,6 +19,11 @@ import time
 
 import requests
 
+try:  # 插件作为包加载
+    from .hw_privacy import redact_error
+except ImportError:  # 插件目录在 sys.path 里
+    from hw_privacy import redact_error
+
 BASE = "https://hihealthbase-drcn.things.dbankcloud.cn/healthrunninggroup/v1"
 DEFAULT_CLIENT_ID = "106533743"
 DEFAULT_VERSION = "HealthKitRunningGroupPortal_6.26.4.200"
@@ -301,11 +306,15 @@ class HuaweiHealthClient:
         if resp.status_code == 401:
             raise AuthExpired("华为返回 401，登录态已失效")
         if resp.status_code >= 400:
-            raise HuaweiHealthError("HTTP %d: %s" % (resp.status_code, resp.text[:200]))
+            # 响应体里可能回显请求头/URL，洗完再拼进异常。
+            raise HuaweiHealthError(
+                "HTTP %d: %s" % (resp.status_code,
+                                 redact_error(resp.text[:200] or "（空响应）")))
         try:
             return resp.json()
         except Exception:
-            raise HuaweiHealthError("响应不是 JSON: %s" % resp.text[:200])
+            raise HuaweiHealthError(
+                "响应不是 JSON: %s" % redact_error(resp.text[:200] or "（空响应）"))
 
     def _request(self, method: str, path: str, *, params=None, body=None):
         """发起一次有限重试的请求；401 交给上层只做一次重认证。"""

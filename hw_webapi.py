@@ -15,9 +15,11 @@ from astrbot.api.web import json_response, request
 try:
     from .hw_login import LoginFlowError
     from .hw_credentials import CredentialsError, DPAPIUnavailableError
+    from .hw_privacy import redact_error
 except ImportError:
     from hw_login import LoginFlowError
     from hw_credentials import CredentialsError, DPAPIUnavailableError
+    from hw_privacy import redact_error
 
 PAGE_PREFIX = "astrbot_plugin_Tricy_huawei_health/page"
 
@@ -122,7 +124,8 @@ class HuaweiHealthWebApi:
                             "expires": self._fmt_ts(c.get("expires")),
                         })
             except Exception as exc:
-                cinfo["error"] = str(exc)
+                # 前端会把这句直接显示出来，异常原文可能带 cookie 文件路径。
+                cinfo["error"] = redact_error(exc)
         data["cookie"] = cinfo
 
         # token
@@ -177,7 +180,8 @@ class HuaweiHealthWebApi:
             # v0.4.1：与磁盘上已有的 cookie 合并 + 补齐 CASTGC 两条路径 + 缺关键项直接报错。
             n = p.auth.import_cookie_sources(text, fields)
         except Exception as exc:
-            return json_response({"status": "error", "message": str(exc)}, status_code=400)
+            return json_response(
+                {"status": "error", "message": redact_error(exc)}, status_code=400)
         # 换 cookie 时清除 token 及全部健康缓存，避免跨账号泄露旧数据。
         await p._invalidate_auth_cache()
         p.logger.info("[华为健康] WebUI 导入了 %d 条 cookie" % n)
@@ -193,7 +197,8 @@ class HuaweiHealthWebApi:
             # 通过认证层的共享锁清除，避免与浏览器回写并发时旧 cookie 被恢复。
             p.auth.clear_cookies()
         except Exception as exc:
-            return json_response({"status": "error", "message": str(exc)}, status_code=500)
+            return json_response(
+                {"status": "error", "message": redact_error(exc)}, status_code=500)
         await p._invalidate_auth_cache()
         p.logger.warning("[华为健康] WebUI 清除了 cookie 文件")
         return json_response({"status": "ok", "message": "cookie 已清除，token 缓存已作废"})

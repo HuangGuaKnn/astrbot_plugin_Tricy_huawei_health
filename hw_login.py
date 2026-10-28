@@ -49,6 +49,7 @@ try:
         DPAPIUnavailableError,
         harden_file_permissions,
     )
+    from .hw_privacy import redact_error
 except ImportError:
     from hw_auth import (
         HuaweiAuth,
@@ -68,6 +69,7 @@ except ImportError:
         DPAPIUnavailableError,
         harden_file_permissions,
     )
+    from hw_privacy import redact_error
 
 
 LOGIN_STATES = {
@@ -903,7 +905,7 @@ class HuaweiLoginManager:
             return
         except (OSError, ValueError, TypeError) as exc:
             # v0.4.0 静默吞掉：文件被截断 → 额度/冷却静默清零，下一次写回把「干净」状态固化。
-            self._backup_bad_config("%s: %s" % (type(exc).__name__, exc))
+            self._backup_bad_config("%s: %s" % (type(exc).__name__, redact_error(exc)))
             self._prune_attempts()
             return
         if not isinstance(data, dict):
@@ -953,7 +955,7 @@ class HuaweiLoginManager:
         self.failure_cooldown_until = max(0.0, cooldown)
         if problems:
             self._log_warning("login_config.json 有非法字段，已按默认值处理：%s"
-                              % "；".join(problems))
+                              % redact_error("；".join(problems)))
         self._prune_attempts()
 
     def _save_login_config(self):
@@ -981,7 +983,8 @@ class HuaweiLoginManager:
         except OSError as exc:
             # 只读目录 / 文件被占用：闸门状态丢了比抛裸 OSError 一路穿到 WebUI 好。
             # v0.4.1 第一版这里会把 PermissionError 抛到 manager.start() 的调用方。
-            self._log_warning("写入 login_config.json 失败（%s），本次状态未持久化" % exc)
+            self._log_warning("写入 login_config.json 失败（%s），本次状态未持久化"
+                              % redact_error(exc))
         finally:
             try:
                 if os.path.exists(tmp):
