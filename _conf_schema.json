@@ -100,5 +100,36 @@
         "hint": "华为网页端的版本号，除非接口变更否则不要改",
         "type": "string",
         "default": "HealthKitRunningGroupPortal_6.26.4.200"
+    },
+    "permission_settings": {
+        "description": "权限与可见范围",
+        "type": "object",
+        "hint": "控制哪些会话、哪些人可以使用健康数据工具。健康数据属个人隐私，默认只在私聊、且仅管理员可用。",
+        "items": {
+            "allow_private": {
+                "description": "允许私聊",
+                "type": "bool",
+                "hint": "在私聊会话中提供健康数据工具。",
+                "default": true
+            },
+            "allow_group": {
+                "description": "允许群聊",
+                "type": "bool",
+                "hint": "在群聊会话中提供健康数据工具。默认关闭——本插件面向个人使用，群聊里通常不需要。",
+                "default": false
+            },
+            "extra_umo_whitelist": {
+                "description": "额外允许的会话 UMO",
+                "type": "list",
+                "hint": "每行一个，格式 platform:MessageType:session_id（例如 aiocqhttp:GroupMessage:123456789）。只覆盖上面两个开关，不会绕过下面的管理员限制。留空则不加任何例外。",
+                "default": []
+            },
+            "admin_only": {
+                "description": "仅 AstrBot 管理员可用",
+                "type": "bool",
+                "hint": "开启后，只有 AstrBot 管理员（框架 admins_id 中的账号）能调用健康数据工具。对所有会话生效，包括上面填的 UMO。",
+                "default": true
+            }
+        }
     }
 }

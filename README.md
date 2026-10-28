@@ -1,8 +1,8 @@
 # 华为运动健康 · AstrBot 插件
 
-版本：v0.4.2
+版本：v0.5.0-rc.1
 
-> 各版本变更见 [Releases](https://github.com/HuangGuaKnn/astrbot_plugin_Tricy_huawei_health/releases) 与 [CHANGELOG_v0.4.1.md](CHANGELOG_v0.4.1.md)、[CHANGELOG_v0.4.2.md](CHANGELOG_v0.4.2.md)。
+> 各版本变更见 [Releases](https://github.com/HuangGuaKnn/astrbot_plugin_Tricy_huawei_health/releases) 与 [CHANGELOG_v0.4.1.md](CHANGELOG_v0.4.1.md)、[CHANGELOG_v0.4.2.md](CHANGELOG_v0.4.2.md)、[CHANGELOG_v0.5.0.md](CHANGELOG_v0.5.0.md)。
 
 把华为运动健康**网页端**的睡眠 / 静息心率 / HRV / 运动记录 / 跑力数据接进 AstrBot，
 按需查询睡眠、心率、HRV 等健康数据。
@@ -25,6 +25,38 @@
 | `health_performance` | 运动能力评估（跑力 / 预测成绩）+ 跑步个人纪录 |
 | `health_overview` | 一次性查看全部已接入的健康数据（含近期运动） |
 | `health_refresh` | 清缓存并强制重新认证（数据在下次查询时重新拉取） |
+
+---
+
+## 权限与可见范围
+
+健康数据属于个人隐私，**默认只在私聊、且只对 AstrBot 管理员开放**。配置页里的「权限与可见范围」分组控制这些：
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `allow_private` | 开 | 私聊会话里提供健康数据工具 |
+| `allow_group` | 关 | 群聊会话里提供健康数据工具 |
+| `extra_umo_whitelist` | 空 | 额外允许的会话 UMO，每行一个，格式 `platform:MessageType:session_id`（例：`aiocqhttp:GroupMessage:123456789`） |
+| `admin_only` | 开 | 只允许 AstrBot 管理员（框架 `admins_id` 里的账号）调用 |
+
+判定顺序是**两层正交**的：
+
+1. **成员准入**（`admin_only`）先判，是硬门；
+2. **会话准入**（`allow_private` / `allow_group`）后判，可以被 `extra_umo_whitelist` 覆盖。
+
+也就是说：**把某个群加进白名单，只代表「允许这个群」，不代表「允许群里每个人」。**
+非管理员在白名单群里依然会被拒绝——否则「把群加进白名单」就等于把本人的健康数据对全群开放。
+
+两处生效点：
+
+- LLM 请求前把 8 个工具从本次请求的工具集里摘掉（省 token，模型也不会徒劳去试）；
+- 每个工具函数第一行还有一道兜底，覆盖 cron / 后台任务 / MCP 等绕过前者的路径。
+
+填错的 UMO（比如 `abc`、`a:b`、`x:FriendMessage:`）不会生效：插件启动时日志会报错，
+WebUI 的 `/status` 也会在 `permission.invalid_umos` 里回显，便于当场发现。
+
+> **从旧版本升级**：按默认值，群聊与非管理员会立刻无法使用这 8 个工具。
+> 如果原来靠群聊使用，需要显式打开「允许群聊」，或把该会话的 UMO 加进白名单。
 
 ---
 

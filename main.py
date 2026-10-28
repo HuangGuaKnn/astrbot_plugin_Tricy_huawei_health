@@ -59,6 +59,11 @@ TOOL_NAMES = [
     "health_activities", "health_performance", "health_overview", "health_refresh",
 ]
 
+#: AstrBot 会话 UMO 里合法的 MessageType（core/platform/message_type.py 只有这三个）。
+VALID_MESSAGE_TYPES = {"FriendMessage", "GroupMessage", "OtherMessage"}
+#: 权限配置在 _conf_schema.json 里的分组键。
+PERMISSION_SECTION = "permission_settings"
+
 
 def _data_dir() -> str:
     """插件数据目录（cookie / 数据库都放这儿）。"""
@@ -99,7 +104,7 @@ class LoginNeedsHuman(HuaweiAuthError):
     PLUGIN_NAME,
     "HuangGuaKnn",
     "把华为运动健康（网页端）的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot",
-    "v0.4.2",
+    "v0.5.0-rc.1",
 )
 class HuaweiHealthPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -124,6 +129,9 @@ class HuaweiHealthPlugin(Star):
                 self.login_manager.daily_limit = max(1, min(10, int(limit)))
             except (TypeError, ValueError):
                 pass
+        # 权限白名单在 initialize() 里构建（含格式校验）；None 表示「尚未构建」。
+        self._umo_whitelist = None
+        self._invalid_umos = []
         self.logger = logger
 
     async def initialize(self):
@@ -158,6 +166,11 @@ class HuaweiHealthPlugin(Star):
                     self.logger.info("[华为健康] 配置里的 cookie 未变化，保留现有 cookie 文件")
             except Exception as exc:
                 self.logger.warning("[华为健康] 配置里的 cookie 解析失败：%s" % redact_error(exc))
+        # 会话白名单：格式非法的条目在这里就报错，WebUI 的 /status 也会回显。
+        try:
+            self._build_umo_whitelist()
+        except Exception as exc:
+            self.logger.warning("[华为健康] 会话白名单解析失败：%s" % redact_error(exc))
         self.logger.info("[华为健康] 插件已就绪，数据目录：%s" % self.data_dir)
         # 注册 WebUI 页面 API（页面在 pages/health_console/）
         try:
@@ -766,6 +779,152 @@ class HuaweiHealthPlugin(Star):
                 results.append(task.result())
         return results
 
+    # ================= 权限（会话准入 + 成员准入）=================
+    #
+    # 两层正交，顺序不能换：
+    #   成员维度（admin_only）是硬门，任何会话白名单都救不了它；
+    #   会话维度（allow_private / allow_group）才允许被 UMO 白名单覆盖。
+    # 「把某个群加进白名单」只表示允许这个群，**不等于**允许群里每个人。
+
+    def _permission_config(self) -> dict:
+        """实时读权限分组（不缓存成模块级常量：热路径可能再次用到配置）。"""
+        raw = self.config.get(PERMISSION_SECTION)
+        return raw if isinstance(raw, dict) else {}
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        """配置布尔取值：容忍字符串/数字写法，非法值退回默认。"""
+        value = self._permission_config().get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("true", "1", "yes", "on"):
+                return True
+            if text in ("false", "0", "no", "off"):
+                return False
+        return default
+
+    def _parse_umos(self, raw_items):
+        """拆分合法/非法 UMO。非法项不生效（fail-closed），但不影响其它合法项。"""
+        valid, invalid = [], []
+        for raw in raw_items or []:
+            s = str(raw).strip()
+            if not s:
+                continue
+            # session_id 本身可能含冒号，所以只切两刀。
+            parts = s.split(":", 2)
+            if len(parts) == 3 and parts[0] and parts[2] and parts[1] in VALID_MESSAGE_TYPES:
+                valid.append(s)
+            else:
+                invalid.append(s)
+        return valid, invalid
+
+    def _build_umo_whitelist(self):
+        raw = self._permission_config().get("extra_umo_whitelist") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        try:
+            items = list(raw)
+        except TypeError:
+            items = []
+        valid, invalid = self._parse_umos(items)
+        self._umo_whitelist = set(valid)
+        self._invalid_umos = invalid
+        if invalid:
+            self.logger.error("[华为健康] 以下会话 UMO 格式不合法，已忽略：%s", invalid)
+        if valid:
+            self.logger.info("[华为健康] 会话白名单已加载 %d 项" % len(valid))
+        return valid, invalid
+
+    def _whitelist(self) -> set:
+        if self._umo_whitelist is None:
+            self._build_umo_whitelist()
+        return self._umo_whitelist or set()
+
+    def _is_allowed(self, event) -> bool:
+        """fail-closed：任何异常都按拒绝处理。"""
+        try:
+            if event is None:
+                # fail-closed：与 AstrBot 自身的取向一致——框架在
+                # event is None 时同样直接判「无权限」（见
+                # core/provider/func_tool_manager.py 的 admin 工具守卫）。
+                # 拿不到事件上下文就说明无法证明调用方有权，一律拒绝。
+                return False
+            # —— 成员维度：硬门，白名单救不了 ——
+            if self._cfg_bool("admin_only", True) and not event.is_admin():
+                return False
+            # —— 会话维度：白名单可以覆盖下面两个开关 ——
+            umo = (getattr(event, "unified_msg_origin", "") or "").strip()
+            if umo and umo in self._whitelist():
+                return True
+            if event.is_private_chat():
+                return self._cfg_bool("allow_private", True)
+            return self._cfg_bool("allow_group", False)
+        except Exception:
+            return False
+
+    def _deny_reason(self, event) -> str:
+        """拒绝原因：not_admin（成员维度）或 session_not_allowed（会话维度）。"""
+        try:
+            if self._cfg_bool("admin_only", True):
+                is_admin = getattr(event, "is_admin", None)
+                if not (callable(is_admin) and is_admin()):
+                    return "not_admin"
+        except Exception:
+            return "not_admin"
+        return "session_not_allowed"
+
+    def _deny_text(self, event) -> str:
+        """拒绝文案必须是「终局」：本设计不做前置注入，tool result 是唯一能让模型停下的地方。"""
+        if self._deny_reason(event) == "not_admin":
+            return ("（该功能当前不可用：本会话仅限 AstrBot 管理员使用健康数据。"
+                    "请勿再次调用本工具，直接告知用户「该会话中健康数据仅管理员可查」。）")
+        return ("（该功能当前不可用：本会话未获授权使用健康数据。"
+                "请勿再次调用本工具，直接告知用户「健康数据查询需在私聊中进行」。）")
+
+    def _event_umo(self, event) -> str:
+        return (getattr(event, "unified_msg_origin", "") or "") if event is not None else ""
+
+    def _event_sender(self, event) -> str:
+        try:
+            getter = getattr(event, "get_sender_id", None)
+            return getter() if callable(getter) else ""
+        except Exception:
+            return ""
+
+    @filter.on_llm_request()
+    async def _gate_health_tools(self, event, req):
+        """第一层：不放行就把 8 个工具从本次请求的工具集里摘掉。
+
+        省 token，也让模型不会徒劳地试。``req.func_tool`` 是每请求新建的
+        ``ToolSet`` 副本（``func_tool_manager.get_full_tool_set()`` 每次构造新
+        对象，``astr_main_agent`` 里赋给 ``req.func_tool``），所以
+        ``remove_tool()`` 不会污染全局工具表。
+        """
+        if req.func_tool is None:  # cron / 后台任务路径下可能是 None
+            return
+        try:
+            allowed = self._is_allowed(event)
+        except Exception:
+            allowed = False
+        if allowed:
+            return
+        for name in TOOL_NAMES:
+            try:
+                req.func_tool.remove_tool(name)
+            except Exception:
+                pass
+        try:
+            self.logger.debug(
+                "[华为健康] 已对本会话隐藏健康工具：umo=%s sender=%s reason=%s",
+                self._event_umo(event), self._event_sender(event),
+                self._deny_reason(event),
+            )
+        except Exception:
+            pass
+
     # ================= LLM 工具 =================
 
     @filter.llm_tool(name="health_status")
@@ -774,6 +933,8 @@ class HuaweiHealthPlugin(Star):
 
         用户问「健康数据通道通不通」「健康数据还能用吗」时用这个。
         """
+        if not self._is_allowed(event):
+            return self._deny_text(event)
         manager = self.login_manager
         mode = getattr(manager, "login_mode", "cookie")
         has_cookie = os.path.exists(self.cookie_file)
@@ -835,6 +996,8 @@ class HuaweiHealthPlugin(Star):
 
         用户问「今天身体怎么样」「昨晚睡得怎么样」「心率如何」时优先用这个。
         """
+        if not self._is_allowed(event):
+            return self._deny_text(event)
         parts = []
         try:
             hr = await self._cached("hr:2", lambda c: c.resting_heart_rate(2))
@@ -862,6 +1025,8 @@ class HuaweiHealthPlugin(Star):
 
         用户问「健康状况整体怎么样」「把能看的都给我看看」「健康总览」时用这个。
         """
+        if not self._is_allowed(event):
+            return self._deny_text(event)
         items = await self._overview_items()
         return "\n\n".join("【%s】\n%s" % (i["title"], i["text"]) for i in items)
 
@@ -872,6 +1037,8 @@ class HuaweiHealthPlugin(Star):
         Args:
             days(number): 查询天数，默认 7，范围 1~30
         """
+        if not self._is_allowed(event):
+            return self._deny_text(event)
         days = _int_cfg(days, 7, 1, 30)
         try:
             sl = await self._cached("sleep:%d" % days, lambda c: c.sleep_records(days))
@@ -886,6 +1053,8 @@ class HuaweiHealthPlugin(Star):
         Args:
             days(number): 查询天数，默认 7，范围 1~90
         """
+        if not self._is_allowed(event):
+            return self._deny_text(event)
         days = _int_cfg(days, 7, 1, 90)
         out = []
         try:
@@ -908,6 +1077,8 @@ class HuaweiHealthPlugin(Star):
             days(number): 回溯天数，默认 30，范围 1~365
             limit(number): 最多返回几条，默认 10，范围 1~50
         """
+        if not self._is_allowed(event):
+            return self._deny_text(event)
         days = _int_cfg(days, 30, 1, 365)
         limit = _int_cfg(limit, 10, 1, 50)
         try:
@@ -925,6 +1096,8 @@ class HuaweiHealthPlugin(Star):
 
         用户问「跑力多少」「半马能跑多久」「PB 是多少」时用这个。
         """
+        if not self._is_allowed(event):
+            return self._deny_text(event)
         out = []
         try:
             perf = await self._cached("perf", lambda c: c.athletic_performance(), ttl=3600)
@@ -945,6 +1118,8 @@ class HuaweiHealthPlugin(Star):
 
         用户问「刷新一下最新的健康数据」时用这个。
         """
+        if not self._is_allowed(event):
+            return self._deny_text(event)
         # 刷新时推进 generation，避免尚未结束的旧请求覆盖刷新后的缓存。
         await self._invalidate_auth_cache()
         try:

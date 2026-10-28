@@ -129,6 +129,50 @@ def default_config(**overrides):
     return cfg
 
 
+def metadata_version(plugin_dir=None):
+    """读取 ``metadata.yaml`` 里声明的版本号，作为版本比对唯一真值来源。
+
+    版本号一旦升级，硬编码字面值的断言会集体误报；断言应比对这个函数
+    返回的值。
+
+    Args:
+        plugin_dir: 插件目录，缺省用 ``PLUGIN_DIR``。
+
+    Returns:
+        ``metadata.yaml`` 中 ``version`` 字段的原始字符串（含 ``v`` 前缀）。
+    """
+    import re as _re
+
+    root = plugin_dir or PLUGIN_DIR
+    path = os.path.join(str(root), "metadata.yaml")
+    with open(path, "r", encoding="utf-8") as handle:
+        matched = _re.search(r"^version:\s*(\S+)\s*$", handle.read(), _re.MULTILINE)
+    if matched is None:
+        raise AssertionError("metadata.yaml 缺少 version 字段")
+    return matched.group(1)
+
+
+def allowed_event(**overrides):
+    """构造一个「管理员 + 私聊」的假事件。
+
+    用于直接调用工具函数体、不关心权限语义的用例（例如验收套件里那几处
+    ``plugin.health_status(...)``）。权限相关用例请自己构造事件并显式设置
+    ``_admin`` / ``_private`` / ``unified_msg_origin``。
+
+    Args:
+        **overrides: 需要覆盖的 ``AstrMessageEvent`` 构造参数。
+
+    Returns:
+        默认放行的 ``AstrMessageEvent`` 实例。
+    """
+    from astrbot.api.event import AstrMessageEvent
+
+    event = AstrMessageEvent(message="", sender="test-user", **overrides)
+    event._admin = True
+    event._private = True
+    return event
+
+
 def make_plugin(main_mod=None, initialize=False, plugin_dir=None, **config_overrides):
     """Create a plugin instance whose data_dir lives in the sandbox."""
     main_mod = main_mod or load_main(plugin_dir=plugin_dir)

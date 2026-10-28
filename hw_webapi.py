@@ -86,12 +86,46 @@ class HuaweiHealthWebApi:
 
     # ---------- 接口 ----------
 
+    @staticmethod
+    def _permission_snapshot(p) -> dict:
+        """权限状态快照（T7）。
+
+        AstrBot 没有「插件侧配置保存前校验」钩子，所以采用等效方案：
+        保存 → 自动重载 → 立刻把不合法的 UMO 回显出来。字段缺失时按
+        fail-closed 的默认值回显，本方法绝不抛异常。
+        """
+
+        def flag(key, default):
+            getter = getattr(p, "_cfg_bool", None)
+            if callable(getter):
+                try:
+                    return bool(getter(key, default))
+                except Exception:
+                    return default
+            return default
+
+        try:
+            extra_umo_count = len(p._whitelist())
+        except Exception:
+            extra_umo_count = 0
+        try:
+            invalid = [str(item) for item in (getattr(p, "_invalid_umos", None) or [])]
+        except Exception:
+            invalid = []
+        return {
+            "allow_private": flag("allow_private", True),
+            "allow_group": flag("allow_group", False),
+            "admin_only": flag("admin_only", True),
+            "extra_umo_count": extra_umo_count,
+            "invalid_umos": invalid,
+        }
+
     async def get_status(self):
         p = self.plugin
         manager = getattr(p, "login_manager", None)
         data = {
             # 页面状态版本与插件元数据统一，避免前端误判部署版本。
-            "version": "v0.4.2",
+            "version": "v0.5.0-rc.1",
             "data_dir": p.data_dir,
             "cookie_file": p.cookie_file,
             "login_mode": getattr(manager, "login_mode", "cookie"),
@@ -102,6 +136,8 @@ class HuaweiHealthWebApi:
                 "data_ttl": p.config.get("data_ttl", 600),
                 "warmup": bool(p.config.get("warmup", True)),
             },
+            # T7：权限可见范围 + 不合法的 UMO 回显（不改动上面的现有字段）。
+            "permission": self._permission_snapshot(p),
         }
 
         # cookie

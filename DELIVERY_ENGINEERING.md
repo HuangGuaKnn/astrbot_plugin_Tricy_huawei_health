@@ -20,6 +20,7 @@
 | T6 | 完成 | `astrbot-runner-contract` job + 两个契约脚本 + `scripts/resolve_astrbot_ref.py` |
 | **P1** | **已修** | 闸门改为复用 `hw_privacy._SENSITIVE_KEYS`（单一真值来源）+ 新增 CASTGC 值特征规则 |
 | **P2** | **已修** | CDP 目标地址异常保留 `scheme://host:port`，只丢弃路径与查询串 |
+| **T7** | **已完成** | 权限边界：会话准入 + 成员准入（两层正交，白名单不覆盖成员维度） |
 
 **未 commit、未 push、未动 tag、未改版本号**（`v0.4.2` 四处保持一致）。改动全部留在工作区，等验收人复核。
 
@@ -652,3 +653,124 @@ cd <仓库根>
 | T6 冒烟 | `check_astrbot_runtime_smoke.py` | 8/8，exit=0 ✅ |
 | 本轮改动文件 | 按修改时间 | 仅 `hw_auth.py`、`scripts/privacy_gate.py`、本文档 ✅ |
 | 红线 | 全仓 grep | 本机账户名 / 私有称呼 → 0 命中 ✅ |
+
+---
+
+## 14. T7 · 权限边界（会话准入 + 成员准入）
+
+来源：`派活单_华为健康插件_T7_权限边界.md`。**前置说明**：接手时 T0–T6 已由项目所有者提交为 `e519f67`，工作区干净；派活单 §1 写的「HEAD 5a4dcc4 + 工作区脏」已过期，实质内容（T0–T6 齐备、`pytest tests/` 217 passed）与前置要求一致，故继续执行。
+
+### 14.1 设计落地
+
+**配置**：`_conf_schema.json` 新增顶层键 `permission_settings`（`type: object`，4 项）。原 17 个平铺键**一字未动**，schema 顶层键由 17 → 18。
+
+| 配置项 | 默认值 | 语义 |
+|---|---|---|
+| `allow_private` | `true` | 私聊会话提供工具 |
+| `allow_group` | `false` | 群聊会话提供工具 |
+| `extra_umo_whitelist` | `[]` | 额外允许的会话 UMO（`platform:MessageType:session_id`） |
+| `admin_only` | `true` | 仅 AstrBot 管理员可用 |
+
+**判定顺序（两层正交，顺序不可换）**：
+
+1. **成员维度**（`admin_only`）→ 硬门。`admin_only` 为真且 `not event.is_admin()` → 拒绝，**白名单救不了**。
+2. **会话维度** → 先看 UMO 白名单（命中即放行，可覆盖下面两个开关），否则按 `is_private_chat()` 走 `allow_private` / `allow_group`。
+
+> 核心约束的实现方式：成员维度**先于**会话维度判定并直接 `return False`，所以「把某个群加进白名单」只等于「允许这个群」，不等于「允许群里每个人」。
+
+**两处生效点**：
+
+- `@filter.on_llm_request()` 的 `_gate_health_tools`：拒绝时把 8 个工具从**本次请求**的 `ToolSet` 副本里移除（`req.func_tool` 每请求新建，不污染全局）。`req.func_tool is None` 时直接返回。
+- 8 个工具函数**第一行**兜底 `if not self._is_allowed(event): return self._deny_text(event)`，覆盖 `request_llm` / `tool_exec` / cron / MCP 等绕过路径。
+
+**拒绝文案**分两种（按 `_deny_reason()` 的 `not_admin` / `session_not_allowed` 选择），两种都含「**请勿再次调用**」——本设计不做前置注入，tool result 是唯一能让模型停下的地方。
+
+**UMO 校验**：`MessageType` 只接受 `FriendMessage` / `GroupMessage` / `OtherMessage`；`split(":", 2)` 保证 session_id 含冒号也能解析。非法项不生效（fail-closed）、不影响合法项，并写入 `self._invalid_umos`。
+
+**WebUI 回显**：`/status` 新增 `permission` 块（`allow_private` / `allow_group` / `admin_only` / `extra_umo_count` / `invalid_umos`），现有字段一个未改。
+
+### 14.2 改动文件清单（全部为新增行，0 删除）
+
+| 文件 | 行数变化 | 说明 |
+|---|---|---|
+| `main.py` | **+174 / −0** | 权限方法组 + `on_llm_request` 闸门 + 8 个工具兜底 + `initialize()` 构建白名单 |
+| `hw_webapi.py` | **+36 / −0** | `_permission_snapshot()` + `/status` 的 `permission` 块 |
+| `_conf_schema.json` | **+31 / −0** | `permission_settings` 分组 |
+| `README.md` | **+32 / −0** | 新增「权限与可见范围」章节（含升级行为变化） |
+| `tests/stubs/astrbot/api/event.py` | **+38 / −0** | 见 §14.4-1（纯新增） |
+| `tests/test_permissions.py` | **新增 437 行 / 19,138 B** | 41 条测试 |
+| `DELIVERY_ENGINEERING.md` | +1（总览）+ 本节 | 交付记录 |
+
+`main.py` 新增函数位置：`_permission_config`(789) / `_cfg_bool`(794) / `_parse_umos`(809) / `_build_umo_whitelist`(824) / `_is_allowed`(846) / `_deny_reason`(867) / `_deny_text`(878) / `_gate_health_tools`(897)。
+
+### 14.3 验证结果
+
+**全量**：`pytest tests -q` → **258 passed**（原 217 + 新增 41）；178 条验收套件 `Ran 178 / OK`。
+
+**§4.1 十行矩阵**（`tests/test_permissions.py::TestIsAllowedMatrix`，一行一个测试，全部通过）：
+
+| # | 场景 | 结果 |
+|---|---|---|
+| 1 | 私聊 / 管理员 / admin_only=on | 放行 ✅ |
+| 2 | 私聊 / 非管理员 / admin_only=on | 拒绝，`not_admin` ✅ |
+| 3 | 私聊 / 非管理员 / admin_only=off | 放行 ✅ |
+| 4 | 群聊 / 管理员 / allow_group=off | 拒绝，`session_not_allowed` ✅ |
+| 5 | 群聊 / 管理员 / allow_group=on | 放行 ✅ |
+| 6 | 群聊 / 非管理员 / allow_group=on | 拒绝，`not_admin` ✅ |
+| 7 | 群聊 / 管理员 / allow_group=off / **在白名单** | 放行（白名单覆盖会话维度）✅ |
+| 8 | 群聊 / **非管理员** / allow_group=off / **在白名单** | **拒绝，`not_admin`（白名单不覆盖成员维度）** ✅ |
+| 9 | 群聊 / 非管理员 / allow_group=off / 在白名单 / admin_only=off | 放行 ✅ |
+| 10 | 私聊 / 管理员 / allow_private=off | 拒绝，`session_not_allowed` ✅ |
+
+**§4.2 两层**：
+
+| 层 | 验证 | 结果 |
+|---|---|---|
+| `on_llm_request` | 拒绝时 8 个工具全部从 `req.func_tool` 移除 | ✅ |
+| `on_llm_request` | 放行时 8 个工具全部保留 | ✅ |
+| `on_llm_request` | `req.func_tool is None` 不崩、不做任何事 | ✅ |
+| `on_llm_request` | 闸门确实以 `on_llm_request` 注册（`__on_llm_request__` + 注册表命中） | ✅ |
+| 工具内兜底 | 绕过闸门直接调 8 个工具：拒绝文案 + **不触达任何取数/认证代码**（spy 计数为 0）+ 输出不含 sentinel | ✅ |
+| 工具内兜底 | 放行时 8 个工具均不返回拒绝文案（证明真的通过了权限检查） | ✅ |
+
+**§4.3 边界**：`req.func_tool is None`、`_is_allowed` 内部抛异常（fail-closed）、`unified_msg_origin` 为空串、白名单空 + `admin_only=false` + `allow_group=false`、UMO 校验（`abc` / `a:b` / `x:FriendMessage:` / `x:Bogus:y` 全判非法；`aiocqhttp:GroupMessage:123` 合法；`webchat:FriendMessage:abc:def` 因 session_id 含冒号仍合法）、旧 17 项配置仍可读 —— 全部覆盖并通过。
+
+**§4.4 变异验证 M1–M4**（改完即还原，最终 `main.py` 与变异前 SHA256 逐字节一致）：
+
+| 变异 | 操作 | 期望变红的测试 | 实测 |
+|---|---|---|---|
+| M1 | `if False and <admin_only 判断>` | #2 / #6 / #8 | `3 failed`：`test_row02_*`、`test_row06_*`、`test_row08_*` ✅ |
+| M2 | `if False and <白名单短路>` | #7 | `1 failed`：`test_row07_*` ✅ |
+| M3 | `if False and <工具内 _is_allowed 兜底>`（命中 8 处） | 绕过闸门的两条 | `2 failed`：`test_all_eight_tools_deny_and_leak_nothing`、`test_all_eight_tools_deny_on_session_denial` ✅ |
+| M4 | `for name in ()`（禁用 `remove_tool` 循环） | 工具应被移除的两条 | `2 failed`：`test_denied_request_has_all_eight_tools_removed`、`test_session_denied_also_removes_tools` ✅ |
+
+每次变异后立即还原并复跑，四条均恢复为 `passed`。
+
+### 14.4 两处需要复核的偏离
+
+**① `tests/stubs/astrbot/api/event.py` 必须扩展（不在派活单 §6.1 的文件清单里）**
+
+原因是硬性的，不是可选优化：
+
+- 桩里的 `_Filter` 没有 `on_llm_request`，而 `main.py` 在**类定义期**就要执行 `@filter.on_llm_request()` → 不补则整个测试套件 import 直接失败（连 178 条都会挂）。
+- 桩里的 `AstrMessageEvent` 没有 `unified_msg_origin` / `is_admin()` / `is_private_chat()` / `get_sender_id()`，与真实 API 不一致，无法测权限。
+
+处理方式：**纯新增**（`+38 / −0`），既有成员一行未改；新方法默认 `_admin=True` / `_private=True`，保证既有用例语义不变。这符合红线 1 的「只能新增、不能重写」。
+
+**② `_is_allowed(None)` 返回 `True`（与「fail-closed」字面有张力）**
+
+`tests/test_v041.py` 有 **7 处** `plugin.health_xxx(None)` 直接调用工具（如 `test_password_mode_reports_credentials` 断言返回文本含「账号密码」）。红线 1 禁止修改该文件，若对 `None` 也 fail-closed，这 7 条会立刻变红，与「基线必须保持」冲突。
+
+处理方式：在 `_is_allowed` 里对 `event is None` 单独放行，并在代码注释说明——**AstrBot 调度工具时一定传真实 event，`None` 只出现在插件内部直接调用，任何消息路径都拿不到 `None`**。所有真实事件（含 cron / tool_exec / MCP 路径）仍严格 fail-closed。
+
+如果验收人认为 `None` 也必须拒绝，则必须放开 `tests/test_v041.py` 的修改权限（需同时改那 7 处为传真实事件），请指示。
+
+### 14.5 升级后的行为变化（需在发布说明中提示）
+
+按默认值（`allow_private=true` / `allow_group=false` / `admin_only=true` / 白名单空）：
+
+- **群聊里 8 个工具全部不可用**（之前可用）；
+- **非管理员账号在私聊里也不可用**（之前可用）；
+- 管理员私聊：行为不变。
+
+也就是说，旧版本「谁都能问」的状态在升级后会被默认收紧。需要恢复群聊使用的用户，必须显式打开「允许群聊」或把该会话 UMO 加入白名单。此变化已写入 README 的「权限与可见范围」章节。

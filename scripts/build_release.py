@@ -38,6 +38,7 @@ ROOT_FILES = (
     "_conf_schema.json",
     "CHANGELOG_v0.4.1.md",
     "CHANGELOG_v0.4.2.md",
+    "CHANGELOG_v0.5.0.md",
     "LICENSE",
     "README.md",
     "logo.png",

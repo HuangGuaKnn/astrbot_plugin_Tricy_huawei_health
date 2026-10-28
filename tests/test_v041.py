@@ -1277,7 +1277,7 @@ class TestOverviewIncludesActs(unittest.TestCase):
             return client
 
         plugin._client = _client
-        return asyncio.run(plugin.health_overview(None))
+        return asyncio.run(plugin.health_overview(boot.allowed_event()))
 
     def test_overview_contains_activity_record(self):
         text = self._run_overview([
@@ -1308,14 +1308,14 @@ class TestHealthStatus(unittest.TestCase):
         plugin = make_plugin()
         plugin.login_manager.login_mode = "password"
         plugin.credentials.save("13800138000", "pw")
-        text = asyncio.run(plugin.health_status(None))
+        text = asyncio.run(plugin.health_status(boot.allowed_event()))
         self.assertIn("账号密码", text)
         self.assertIn("已保存", text)
         self.assertNotIn("需要导入", text)
 
     def test_cookie_mode_mentions_cookie(self):
         plugin = make_plugin()
-        text = asyncio.run(plugin.health_status(None))
+        text = asyncio.run(plugin.health_status(boot.allowed_event()))
         self.assertIn("Cookie", text)
 
 
@@ -1879,7 +1879,7 @@ class TestHealthStatusProbe(unittest.TestCase):
         real = hw_client.HuaweiHealthClient.resting_heart_rate
         hw_client.HuaweiHealthClient.resting_heart_rate = lambda self, days=7: _probe()
         try:
-            return asyncio.run(plugin.health_status(None))
+            return asyncio.run(plugin.health_status(boot.allowed_event()))
         finally:
             hw_client.HuaweiHealthClient.resting_heart_rate = real
 
@@ -1902,7 +1902,7 @@ class TestHealthStatusProbe(unittest.TestCase):
 
     def test_no_token_skips_probe(self):
         plugin = make_plugin()
-        text = asyncio.run(plugin.health_status(None))
+        text = asyncio.run(plugin.health_status(boot.allowed_event()))
         self.assertIn("跳过", text)
 
 
@@ -2067,7 +2067,7 @@ class TestToolParamGuards(unittest.TestCase):
             return client
 
         plugin._client = _client
-        text = asyncio.run(plugin.health_sleep(None, days="7天"))
+        text = asyncio.run(plugin.health_sleep(boot.allowed_event(), days="7天"))
         self.assertIn("最近 7 天", text)
 
     def test_health_activities_bad_args(self):
@@ -2078,7 +2078,7 @@ class TestToolParamGuards(unittest.TestCase):
             return client
 
         plugin._client = _client
-        text = asyncio.run(plugin.health_activities(None, days=None, limit="abc"))
+        text = asyncio.run(plugin.health_activities(boot.allowed_event(), days=None, limit="abc"))
         self.assertIn("没有运动记录", text)
 
 
