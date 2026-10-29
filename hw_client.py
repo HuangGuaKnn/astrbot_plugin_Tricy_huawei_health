@@ -479,7 +479,10 @@ class HuaweiHealthClient:
             raise SchemaDrift("sampleConfigs 缺失，实际键=%s" % list(raw)[:8])
         if not isinstance(configs, list):
             raise SchemaDrift("sampleConfigs 不是数组（%s）" % type(configs).__name__)
-        # TODO(v0.3.2)：核实华为端区间字段的真实语义和上下界，避免仅凭字段名推断顺序。
+        # 字段语义已按实际响应核实（2026-10-29，Issue #2）：华为的
+        # ``mAnaerobicThreshold``(166) 低于 ``mAnaerobicBaseThreshold``(170)，
+        # 因此前者才是「无氧基础」、后者是「无氧耐力」。九档按数值排列为
+        # 110 → 129 → 135 → 147 → 153 → 165 → 166 → 170 → 178，严格单调。
         for item in configs:
             if not isinstance(item, dict):
                 continue
@@ -507,8 +510,9 @@ class HuaweiHealthClient:
                 "aerobic": hr.get("mAerobicThreshold"),
                 "aerobic_advance": hr.get("mAerobicAdvanceThreshold"),
                 "lactic_acid": hr.get("mLacticAcidThreshold"),
-                "anaerobic_base": hr.get("mAnaerobicBaseThreshold"),
-                "anaerobic": hr.get("mAnaerobicThreshold"),
+                # 注意：这两个字段名与语义是反的，见上方说明与 Issue #2。
+                "anaerobic_base": hr.get("mAnaerobicThreshold"),
+                "anaerobic": hr.get("mAnaerobicBaseThreshold"),
                 "anaerobic_advance": hr.get("mAnaerobicAdvanceThreshold"),
             }
             if all(v is None for v in zones.values()):

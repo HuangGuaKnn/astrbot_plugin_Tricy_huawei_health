@@ -1,13 +1,63 @@
-# v0.5.0-rc.1 变更
+# v0.5.0 系列变更
 
+> 当前版本：**v0.5.0-rc.2**（预发布 / release candidate）
 > 基线：v0.4.2（v0.4.1 的逐条修复对照见 `CHANGELOG_v0.4.1.md`）
-> 本版是**预发布（release candidate）**：tag 形状（`-rc.1`）与 GitHub Release 均标记为 pre-release。
+> tag 形状（`-rc.N`）与 GitHub Release 的 pre-release 标记共同表达「这是预览版」。
 
-## 破坏性变更（升级前必读）
+---
+
+## rc.2（相对 rc.1）
+
+### 修复
+
+**心率区间：「无氧基础」与「无氧耐力」两档标签映射反了**（Issue #2）
+
+原先的输出：
+
+```
+无氧进阶 ≥ 178
+无氧耐力 ≥ 166     ← 比下一档还低
+无氧基础 ≥ 170
+乳酸阈值 ≥ 165
+```
+
+核对华为原始响应（`GET /sampleConfigs?type=9002&id=900200028`）后发现，字段名与语义顺序不一致：
+
+| 字段 | 值 |
+|---|---|
+| `mLacticAcidThreshold` | 165 |
+| `mAnaerobicThreshold` | **166** |
+| `mAnaerobicBaseThreshold` | **170** |
+| `mAnaerobicAdvanceThreshold` | 178 |
+
+按数值排列是一条完美单调阶梯：110 → 129 → 135 → 147 → 153 → 165 → 166 → 170 → 178。
+也就是说 `mAnaerobicThreshold`(166) 才是较低的「无氧基础」，`mAnaerobicBaseThreshold`(170) 才是「无氧耐力」。
+`hw_client.py` 中这两项的映射已互换，并补上了说明注释。
+
+**影响范围**：仅显示标签。所有阈值数值本身正确，不影响认证、取数、缓存等任何其它链路。
+
+### 新增测试
+
+`tests/test_hr_zones.py`（6 条守卫）：
+
+- 九档阈值齐全时**必须严格单调递增且不重复**
+- `anaerobic_base` 必须低于 `anaerobic`
+- 乳酸阈值必须低于无氧基础
+- 静息低于最低档、最大心率高于最高档
+- **渲染顺序必须从高到低单调递减**（防止展示层排错）
+- 字段缺失时不崩溃且保持相对顺序
+
+变异验证：把映射改回错误版本后，其中 4 条测试立即变红。
+
+---
+
+## rc.1（首次预发布）
+
+### 破坏性变更（升级前必读）
 
 **权限默认收紧**，升级后以下场景会从「可用」变成「不可用」：
 
-| 场景 | v0.4.2 | v0.5.0-rc.1 默认 |
+| 场景 | v0.4.2 | v0.5.0 默认 |
 |---|---|---|
 | 私聊 + 管理员 | 可用 | **可用**（不变） |
 | 私聊 + 非管理员 | 可用 | **不可用** |
@@ -17,7 +67,7 @@
 
 配置层面向后兼容：只新增一个 `permission_settings` 分组，原有 17 项一字未改。
 
-## 新增 · 权限与可见范围
+### 新增 · 权限与可见范围
 
 三层正交设计，**成员维度是硬门，会话维度的白名单救不了它**：
 
@@ -35,15 +85,21 @@
 
 UMO 格式在加载时校验（`platform:MessageType:session_id`），非法条目报错并忽略，不影响其它合法条目。
 
-## 工程加固
+### 工程加固
 
 - **错误信息脱敏**：新增 `hw_privacy.redact_error()`，11 条规则清洗 token / cookie / 私钥 / URL / 本机路径 / 邮箱 / AstrBot 会话标识 / 控制字符；6 个模块 26 处调用点接入
 - **隐私闸门**：新增 `scripts/privacy_gate.py`，fail-closed，源码树与发布包双查（禁止后缀 / 私钥 / 已知 token 格式 / 敏感字段赋值 / cookie 对 / 本机路径 / 归档体积）；敏感键名复用单一来源（含 `castgc` / `sid` / `hwid_cas_sid`），另加 CASTGC 值特征规则
 - **确定性打包**：新增 `scripts/build_release.py`，显式文件清单 + 版本号从 `metadata.yaml` 单一来源提取
-- **CI**：新增 `.github/workflows/checks.yml`，Python 3.11/3.12 矩阵（隐私闸门 → pytest → compileall → 打包 → 归档闸门），外加 `astrbot-runner-contract` 双通道契约测试
-- **测试入库**：178 条验收用例 + 39 条脱敏单测 + 41 条权限测试，合计 **259 passed**
+- **CI**：新增 `.github/workflows/checks.yml`，Linux 3.11/3.12 矩阵 + Windows DPAPI job + `astrbot-runner-contract` 双通道契约测试
 - `metadata.yaml` 补 `short_desc` 与 `astrbot_version`（`>=4.26.0,<5`：`astrbot.api.web` 自 4.26.0 起提供，更早版本会在 import 阶段失败）
+
+---
 
 ## 升级说明
 
 覆盖升级即可，无需重新登录。升级后请在 WebUI 的「权限与可见范围」确认默认值符合预期。
+
+## 平台说明
+
+账号密码登录依赖 Windows DPAPI，**仅 Windows 可用**（非 Windows 平台会明确禁用该功能，不会降级为明文保存密码）。
+所有平台都可用 **cookie 模式**：非 Windows 上 cookie 文件按设计降级为明文并收紧到 `0600`，且有测试覆盖。
