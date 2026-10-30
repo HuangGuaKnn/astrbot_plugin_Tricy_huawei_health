@@ -112,5 +112,48 @@ class TimezoneFieldValidationTests(unittest.TestCase):
         self.assertEqual(value, "+0800")
 
 
+class BrowserPathReportingTests(unittest.TestCase):
+    """``/status`` 必须把「配置路径失效、已回退默认」说出来。
+
+    ``find_browser`` 在「填了路径但文件不存在」时会静默回退到默认浏览器。
+    之前 ``_browser()`` 只返回实际找到的那一个，用户会以为自己填的路径生效了——
+    这是「配置填错但查不出原因」的常见来源。
+    """
+
+    def setUp(self):
+        self.api, _ = make_api()
+
+    def _with_path(self, value):
+        self.api.plugin.config["browser_path"] = value
+        return self.api._browser()
+
+    def test_missing_configured_path_is_reported(self):
+        missing = os.path.join(boot.sandbox_dir("t_br"), "definitely-not-a-browser.exe")
+        info = self._with_path(missing)
+        self.assertEqual(info["configured"], missing)
+        self.assertFalse(info["configured_ok"])
+        # 不应把不存在的路径当成找到了
+        self.assertNotEqual(info["path"], missing)
+
+    def test_existing_configured_path_is_accepted(self):
+        # 用当前解释器当「确实存在的可执行文件」，跨平台稳定
+        info = self._with_path(sys.executable)
+        self.assertEqual(info["configured"], sys.executable)
+        self.assertTrue(info["configured_ok"])
+        self.assertEqual(info["path"], sys.executable)
+
+    def test_blank_config_reports_no_override(self):
+        for blank in ("", "   "):
+            with self.subTest(blank=repr(blank)):
+                info = self._with_path(blank)
+                self.assertEqual(info["configured"], "")
+                self.assertTrue(info["configured_ok"], "没填路径不算配错")
+
+    def test_payload_never_contains_file_contents(self):
+        """这条接口只回路径，不回任何文件内容或凭据。"""
+        info = self._with_path(sys.executable)
+        self.assertEqual(set(info) - {"path", "found", "configured", "configured_ok"}, set())
+
+
 if __name__ == "__main__":
     unittest.main()

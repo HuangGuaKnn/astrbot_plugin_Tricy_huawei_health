@@ -197,10 +197,20 @@ class HuaweiHealthWebApi:
                 from .hw_auth import find_browser
             except ImportError:
                 from hw_auth import find_browser
-            path = find_browser((p.config.get("browser_path") or "").strip())
+            configured = (p.config.get("browser_path") or "").strip()
+            path = find_browser(configured)
         except Exception:
-            path = ""
-        return {"path": path, "found": bool(path)}
+            return {"path": "", "found": False, "configured": "", "configured_ok": True}
+        # find_browser 在「填了路径但文件不存在」时会静默回退到默认浏览器。
+        # 页面必须把这件事说出来，否则用户会以为自己填的路径生效了——
+        # 这正是「配置填错但查不出原因」的常见来源。
+        configured_ok = (not configured) or os.path.exists(configured)
+        return {
+            "path": path,
+            "found": bool(path),
+            "configured": configured,
+            "configured_ok": configured_ok,
+        }
 
     def _cookie_storage_data(self) -> dict:
         """只返回存储保护方式，不把 Cookie 内容或文件路径交给页面。"""

@@ -732,7 +732,15 @@ function renderStatus(d){
   brCell.appendChild(dot(br.found ? "ok" : "err"));
   brCell.appendChild(textNode(br.found ? String(br.path || "").split(/[\\/]/).pop() : "未找到"));
   brCell.title = br.path || "";
-  $("s_browser_path").textContent = br.path || "-";
+  // find_browser 在「填了路径但文件不存在」时会静默回退到默认浏览器，
+  // 这里把回落说出来，否则用户会以为自己填的路径生效了。
+  if(br.configured && br.configured_ok === false){
+    $("s_browser_path").textContent = br.configured + "（不存在）→ 实际使用 " + (br.path || "未找到");
+    $("s_browser_path").title = "配置里填的浏览器路径不存在，已回退到默认浏览器";
+  }else{
+    $("s_browser_path").textContent = br.path || "-";
+    $("s_browser_path").title = br.configured ? "配置路径生效" : "";
+  }
 
   const keys = (ck.keys || []);
   // cookie 名称和域名来自本地导入文件，使用 DOM API 赋值，避免恶意值被当作 HTML 解析。
