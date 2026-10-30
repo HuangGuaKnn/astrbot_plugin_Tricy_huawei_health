@@ -324,15 +324,18 @@ class HuaweiLoginSession:
 
     def _run(self):
         try:
-            self._launch()
+            ready = self._launch() or {}
             if self._cancel.is_set():
                 return
             if self.mode == "auto":
-                token = self._auth._js(self._ws, "sessionStorage.getItem('accessToken')")
+                # Keep a token observed during navigation: another read may land
+                # in a transient document while the SPA redirects to its dashboard.
+                token = ready.get("token") or self._read_access_token()
+                if not token and not ready.get("await_token"):
+                    token = self._auto_submit_credentials()
                 if token:
                     self._finish(token)
                     return
-                self._auto_submit_credentials()
                 with self._lock:
                     self._set_state("SUBMITTING", refresh=True)
             else:
@@ -399,8 +402,7 @@ class HuaweiLoginSession:
             self._ensure_active()
             self._auth._call(self._ws, "Page.navigate", {"url": TRAINING_CAMP_URL})
             if self._headless:
-                if not self._wait_login_button():
-                    raise LoginFlowError("credentials_page")
+                return self._wait_login_ready()
             else:
                 try:
                     self._auth._js(self._ws, self._login_click_script())
@@ -441,23 +443,60 @@ class HuaweiLoginSession:
             self._auth._call(self._ws, "Network.setCookies", {"cookies": cookies})
             self._ensure_active()
 
-    def _wait_login_button(self):
+    def _read_access_token(self):
+        self._ensure_active()
+        token = self._auth._js(self._ws, "sessionStorage.getItem('accessToken')")
+        self._ensure_active()
+        return token.strip() if isinstance(token, str) else ""
+
+    def _wait_login_ready(self):
+        """Distinguish a token, a pending authenticated page, and a login form.
+
+        A valid Cookie session can bypass the login button entirely. A direct
+        redirect to the account form is also ready; neither requires that button.
+        """
         deadline = time.monotonic() + min(40, max(1, self._auth.page_timeout))
-        while time.monotonic() < deadline and not self._cancel.is_set():
+        while time.monotonic() < deadline:
+            self._ensure_active()
             try:
-                if self._auth._js(self._ws, "sessionStorage.getItem('accessToken')"):
-                    return True
+                token = self._read_access_token()
+                if token:
+                    return {"token": token}
                 result = self._auth._js(self._ws, self._login_click_script())
-                if result == "clicked":
-                    return True
+                self._ensure_active()
+                if isinstance(result, dict):
+                    token = result.get("token")
+                    if isinstance(token, str) and token.strip():
+                        return {"token": token.strip()}
+                    if result.get("await_token") is True:
+                        return {"await_token": True}
+                if result in ("clicked", "credentials"):
+                    return {}
+            except LoginFlowError:
+                raise
             except HuaweiAuthError:
                 raise
             except Exception:
                 pass
-            time.sleep(0.5)
-        return False
+            self._cancel.wait(0.5)
+        self._ensure_active()
+        raise LoginFlowError("credentials_page")
 
     # ---------- 页面脚本 ----------
+
+    @staticmethod
+    def _existing_login_script() -> str:
+        # UserLoginView may restore cookies through authInfo and navigate directly
+        # to the dashboard. The user menu uses v-show, so hidden nodes are not
+        # evidence of an authenticated page. Even a visible menu only starts a
+        # bounded token wait; _finish still requires an actual accessToken.
+        return (
+            "const token=sessionStorage.getItem('accessToken');"
+            "if(token&&token.trim())return {token:token.trim()};"
+            "const menu=document.querySelector('div.custom-select-container');"
+            "if(menu&&visible(menu)&&menu.querySelector('li.custom-option.text-orange'))"
+            "return {await_token:true};"
+        )
 
     @staticmethod
     def _credential_fill_script(account: str, password: str) -> str:
@@ -468,9 +507,10 @@ class HuaweiLoginSession:
             # 只把密码交给 huawei.com：v0.4.0 没有任何域名校验，页面被替换时会照填。
             "const host=location.hostname;"
             "if(!/(^|\\.)huawei\\.com$/i.test(host))return 'wronghost';"
-            "const user=%s,pwd=%s;"
             "const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);"
             "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';};"
+            + HuaweiLoginSession._existing_login_script() +
+            "const user=%s,pwd=%s;"
             "const set=(sel,val)=>{const e=document.querySelector(sel);if(!e||!visible(e))return false;"
             "const d=Object.getOwnPropertyDescriptor(e.constructor.prototype,'value');"
             "if(!d||!d.set)return false;d.set.call(e,val);e.dispatchEvent(new Event('input',{bubbles:true}));"
@@ -484,6 +524,9 @@ class HuaweiLoginSession:
         ) % (account_json, password_json)
 
     def _auto_submit_credentials(self):
+        token = self._read_access_token()
+        if token:
+            return token
         store = getattr(self.plugin, "credentials", None)
         if store is None or not store.available:
             raise LoginFlowError("credentials_unavailable")
@@ -501,14 +544,24 @@ class HuaweiLoginSession:
         password = values.get("password", "")
         deadline = time.monotonic() + min(45, max(1, self._auth.page_timeout))
         try:
-            while time.monotonic() < deadline and not self._cancel.is_set():
+            while time.monotonic() < deadline:
+                token = self._read_access_token()
+                if token:
+                    return token
                 result = self._auth._js(self._ws, self._credential_fill_script(account, password))
+                self._ensure_active()
+                if isinstance(result, dict):
+                    token = result.get("token")
+                    if isinstance(token, str) and token.strip():
+                        return token.strip()
+                    if result.get("await_token") is True:
+                        return ""
                 if result == "submitted":
                     self._credentials_submitted = True
-                    return
+                    return ""
                 if result == "wronghost":
                     raise LoginFlowError("wronghost")
-                time.sleep(0.5)
+                self._cancel.wait(0.5)
         except LoginFlowError:
             raise
         except Exception as exc:
@@ -517,6 +570,7 @@ class HuaweiLoginSession:
             account = None
             password = None
             values = None
+        self._ensure_active()
         raise LoginFlowError("credentials_page")
 
     def _try_visible_fallback(self, code: str) -> bool:
@@ -559,6 +613,10 @@ class HuaweiLoginSession:
         return (
             "(()=>{const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);"
             "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';};"
+            + HuaweiLoginSession._existing_login_script() +
+            "const u=document.querySelector('input.userAccount'),"
+            "p=document.querySelector('input.hwid-input-pwd');"
+            "if(u&&p&&visible(u)&&visible(p))return 'credentials';"
             "const b=document.querySelector('button.login-button');"
             "if(b&&visible(b)){b.click();return 'clicked';}return 'notfound';})()"
         )

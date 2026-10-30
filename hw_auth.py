@@ -159,17 +159,16 @@ def browser_launch_args(browser_path: str, profile_dir: str, headless: bool, por
 
 
 def read_devtools_port(profile_dir: str, timeout: float = 40.0, cancel=None, proc=None) -> int:
-    """等浏览器写出 DevToolsActivePort 并返回端口；超时/进程已退出返回 0。
+    """等浏览器写出 DevToolsActivePort 并返回端口；超时或取消返回 0。
 
-    ``proc`` 给了就同时检查进程还活着——否则上一轮崩溃留下的陈旧
-    ``DevToolsActivePort`` 会被当成这一轮的端口（只能靠调用方先删文件来兜）。
+    Edge 的启动器可能先退出，再由实际浏览器进程写端口文件，不能用
+    ``proc.poll()`` 判断启动失败。保留 ``proc`` 参数以兼容现有调用方；
+    调用方仍须在启动前清除旧端口文件，避免连接到上一次会话。
     """
     path = os.path.join(profile_dir, "DevToolsActivePort")
     deadline = time.monotonic() + max(1.0, float(timeout))
     while time.monotonic() < deadline:
         if cancel is not None and cancel.is_set():
-            return 0
-        if proc is not None and proc.poll() is not None:
             return 0
         try:
             with open(path, "r", encoding="utf-8") as f:
