@@ -117,7 +117,7 @@ class _PooledClient:
     PLUGIN_NAME,
     "HuangGuaKnn",
     "把华为运动健康（网页端）的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot",
-    "v0.5.0-rc.3",
+    "v0.5.0-rc.4",
 )
 class HuaweiHealthPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -243,7 +243,7 @@ class HuaweiHealthPlugin(Star):
             raise
 
     async def _password_token_impl(self, holder, cancelled, epoch) -> str:
-        """跑（或加入）唯一的 DPAPI 自动登录会话，拿到 token。
+        """跑（或加入）唯一的加密凭据自动登录会话，拿到 token。
 
         v0.4.1 的两个关键变化：
           1. 需要人工介入（验证码 / 账号密码 / 信任选择）时**立刻返回**可行动的
@@ -275,8 +275,8 @@ class HuaweiHealthPlugin(Star):
             messages = {
                 "credentials_missing": "尚未保存账号密码，请先在 WebUI 凭据区保存。",
                 "credentials_corrupt": "账号密码凭据已损坏，请在 WebUI 重新保存。",
-                "credentials_locked": "账号密码凭据被占用或无权读取，请稍后重试。",
-                "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式。",
+                "credentials_locked": "账号密码凭据已锁定，请检查文件权限和原主密钥。",
+                "credentials_unavailable": "安全凭据存储不可用，请配置外部主密钥或检查系统加密服务。",
                 "daily_limit": "今日自动登录失败次数已达上限，请稍后再试。",
                 "cooldown": "自动登录失败冷却中，请稍后再试。",
             }
@@ -507,9 +507,11 @@ class HuaweiHealthPlugin(Star):
             self._clear_auth_cache_blocking()
             self._state_error = True
             try:
+                # Validate and persist new credentials before discarding the old
+                # cookie file. Wrong/missing keys must preserve recoverable data.
+                result = mutator() if mutator else None
                 if clear_cookies:
                     self.auth.clear_cookies()
-                result = mutator() if mutator else None
             except Exception:
                 # No query may use partially updated credentials after a failed change.
                 raise
@@ -1131,14 +1133,14 @@ class HuaweiHealthPlugin(Star):
         lines = []
         if mode == "password":
             # v0.4.0 在 password 模式下也只看 cookie 文件，恒定输出「没有，需要导入」。
-            lines.append("登录方式：账号密码（DPAPI 加密保存）")
+            lines.append("登录方式：账号密码（加密保存）")
             try:
                 st = await asyncio.to_thread(self.credentials.status) if self.credentials else {}
             except Exception:
                 st = {}
             state_label = {
                 "ok": "已保存", "absent": "未保存", "corrupt": "文件损坏，需重新保存",
-                "locked": "被占用或无权读取", "unavailable": "当前系统不支持 DPAPI",
+                "locked": "已锁定，检查权限和原主密钥", "unavailable": "加密服务或主密钥不可用",
             }.get(st.get("state") or "", "未知")
             lines.append("凭据：%s%s" % (
                 state_label,

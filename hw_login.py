@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """华为运动健康 WebUI 登录会话（v0.4.1）。
 
-默认仍使用 Cookie 模式；账号密码模式使用 DPAPI 凭据启动无头路线 B，遇到
+默认仍使用 Cookie 模式；账号密码模式使用加密凭据启动无头路线 B，遇到
 验证码时复用 WebUI 半自动流程。自动登录失败且显式开启兜底时才打开可见窗口。
 账号密码和验证码不会进入日志或状态响应。
 
@@ -49,7 +49,7 @@ try:
         CredentialsError,
         CredentialsCorruptError,
         CredentialsLockedError,
-        DPAPIUnavailableError,
+        CredentialsUnavailableError,
         harden_file_permissions,
     )
     from .hw_privacy import redact_error
@@ -69,7 +69,7 @@ except ImportError:
         CredentialsError,
         CredentialsCorruptError,
         CredentialsLockedError,
-        DPAPIUnavailableError,
+        CredentialsUnavailableError,
         harden_file_permissions,
     )
     from hw_privacy import redact_error
@@ -288,9 +288,9 @@ class HuaweiLoginSession:
             "unsupported": "登录模式不受支持",
             "credentials_page": "自动登录页未准备好，请稍后重试",
             "credentials_missing": "账号密码凭据不存在，请先在 WebUI 保存",
-            "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式",
+            "credentials_unavailable": "安全凭据存储不可用，请配置外部主密钥或检查系统加密服务",
             "credentials_corrupt": "凭据文件损坏或无法解密，请在 WebUI 重新保存账号密码",
-            "credentials_locked": "凭据文件被占用或无权读取，请关闭占用程序后重试",
+            "credentials_locked": "凭据已锁定，请检查文件权限和原主密钥后重试",
             "bad_credentials": "账号或密码不正确，请在 WebUI 重新保存账号密码",
             "wronghost": "页面跳转到了非华为域名，已中止自动填表",
             "fallback": "自动登录失败，可见浏览器也未能启动，请改用 Cookie 导入",
@@ -489,7 +489,7 @@ class HuaweiLoginSession:
             raise LoginFlowError("credentials_unavailable")
         try:
             values = store.load()
-        except DPAPIUnavailableError:
+        except CredentialsUnavailableError:
             raise LoginFlowError("credentials_unavailable")
         except CredentialsLockedError:
             raise LoginFlowError("credentials_locked")
@@ -1195,7 +1195,7 @@ class HuaweiLoginManager:
                     raise LoginFlowError("credentials_unavailable")
                 try:
                     store.load()
-                except DPAPIUnavailableError:
+                except CredentialsUnavailableError:
                     raise LoginFlowError("credentials_unavailable")
                 except CredentialsLockedError:
                     raise LoginFlowError("credentials_locked")

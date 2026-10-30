@@ -1,8 +1,19 @@
 # v0.5.0 系列变更
 
-> 当前版本：**v0.5.0-rc.3**（预发布 / release candidate）
+> 当前版本：**v0.5.0-rc.4**（预发布 / release candidate）
 > 基线：v0.4.2（v0.4.1 的逐条修复对照见 `CHANGELOG_v0.4.1.md`）
 > tag 形状（`-rc.N`）与 GitHub Release 的 pre-release 标记共同表达「这是预览版」。
+
+---
+
+## rc.4（相对 rc.3）
+
+- 增加跨平台 AES-256-GCM 凭据存储；Windows 保留 DPAPI，非 Windows 通过外部随机主密钥加密账号密码、Cookie 和 token，未配置主密钥时拒绝持久化明文。
+- 支持外部主密钥文件、systemd `LoadCredentialEncrypted=` 提供的运行时凭据，以及显式启用的 macOS Keychain；提供首次供钥工具，拒绝覆盖已有主密钥。
+- 显式来源配置错误、密钥缺失或密文验证失败时明确报错，不静默切换供钥来源、不生成替代钥匙、不退回明文。
+- 旧 DPAPI 与旧明文 Cookie 保留读取兼容；重新保存时原子迁移，读取操作不改变 Cookie 文件时间戳。
+- WebUI 展示当前加密方式、供钥来源与未就绪/锁定原因，不接收或展示主密钥。
+- 补充 Linux 服务、普通进程、容器和 macOS 部署说明，以及明文旧配置、备份与密钥丢失的恢复边界。
 
 ---
 

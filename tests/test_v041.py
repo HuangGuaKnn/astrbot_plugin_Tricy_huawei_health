@@ -189,12 +189,7 @@ class TestCookieImport(unittest.TestCase):
                          ["user-edited", "user-edited"])
 
     def test_cookie_file_is_encrypted(self):
-        """P1-12：Windows 上磁盘不得出现明文 cookie；其它平台按设计降级为 0600 明文。
-
-        DPAPI 是 Windows API，Linux/macOS 上 ``_serialize_cookies`` 会退回明文
-        （见 hw_auth 的分支），因此这里断言的是「当前平台的正确行为」：
-        Windows 必须加密且无明文值，其它平台必须明文 + 0600（不可被其他用户读取）。
-        """
+        """每个平台都必须加密；POSIX 还须保留 0600 权限。"""
         a = make_auth()
         a.import_cookie_sources("", SIX)
         with open(a.cookie_file, "rb") as f:
@@ -203,7 +198,8 @@ class TestCookieImport(unittest.TestCase):
             self.assertTrue(raw.startswith(hw_auth.COOKIE_MAGIC))
             self.assertNotIn(b"castgc-value", raw)
         else:
-            self.assertFalse(raw.startswith(hw_auth.COOKIE_MAGIC))
+            self.assertTrue(raw.startswith(hw_auth.AES_MAGIC))
+            self.assertNotIn(b"castgc-value", raw)
             mode = os.stat(a.cookie_file).st_mode & 0o777
             self.assertEqual(mode, 0o600, "非 Windows 平台必须收紧到 0600")
         self.assertEqual(len(a.load_cookies()), 7)

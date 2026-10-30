@@ -277,9 +277,10 @@
     <h2 style="margin-top:0">账号密码（可选）</h2>
     <div class="card">
       <div class="hint" style="margin-top:0">
-        仅在你主动保存后启用账号密码模式。凭据只写入本机 Windows DPAPI 加密文件，页面不会回填密码；
+        仅在你主动保存后启用账号密码模式。Windows 使用系统加密，其他平台需先按 README 配置主密钥；页面不会回填密码。
         登录区可选择无头自动登录；遇到验证码仍由 WebUI 提交，自动失败时可选择打开可见窗口兜底。
       </div>
+      <p class="hint" id="credentialProtection">正在读取加密存储状态。主密钥由部署环境提供，请勿填入插件配置。</p>
       <div class="credential-fields">
         <label class="credential-field">华为账号<input id="credentialAccount" autocomplete="username"></label>
         <label class="credential-field">密码<input id="credentialPassword" type="password" autocomplete="new-password"></label>
@@ -322,7 +323,7 @@
     <h2>手动登录</h2>
     <div class="card">
       <div class="hint" style="margin-top:0">
-        默认使用已保存的 DPAPI 凭据做<b>无头自动登录</b>（不弹窗口）；需要自己输账号密码时，取消勾选「无头自动登录」即可。
+        默认使用已加密保存的凭据做<b>无头自动登录</b>（不弹窗口）；需要自己输账号密码时，取消勾选「无头自动登录」即可。
         遇到手机验证码时，可以把 4~8 位验证码填到这里提交。账号密码和验证码不会写入状态或日志。
       </div>
       <div class="row" style="margin-top:10px">
@@ -675,7 +676,10 @@ function renderStatus(d){
 
   const tokCell = $("c_token");
   tokCell.replaceChildren();
-  if(tk.cached && tk.left > 0){
+  if(tk.error || tk.state === "locked" || tk.state === "error"){
+    tokCell.appendChild(dot("err"));
+    tokCell.appendChild(textNode("读取失败 · " + (tk.error || "token 缓存暂时不可读取，请检查存储状态")));
+  }else if(tk.cached && tk.left > 0){
     tokCell.appendChild(dot("ok"));
     tokCell.appendChild(textNode("有效，剩 " + tk.left + " 秒"));
   }else if(tk.cached){
@@ -953,10 +957,19 @@ async function doLoginTrust(choice){
   finally{ loadLoginStatus(true); renderDiag(); }
 }
 
-/* ---------- 账号凭据 ---------- */
+/* ---------- 账号凭据（只写 + 加密存储状态） ---------- */
 function renderCredentialsStatus(d){
   d = d || {};
   if(d.cookie_storage) $("cookieProtection").textContent = d.cookie_storage.message || "Cookie 存储状态暂时不可用";
+  const storage = d.storage || {};
+  const protection = $("credentialProtection");
+  if(storage.available === false || d.available === false){
+    protection.textContent = storage.error || "加密存储未就绪，请先按 README 配置主密钥，再保存账号密码。";
+  }else{
+    const method = {"dpapi":"Windows 系统加密", "aes-256-gcm":"AES-256-GCM 加密"}[storage.method] || "加密存储";
+    const source = {"file":"外部主密钥文件", "systemd":"systemd 凭据", "keychain":"macOS Keychain"}[storage.key_source];
+    protection.textContent = method + (source ? " · " + source : "") + "。主密钥不会显示在页面中。";
+  }
   const modeText = d.mode === "password" ? "账号密码模式" : "Cookie 模式";
   const state = d.state || (d.password_set ? "ok" : "absent");
   // 不再把「文件损坏 / 被占用」谎报成「未保存」——否则用户会反复保存却永远登不上。

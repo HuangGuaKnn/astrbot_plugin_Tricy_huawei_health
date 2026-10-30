@@ -1,6 +1,6 @@
 # 华为运动健康 · AstrBot 插件
 
-版本：v0.5.0-rc.3
+版本：v0.5.0-rc.4
 
 > 各版本变更见 [Releases](https://github.com/HuangGuaKnn/astrbot_plugin_Tricy_huawei_health/releases) 与 [CHANGELOG_v0.4.1.md](CHANGELOG_v0.4.1.md)、[CHANGELOG_v0.4.2.md](CHANGELOG_v0.4.2.md)、[CHANGELOG_v0.5.0.md](CHANGELOG_v0.5.0.md)。
 
@@ -66,6 +66,8 @@ WebUI 的 `/status` 也会在 `permission.invalid_umos` 里回显，便于当场
 
 插件配置页里能填的：
 
+非 Windows 平台请先完成下方「跨平台加密存储」配置，再导入 Cookie 或保存账号密码。主密钥不属于插件配置项，也不要放进聊天消息或 WebUI 表单。Cookie 分项和 `cookie_json` 是旧版兼容入口，内容仍由 AstrBot 保存到普通配置；希望避免这份明文副本时，请改用 WebUI 导入，并清空旧配置中的所有 Cookie 值。
+
 | 配置项 | 说明 |
 |---|---|
 | `cookie_CASTGC` / `cookie_sid` / `cookie_hwid_cas_sid` | 从 `.id1.cloud.huawei.com` 复制对应 cookie 的值；CASTGC 会自动生成 `/CAS` 与 `/UnifiedIDMPortal` 两条 |
@@ -85,7 +87,7 @@ WebUI 的 `/status` 也会在 `permission.invalid_umos` 里回显，便于当场
 
 并发查询会复用最多 3 个 HTTP 会话，并限制排队、重试与整体等待时间。同一数据项的并发请求共用一次取数，刷新或切换账号后不会复用旧请求的结果。
 
-cookie 也可以直接用文件：`data/plugin_data/astrbot_plugin_Tricy_huawei_health/hw_cookies.json`
+Cookie 文件由插件维护：`data/plugin_data/astrbot_plugin_Tricy_huawei_health/hw_cookies.json`。新保存的内容为密文，文件名中的 `.json` 仅为兼容旧版本；请通过 WebUI 导入，勿手动覆盖密文文件。
 （配置里的分项 cookie 或旧版 `cookie_json` 有内容时**会写入**这个文件；文件已存在且配置没变时不会覆盖）
 
 > **配置导入的判重规则**：插件启动时会把「配置里那六条」算一个指纹存在
@@ -122,8 +124,8 @@ cookie 也可以直接用文件：`data/plugin_data/astrbot_plugin_Tricy_huawei_
 | 通道状态 | cookie 条数 / 更新时间、token 剩余秒数、浏览器探测结果、缓存条数、数据目录 |
 | 关键 cookie 表 | 六条关键 cookie 的域与到期日，一眼看出「信任设备」还剩多久 |
 | 账号登录 | 打开独立可见浏览器，在窗口内手动输入账号密码；验证码可从 WebUI 提交，信任设备支持自动或手动选择；成功后自动保存新 Cookie |
-| 账号密码凭据 | WebUI 主动保存后写入 Windows DPAPI 加密的 `credentials.bin`；页面只显示账号掩码和保存时间，不回填密码 |
-| Cookie 存储保护 | 显示实际文件使用 DPAPI 加密、文件权限保护，或需要重新导入的状态 |
+| 账号密码凭据 | WebUI 主动保存后加密写入 `credentials.bin`；页面只显示账号掩码和保存时间，不回填密码 |
+| 存储保护 | 显示 Windows DPAPI / AES-256-GCM、主密钥来源及未配置或已锁定状态；不显示密钥或密钥路径 |
 | 操作 | 清缓存并重新认证 · 刷新状态 |
 | 数据概览 | 9 项数据的取数结果 + 取数时间 |
 | 重新导入 Cookie | 六条分项值或 Cookie-Editor JSON 导入（自动作废 token 缓存）；也可一键清除 cookie |
@@ -132,17 +134,88 @@ cookie 也可以直接用文件：`data/plugin_data/astrbot_plugin_Tricy_huawei_
 独立窗口降级直连 `/api/v1/plugins/extensions/<plugin>/page/...`；主题跟随系统并支持手动切换。
 
 登录相关的非敏感选项保存在插件数据目录的 `login_config.json`（包含模式和 `auto_trust`）。
-账号密码不会写入插件配置、WebUI 状态或日志；凭据由 Windows DPAPI 绑定当前用户加密，文件被误传、备份泄露或被其他程序顺手读取时不能直接还原。
-DPAPI 不防同一 Windows 用户下已经能执行代码的恶意程序；它必须能在本机自动解密，才能支持无感登录。账号密码模式支持无头自动填充、验证码 WebUI 介入和可选的可见窗口兜底，并带跨重启的失败次数限制与失败冷却。
+账号密码不会写入插件配置、WebUI 状态或日志。Windows 使用 DPAPI，非 Windows 使用 AES-256-GCM 与外部主密钥。账号密码模式支持无头自动填充、验证码 WebUI 介入和可选的可见窗口兜底，并带跨重启的失败次数限制与失败冷却。
 
 > **账号密码模式需要人工介入时，取数工具会立刻返回提示**，不会占着工具调用等 7 分钟
 > （AstrBot 的默认工具超时是 120 秒）。看到「自动登录需要你输入手机验证码」就去
 > WebUI 的「账号登录」区完成，会话会保留 5 分钟，完成后再问一次即可。
 >
-> `hw_cookies.json` 现在是 DPAPI 加密的；换 Windows 用户或换机器后它解不开，需要重新导入 cookie。
-> 非 Windows 平台没有 DPAPI，该文件会退回明文但权限是 0600。
+> 旧 Windows DPAPI 文件仍需原 Windows 用户和机器才能解密；迁移到其他平台时，请配置新的安全存储并重新导入 Cookie、保存账号密码。
+> **rc.4 起，非 Windows 平台也禁止将新 Cookie、账号密码或 token 持久化为明文。**未配置主密钥时，保存会明确报错。
 
-Windows 上若 DPAPI 加密失败，保存操作会明确报错，不会把 Cookie 改存为明文。已有明文 Cookie 会在控制面板提示重新导入。保存账号密码会清除旧 Cookie、token 与健康缓存，下次查询重新认证；清除账号密码则切回 Cookie 模式、保留已有 Cookie 并清空缓存。导入、清除或刷新登录态时，旧登录与旧查询结果会失效，避免换账号后继续显示上一个账号的数据。
+加密失败时保存会明确报错，并保留原有文件。已有明文 Cookie 保留读取兼容；配置好主密钥后，在 WebUI 重新导入即可原子替换成加密文件，读取操作不会擅自回写。保存账号密码会清除旧 Cookie、token 与健康缓存，下次查询重新认证；清除账号密码则切回 Cookie 模式、保留已有 Cookie 并清空缓存。导入、清除或刷新登录态时，旧登录与旧查询结果会失效，避免换账号后继续显示上一个账号的数据。
+
+### 跨平台加密存储
+
+Windows 无需额外主密钥，继续使用当前用户的 DPAPI。其他平台需要一次性配置独立的 **32 字节随机主密钥**；它是原始二进制数据，不是 32 个字符的密码，也不是十六进制或 Base64 文本文件。插件使用 AES-256-GCM 保存凭据，并将账号密码、Cookie 和 token 用途隔离，文件被篡改或主密钥不匹配时拒绝解密。
+
+主密钥查找顺序为：
+
+1. `HUAWEI_HEALTH_MASTER_KEY_FILE` 指定的绝对文件路径；
+2. `$CREDENTIALS_DIRECTORY/huawei-health-master`，由 systemd 提供；
+3. 仅 macOS：显式设置 `HUAWEI_HEALTH_KEYCHAIN=1` 后读取系统 Keychain。
+
+显式配置的来源无效时不会改用其他来源。插件不会自动生成新钥匙来替代丢失的旧钥匙。配置后重启 AstrBot，在 WebUI 的账号凭据区确认存储状态已就绪，再保存账号密码或导入 Cookie。
+
+#### Linux 服务：推荐 systemd credentials
+
+需要提供 `systemd-creds` 和 `LoadCredentialEncrypted=` 的 systemd 版本（加密凭据功能自 v250 提供）。以下命令用于**首次初始化**，在宿主机运行；随机主密钥通过管道传入加密工具，磁盘上仅保存加密后的凭据：
+
+```sh
+sudo install -d -m 0700 /etc/credstore.encrypted
+openssl rand 32 | sudo systemd-creds encrypt --with-key=host \
+  --name=huawei-health-master - /etc/credstore.encrypted/huawei-health-master
+```
+
+有可用 TPM2 的主机可将 `--with-key=host` 改为 `--with-key=host+tpm2`，将解密同时绑定到主机密钥与 TPM2。纯 `host` 模式不要求 TPM，但无法防止同时获得整盘数据和主机密钥的攻击者。
+
+在 AstrBot 的实际 systemd 服务配置中加入：
+
+```ini
+[Service]
+LoadCredentialEncrypted=huawei-health-master:/etc/credstore.encrypted/huawei-health-master
+```
+
+随后重新加载服务配置并重启对应服务。systemd 在服务运行时提供可读取的凭据文件，插件通过 `CREDENTIALS_DIRECTORY` 自动发现；无需把密钥值放进环境变量。若以前设置了 `HUAWEI_HEALTH_MASTER_KEY_FILE`，它仍优先，请在切换前移除该设置。
+
+已有加密数据时，迁移必须保留同一主密钥，不能重新执行 `openssl rand` 生成替代钥匙。主机密钥或 TPM 变化可能使 systemd 凭据无法解密，迁移前应准备单独保护的恢复副本。更多细节见 [systemd-creds 官方文档](https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html)。
+
+#### 普通进程或容器：外部主密钥文件
+
+在插件目录运行以下命令，将 `--data-dir` 替换成真实插件数据目录。创建工具拒绝覆盖已有文件；不要把主密钥放进插件安装目录、数据目录、代码仓库、镜像或与凭据相同的备份中。
+
+```sh
+install -d -m 0700 "$HOME/.config/astrbot-secrets"
+python hw_secure_storage.py create-file \
+  --output "$HOME/.config/astrbot-secrets/huawei-health.key" \
+  --data-dir /srv/astrbot/data/plugin_data/astrbot_plugin_Tricy_huawei_health
+export HUAWEI_HEALTH_MASTER_KEY_FILE="$HOME/.config/astrbot-secrets/huawei-health.key"
+```
+
+使用同一环境启动 AstrBot。文件必须是普通文件，不能是符号链接；POSIX 下所有者必须是运行用户或 root，组用户与其他用户不能拥有权限（常用 `0600` / `0400`）。服务实际运行的用户必须能读取它。文件方式保护插件目录单独泄漏的场景，主密钥文件本身仍依赖操作系统权限、加密磁盘或外部秘密管理系统保护。
+
+容器可把部署环境提供的主密钥以只读文件挂载到容器外部配置路径，并将该路径写入 `HUAWEI_HEALTH_MASTER_KEY_FILE`。注意容器内 UID 和文件权限必须满足上述要求。**普通 Docker Compose secrets 只负责挂载，不会加密宿主机来源文件**；Swarm secrets 的静态加密是另一套机制。不要把密钥直接写进 Compose YAML 或 Dockerfile。参见 [Compose secrets](https://docs.docker.com/compose/how-tos/use-secrets/)。
+
+#### macOS：系统 Keychain
+
+使用安装了插件依赖的同一 Python 解释器首次初始化：
+
+```sh
+python hw_secure_storage.py create-keychain
+export HUAWEI_HEALTH_KEYCHAIN=1
+```
+
+然后使用同一用户和环境启动 AstrBot。工具将随机主密钥写入系统 Keychain，服务名为 `astrbot.huawei_health`、账户标识为 `master-key-v1`；不会写入插件配置或普通文件，也不会覆盖已有主密钥。运行时仅使用明确的 macOS Keychain 后端，不启用明文或自动选择的替代后端。
+
+Keychain 需要允许当前运行用户和 Python 进程访问；未登录、Keychain 锁定或系统拒绝授权时，插件会报告存储未就绪。它不保证任意后台启动方式都能无人干预解锁；这类部署可改用受保护的外部文件供钥。
+
+#### 升级、备份与恢复
+
+- 旧 DPAPI 凭据与旧 Cookie 文件仍按原格式识别。旧明文 Cookie 在重新导入或成功保存后才迁移；迁移失败保留原文件。
+- 主密钥与加密数据需要分别备份、分别授权；恢复时必须使用原主密钥。没有原主密钥无法恢复密文，需重新保存账号密码或重新导入 Cookie。
+- 错钥、锁定与文件损坏不会自动创建新密钥或降级成明文。先恢复正确的钥匙，再重试；确认放弃原凭据时才显式清除并重新配置。
+- 本功能保护插件持久化的登录凭据，不等于全盘加密。健康数据缓存、旧版备份、AstrBot 的旧 Cookie 配置副本、浏览器自身的运行时文件需要分别管理。
+- 运行时需要使用明文凭据，取得 root、同一用户代码执行能力或 AstrBot 进程控制权的攻击者仍可能读取它们；不要把不受信任的插件放在同一进程中。
 
 ### 开发踩坑（2026-10-22 实测）
 
@@ -218,7 +291,8 @@ requests 直连 API 取数 → 落 SQLite → 返回
 | `自动登录需要你输入手机验证码` | 华为要求二次验证 | 去 WebUI「账号登录」区填验证码，会话保留 5 分钟 |
 | `今日自动登录失败次数已达上限` | 当天失败次数到顶（默认 3） | 等冷却，或在 WebUI 手动点一次登录（手动不计入额度） |
 | `账号或密码不正确` | 密码改过 | 在 WebUI 凭据区重新保存 |
-| `凭据文件损坏或无法解密` | 换了 Windows 用户 / 换了机器 | 重新保存账号密码 |
+| `加密存储未就绪` | 未配置主密钥、文件权限不符或 Keychain 未解锁 | 按上方步骤配置，并重启 AstrBot 后刷新状态 |
+| `凭据已锁定` / `凭据文件损坏或无法解密` | 主密钥不匹配、密文被改动，或 DPAPI 文件离开原 Windows 用户环境 | 优先恢复原主密钥和文件；确认无法恢复后，再显式清除并重新保存 |
 | 数据为空但通道正常 | 手表没戴 / 没同步到云 | 等同步，或手动同步一次 |
 
 ---

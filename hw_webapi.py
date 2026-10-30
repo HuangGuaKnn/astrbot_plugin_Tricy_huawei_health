@@ -16,11 +16,11 @@ from astrbot.api.web import json_response, request
 
 try:
     from .hw_login import LoginFlowError
-    from .hw_credentials import DPAPIUnavailableError
+    from .hw_credentials import CredentialsError, CredentialsUnavailableError, CredentialsLockedError
     from .hw_privacy import redact_error
 except ImportError:
     from hw_login import LoginFlowError
-    from hw_credentials import DPAPIUnavailableError
+    from hw_credentials import CredentialsError, CredentialsUnavailableError, CredentialsLockedError
     from hw_privacy import redact_error
 
 PAGE_PREFIX = "astrbot_plugin_Tricy_huawei_health/page"
@@ -238,7 +238,7 @@ class HuaweiHealthWebApi:
         manager = getattr(p, "login_manager", None)
         data = {
             # 页面状态版本与插件元数据统一，避免前端误判部署版本。
-            "version": "v0.5.0-rc.3",
+            "version": "v0.5.0-rc.4",
             "data_dir": p.data_dir,
             "cookie_file": p.cookie_file,
             "login_mode": getattr(manager, "login_mode", "cookie"),
@@ -259,7 +259,7 @@ class HuaweiHealthWebApi:
         cinfo["storage"] = await asyncio.to_thread(self._cookie_storage_data)
         if cinfo["exists"]:
             try:
-                cookies = p.auth.load_cookies()
+                cookies = await asyncio.to_thread(p.auth.load_cookies)
                 cinfo["count"] = len(cookies)
                 cinfo["mtime"] = time.strftime(
                     "%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(cf)))
@@ -279,19 +279,29 @@ class HuaweiHealthWebApi:
         data["cookie"] = cinfo
 
         # token
-        tok = p.store.get("token") or {}
-        left = 0
-        if tok.get("expire_at"):
-            left = int(tok["expire_at"] - time.time())
-        data["token"] = {
-            "cached": bool(tok.get("token")),
-            "left": max(0, left),
-            "obtained_at": tok.get("obtained_at") or "-",
-        }
+        tinfo = {"cached": False, "left": 0, "obtained_at": "-",
+                 "state": "absent", "error": ""}
+        try:
+            # Secret providers may access Keychain or files. Keep that work off
+            # the event loop, and never treat a locked store as a cache miss.
+            tok = await asyncio.to_thread(p.store.get, "token") or {}
+            left = int(float(tok["expire_at"]) - time.time()) if tok.get("expire_at") else 0
+            cached = bool(tok.get("token"))
+            tinfo.update({"cached": cached, "left": max(0, left),
+                          "obtained_at": tok.get("obtained_at") or "-",
+                          "state": ("ready" if left > 0 else "expired") if cached else "absent"})
+        except CredentialsError:
+            tinfo.update({"state": "locked", "error":
+                          "token 缓存已锁定，请检查原主密钥、系统加密服务或文件完整性；原记录未被覆盖"})
+        except Exception:
+            # Database exceptions can include paths or raw values. The status
+            # endpoint should remain usable for recovery without echoing them.
+            tinfo.update({"state": "error", "error": "token 缓存读取失败，请检查数据库访问权限或文件状态"})
+        data["token"] = tinfo
 
         # 缓存
         try:
-            keys = p.store.keys()
+            keys = await asyncio.to_thread(p.store.keys)
         except Exception:
             keys = []
         data["cache"] = {"count": len(keys), "keys": keys[:20]}
@@ -368,11 +378,14 @@ class HuaweiHealthWebApi:
             return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         return json_response({"status": "ok", "message": "缓存已清空，并已重新拿到最新 token"})
 
-    # ---------- 账号凭据（v0.4.0 第 3 阶段：DPAPI，只写接口） ----------
+    # ---------- 账号凭据（只写接口，状态只包含保护方式与掩码） ----------
 
     def _credentials_status_data(self):
         store = getattr(self.plugin, "credentials", None)
         raw = store.status() if store is not None else {}
+        storage = raw.get("storage") if isinstance(raw.get("storage"), dict) else {}
+        available = (bool(storage["available"]) if "available" in storage else
+                     bool(getattr(store, "available", False)))
         password_set = bool(raw.get("password_set"))
         login_manager = getattr(self.plugin, "login_manager", None)
         configured_mode = getattr(login_manager, "login_mode", "cookie")
@@ -392,11 +405,17 @@ class HuaweiHealthWebApi:
             "password_set": password_set,
             "account_masked": str(raw.get("account_masked") or ""),
             "updated_at": updated_at,
-            # v0.4.1：区分「没保存 / 已保存 / 损坏 / 被占用 / 不支持 DPAPI」，
+            # 区分「没保存 / 已保存 / 损坏 / 已锁定 / 加密存储未配置」，
             # 不再把损坏的文件谎报成「未保存」。
             "state": str(raw.get("state") or "absent"),
             "error": str(raw.get("error") or ""),
-            "available": bool(getattr(store, "available", False)) if store is not None else False,
+            "available": available,
+            "storage": {
+                "available": available,
+                "method": str(storage.get("method") or "unknown"),
+                "key_source": str(storage.get("key_source") or "none"),
+                "error": redact_error(storage["error"]) if storage.get("error") else "",
+            },
             "cookie_storage": self._cookie_storage_data(),
         }
 
@@ -440,9 +459,11 @@ class HuaweiHealthWebApi:
             return json_response({"status": "error", "message": "请输入账号和密码"}, status_code=400)
         if not account.strip() or not password or len(account) > 150 or len(password) > 512:
             return json_response({"status": "error", "message": "请输入有效的账号和密码"}, status_code=400)
-        if not store.available:
+        storage_status = await asyncio.to_thread(self._credentials_status_data)
+        if not storage_status["available"]:
             return json_response({
-                "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
+                "status": "error", "message": storage_status["storage"]["error"] or
+                "加密存储尚未就绪，请先按 README 配置主密钥，再保存账号密码",
             }, status_code=409)
         def save_credentials():
             store.save(account, password)
@@ -457,9 +478,13 @@ class HuaweiHealthWebApi:
         try:
             # 保存新账号时撤销旧登录态，避免新账号认证失败后回退到旧账号 Cookie。
             await self.plugin._change_auth_state(save_credentials, clear_cookies=True)
-        except DPAPIUnavailableError:
+        except CredentialsUnavailableError as exc:
             return json_response({
-                "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
+                "status": "error", "message": redact_error(exc) or "加密存储不可用，请检查主密钥配置",
+            }, status_code=409)
+        except CredentialsLockedError:
+            return json_response({
+                "status": "error", "message": "凭据已锁定，请检查主密钥或文件权限；原文件已保留",
             }, status_code=409)
         except Exception:
             return json_response({"status": "error", "message": "凭据保存失败，请稍后重试"}, status_code=500)
@@ -510,9 +535,9 @@ class HuaweiHealthWebApi:
                 "fallback_invalid": "可见窗口兜底选项无效",
                 "prefer_invalid": "无头自动登录选项无效",
                 "credentials_missing": "尚未保存账号密码，请先在凭据区保存",
-                "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式",
+                "credentials_unavailable": "加密存储尚未就绪，请检查系统凭据或主密钥配置",
                 "credentials_corrupt": "账号密码凭据已损坏，请在凭据区重新保存",
-                "credentials_locked": "账号密码凭据被占用或无权读取，请稍后重试",
+                "credentials_locked": "账号密码凭据已锁定，请检查主密钥或文件权限",
                 "daily_limit": "今日自动登录失败次数已达上限，请稍后再试",
                 "cooldown": "自动登录失败冷却中，请稍后再试",
                 "unsupported": "登录模式无效",

@@ -161,6 +161,8 @@ _FORBIDDEN_SUFFIXES = (
     ".db-shm",
     ".db-wal",
     ".env",
+    ".key",
+    ".cred",
     ".log",
     ".pyc",
     ".pyo",

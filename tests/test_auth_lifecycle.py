@@ -6,6 +6,7 @@ requests or real user credentials are needed to exercise these races.
 
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import threading
@@ -18,7 +19,7 @@ import boot
 boot.install_paths()
 import hw_auth
 import hw_login
-from hw_credentials import CredentialsError, DPAPIUnavailableError
+from hw_credentials import CredentialsError, DPAPIUnavailableError, CredentialsUnavailableError
 
 
 class LoginLifecycleTests(unittest.TestCase):
@@ -175,23 +176,25 @@ class CookieAuthenticationTests(unittest.TestCase):
     def test_encrypt_failure_preserves_existing_file(self):
         previous = hw_auth.COOKIE_MAGIC + b"previous-protected-data"
         self.cookie_file.write_bytes(previous)
-        with patch.object(hw_auth, "_protect", side_effect=CredentialsError("test failure")):
+        with patch.object(hw_auth.sys, "platform", "win32"), patch.object(
+                hw_auth, "_protect", side_effect=CredentialsError("test failure")):
             with self.assertRaises(hw_auth.HuaweiAuthError):
                 self.auth.save_cookies([{"name": "sid", "value": "must-not-be-written"}])
         self.assertEqual(self.cookie_file.read_bytes(), previous)
         self.assertFalse(list(Path(self.temp.name).glob(".hw_cookies.*")))
 
     def test_windows_unavailable_dpapi_never_uses_plaintext(self):
-        with patch.object(hw_auth.os, "name", "nt"), patch.object(
+        with patch.object(hw_auth.sys, "platform", "win32"), patch.object(
                 hw_auth, "_protect", side_effect=DPAPIUnavailableError("unavailable")):
             with self.assertRaises(hw_auth.HuaweiAuthError):
                 self.auth._serialize_cookies([{"name": "sid", "value": "secret"}])
 
-    def test_non_windows_explicit_plaintext_policy_remains_supported(self):
-        with patch.object(hw_auth.os, "name", "posix"), patch.object(
-                hw_auth, "_protect", side_effect=DPAPIUnavailableError("unavailable")):
-            payload = self.auth._serialize_cookies([{"name": "sid", "value": "fake"}])
-        self.assertEqual(json.loads(payload)[0]["value"], "fake")
+    def test_non_windows_missing_key_never_uses_plaintext(self):
+        with patch.object(hw_auth.sys, "platform", "linux"), patch.object(
+                hw_auth, "_aes_operation", side_effect=CredentialsUnavailableError("missing key")):
+            with self.assertRaises(hw_auth.HuaweiAuthError):
+                self.auth.save_cookies([{"name": "sid", "value": "must-not-be-written"}])
+        self.assertFalse(self.cookie_file.exists())
 
     def test_storage_status_reports_actual_file_without_values(self):
         self.assertEqual(self.auth.cookie_storage_status()["mode"], "absent")

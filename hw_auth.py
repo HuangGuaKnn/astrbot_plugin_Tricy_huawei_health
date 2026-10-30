@@ -34,6 +34,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -47,11 +48,15 @@ except ImportError:  # pragma: no cover - 取决于部署环境
 
 try:
     from .hw_credentials import harden_file_permissions, _protect, _unprotect
-    from .hw_credentials import DPAPIUnavailableError
+    from .hw_credentials import (DPAPIUnavailableError, CredentialsUnavailableError,
+                                 CredentialsLockedError, CredentialsError, AES_MAGIC,
+                                 _aes_operation, persistent_storage_status)
     from .hw_privacy import redact_error
 except ImportError:
     from hw_credentials import harden_file_permissions, _protect, _unprotect
-    from hw_credentials import DPAPIUnavailableError
+    from hw_credentials import (DPAPIUnavailableError, CredentialsUnavailableError,
+                                CredentialsLockedError, CredentialsError, AES_MAGIC,
+                                _aes_operation, persistent_storage_status)
     from hw_privacy import redact_error
 
 
@@ -477,40 +482,50 @@ class HuaweiAuth:
     def _serialize_cookies(self, cookies) -> bytes:
         payload = json.dumps(cookies, ensure_ascii=False, indent=1).encode("utf-8")
         try:
-            return COOKIE_MAGIC + _protect(payload)
-        except DPAPIUnavailableError:
-            if os.name == "nt":
-                raise HuaweiAuthError("Windows DPAPI 不可用，未保存 Cookie；请检查当前 Windows 用户环境")
-            # 非 Windows 的明文存储是明确的平台策略，不用于掩盖 Windows 加密故障。
-            if not self._plaintext_warned:
-                self._plaintext_warned = True
-                self._log("warning", "当前系统不支持 DPAPI，cookie 文件将以 0600 明文保存")
-            return payload
+            if sys.platform == "win32":
+                return COOKIE_MAGIC + _protect(payload)
+            return _aes_operation(payload, "cookies", os.path.dirname(self.cookie_file))
+        except CredentialsUnavailableError as exc:
+            raise HuaweiAuthError("Cookie 未保存：" + redact_error(exc)) from exc
         except Exception as exc:
-            raise HuaweiAuthError("Cookie 加密失败，已保留原文件；请检查当前 Windows 用户环境") from exc
+            raise HuaweiAuthError("Cookie 加密失败，已保留原文件；请检查系统加密服务或主密钥配置") from exc
 
     def cookie_storage_status(self) -> dict:
         """Describe the on-disk protection without returning any cookie values."""
         try:
             with self._cookie_lock:
                 with open(self.cookie_file, "rb") as stream:
-                    encrypted = stream.read(len(COOKIE_MAGIC)) == COOKIE_MAGIC
+                    raw = stream.read(1024 * 1024 + 1)
         except FileNotFoundError:
             return {"mode": "absent", "method": "absent", "encrypted": False, "message": "尚未保存 Cookie"}
         except OSError:
             return {"mode": "error", "method": "unreadable", "encrypted": False, "message": "Cookie 文件无法读取"}
-        if encrypted:
-            if os.name != "nt":
+        if raw.startswith(AES_MAGIC):
+            try:
+                _aes_operation(raw, "cookies", os.path.dirname(self.cookie_file), decrypt=True)
+            except CredentialsError:
+                return {"mode": "locked", "method": "aes-256-gcm", "encrypted": True,
+                        "message": "Cookie 已加密但无法解锁，请检查原主密钥、权限及文件完整性"}
+            return {"mode": "aes-256-gcm", "method": "aes-256-gcm", "encrypted": True,
+                    "message": "Cookie 已由 AES-256-GCM 加密"}
+        if raw.startswith(COOKIE_MAGIC):
+            if sys.platform != "win32":
                 return {"mode": "unavailable", "method": "dpapi", "encrypted": True,
                         "message": "Cookie 已由 Windows DPAPI 加密，当前系统无法解密"}
             return {"mode": "dpapi", "method": "dpapi", "encrypted": True,
                     "message": "Cookie 已由 Windows DPAPI 加密"}
-        message = ("现有 Cookie 为明文，请重新导入以启用 Windows DPAPI 加密"
-                   if os.name == "nt" else "当前系统不支持 DPAPI，Cookie 以明文保存并限制为 0600 权限")
+        message = "现有 Cookie 为旧版明文；配置加密后重新导入即可迁移，保存失败不会覆盖原文件"
         return {"mode": "plaintext", "method": "plaintext", "encrypted": False, "message": message}
 
     def _deserialize_cookies(self, raw: bytes):
-        if raw.startswith(COOKIE_MAGIC):
+        if len(raw) > 1024 * 1024:
+            raise HuaweiAuthError("Cookie 文件过大，无法读取")
+        if raw.startswith(AES_MAGIC):
+            try:
+                payload = _aes_operation(raw, "cookies", os.path.dirname(self.cookie_file), decrypt=True)
+            except CredentialsError as exc:
+                raise HuaweiAuthError("Cookie 已锁定，请检查原主密钥、权限及文件完整性") from exc
+        elif raw.startswith(COOKIE_MAGIC):
             try:
                 payload = _unprotect(raw[len(COOKIE_MAGIC):])
             except Exception as exc:
@@ -533,7 +548,7 @@ class HuaweiAuth:
             if not os.path.exists(self.cookie_file):
                 return [], None
             with open(self.cookie_file, "rb") as f:
-                raw = f.read()
+                raw = f.read(1024 * 1024 + 1)
             try:
                 mtime_ns = os.stat(self.cookie_file).st_mtime_ns
             except OSError:
@@ -561,7 +576,16 @@ class HuaweiAuth:
                     return False
             parent = os.path.dirname(self.cookie_file) or "."
             os.makedirs(parent, exist_ok=True)
+            # A syntactically valid but wrong master key must not overwrite the
+            # only recoverable cookie file. Discarding it requires explicit clear.
+            if os.path.isfile(self.cookie_file):
+                with open(self.cookie_file, "rb") as existing:
+                    previous = existing.read(1024 * 1024 + 1)
+                if previous.startswith(AES_MAGIC):
+                    self._deserialize_cookies(previous)
             blob = self._serialize_cookies(cookies)
+            if len(blob) > 1024 * 1024:
+                raise HuaweiAuthError("Cookie 文件过大，未保存；原文件保持不变")
             fd, tmp = tempfile.mkstemp(prefix=".hw_cookies.", suffix=".tmp", dir=parent)
             try:
                 with os.fdopen(fd, "wb") as f:
