@@ -1,43 +1,43 @@
 {
     "cookie_json": {
         "description": "Cookie JSON（Cookie-Editor 从华为运动健康网页端导出，整段粘贴）",
-        "hint": "旧版兼容入口，内容会保留在 AstrBot 普通配置中。建议在插件 WebUI 导入并清空所有 Cookie 配置值；非 Windows 平台须先按 README 配置主密钥。主密钥不要填在这里",
+        "hint": "插件控制台仅作安全导入：本次 JSON 须包含 CASTGC 和 sid，成功后清空旧配置；留空不变。直接编辑 AstrBot 原始配置仍会留下明文。非 Windows 须先按 README 配置主密钥，主密钥不要填在这里",
         "type": "text",
         "default": ""
     },
     "cookie_CASTGC": {
         "description": "CASTGC（分项 cookie 值）",
-        "hint": "旧版兼容项，会保留在普通配置中；建议改用 WebUI 导入。从 .id1.cloud.huawei.com 复制，插件会自动补齐两个路径",
+        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .id1.cloud.huawei.com 复制，插件会自动补齐两个路径",
         "type": "string",
         "default": ""
     },
     "cookie_sid": {
         "description": "sid（分项 cookie 值）",
-        "hint": "旧版兼容项，会保留在普通配置中；建议改用 WebUI 导入。从 .id1.cloud.huawei.com 域复制，只填值",
+        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .id1.cloud.huawei.com 域复制，只填值",
         "type": "string",
         "default": ""
     },
     "cookie_hwid_cas_sid": {
         "description": "hwid_cas_sid（分项 cookie 值）",
-        "hint": "旧版兼容项，会保留在普通配置中；建议改用 WebUI 导入。从 .id1.cloud.huawei.com 域复制，只填值",
+        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .id1.cloud.huawei.com 域复制，只填值",
         "type": "string",
         "default": ""
     },
     "cookie_HuaweiID_CAS_ISCASLOGIN": {
         "description": "HuaweiID_CAS_ISCASLOGIN（分项 cookie 值）",
-        "hint": "旧版兼容项，会保留在普通配置中；建议改用 WebUI 导入。从 .huawei.com 域复制，通常为 true",
+        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .huawei.com 域复制，通常为 true",
         "type": "string",
         "default": ""
     },
     "cookie_CASLOGINSITE": {
         "description": "CASLOGINSITE（分项 cookie 值）",
-        "hint": "旧版兼容项，会保留在普通配置中；建议改用 WebUI 导入。从 .huawei.com 域复制，只填值",
+        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .huawei.com 域复制，只填值",
         "type": "string",
         "default": ""
     },
     "cookie_LOGINACCSITE": {
         "description": "LOGINACCSITE（分项 cookie 值）",
-        "hint": "旧版兼容项，会保留在普通配置中；建议改用 WebUI 导入。从 .huawei.com 域复制，只填值",
+        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .huawei.com 域复制，只填值",
         "type": "string",
         "default": ""
     },

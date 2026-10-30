@@ -117,7 +117,7 @@ class _PooledClient:
     PLUGIN_NAME,
     "HuangGuaKnn",
     "把华为运动健康（网页端）的睡眠 / 静息心率 / HRV / 训练数据接进 AstrBot",
-    "v0.5.0-rc.4",
+    "v0.5.0-rc.2",
 )
 class HuaweiHealthPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -129,6 +129,7 @@ class HuaweiHealthPlugin(Star):
         self.store = HealthStore(self.db_path)
         self.credentials = HuaweiCredentialsStore(self.data_dir)
         self._lock = asyncio.Lock()
+        self._auth_change_lock = asyncio.Lock()
         self._state_lock = threading.RLock()
         self._auth_epoch = 0
         self._data_epoch = 0
@@ -502,8 +503,11 @@ class HuaweiHealthPlugin(Star):
             self._clear_health_cache(strict=True)
             self._state_error = False
 
-    def _change_auth_state_blocking(self, mutator=None, clear_cookies=False):
+    def _change_auth_state_blocking(self, mutator=None, clear_cookies=False,
+                                    keep_blocked=False):
         with self._state_lock:
+            if self._closed:
+                raise StateChanged("插件已停用，请重新启用后修改登录状态。")
             self._clear_auth_cache_blocking()
             self._state_error = True
             try:
@@ -516,11 +520,53 @@ class HuaweiHealthPlugin(Star):
                 # No query may use partially updated credentials after a failed change.
                 raise
             else:
-                self._state_error = False
+                self._state_error = keep_blocked
                 return result
 
     async def _change_auth_state(self, mutator=None, clear_cookies=False):
-        return await asyncio.to_thread(self._change_auth_state_blocking, mutator, clear_cookies)
+        return await self._change_auth_state_async(mutator, clear_cookies=clear_cookies)
+
+    async def _change_auth_state_async(self, mutator=None, finalize=None,
+                                       clear_cookies=False, check_current=None):
+        """Serialize credential changes through asynchronous configuration persistence.
+
+        Queries remain blocked until both the encrypted write and the optional
+        async finalizer succeed. Never hold the thread lock across an await.
+        """
+        async with self._auth_change_lock:
+            def begin():
+                with self._state_lock:
+                    if check_current is not None:
+                        check_current()
+                    result = self._change_auth_state_blocking(
+                        mutator, clear_cookies, keep_blocked=finalize is not None)
+                    return result, self._auth_epoch
+
+            worker = asyncio.create_task(asyncio.to_thread(begin))
+            try:
+                result, epoch = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # to_thread keeps running after request cancellation. Keep the
+                # mutation lock until it exits, and leave the state blocked.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not worker.cancelled():
+                    worker.exception()
+                with self._state_lock:
+                    self._state_error = True
+                raise
+            if finalize is not None:
+                await finalize(result)
+            with self._state_lock:
+                if self._closed or epoch != self._auth_epoch:
+                    raise StateChanged("登录状态已更新，本次修改未完成，请刷新后重试。")
+                self._state_error = False
+            return result
 
     async def _invalidate_auth_cache(self):
         await self._change_auth_state()

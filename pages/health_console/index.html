@@ -364,6 +364,10 @@
         <span class="hint" id="cfgDirty" style="margin:0"></span>
       </div>
       <div class="hint" id="cfgState" style="margin-top:8px">未读取</div>
+      <p class="hint" style="margin-bottom:0">
+        Cookie 字段是本次安全导入入口：请同时重新填写 CASTGC 与 sid，其他 Cookie 也需随这份完整登录态一起提交，或使用包含二者的完整 JSON。
+        留空表示不修改；只改其他设置不会导入 Cookie。导入成功后，七项 Cookie 配置值会清空，登录态只保存在加密文件中；清除登录态请使用「登录」页的「清除 cookie」。
+      </p>
       <div class="msg" id="cfgMsg"></div>
     </div>
     <div id="cfgForm">
@@ -1079,7 +1083,7 @@ const CTRL = new Map();    // 叶子路径 -> 控件适配器 {set, get, markErr
 const CFG_GROUPS = [
   { title: "登录与凭据", parts: [
       { title: "Cookie 导入入口（整段 JSON）", keys: ["cookie_json"] },
-      { title: "Cookie 分项值（留空表示不修改）", keys: [
+      { title: "Cookie 分项安全导入（本次须同时填写 CASTGC 与 sid）", keys: [
           "cookie_CASTGC", "cookie_sid", "cookie_hwid_cas_sid",
           "cookie_HuaweiID_CAS_ISCASLOGIN", "cookie_CASLOGINSITE", "cookie_LOGINACCSITE"] },
       { title: "浏览器与登录行为", keys: ["browser_path", "headless", "page_timeout", "login_daily_limit"] },
@@ -1259,7 +1263,7 @@ function buildControl(path, node, key, depth){
       area.addEventListener("input", () => setDirty(path, area.value));
     }
     shell.mount(area);
-    if(sensitive) shell.note("敏感项：不会回显已保存的值；留空提交表示不修改，不会清空配置。");
+    if(sensitive) shell.note("只写导入：内容须包含 CASTGC 与 sid；不会回显已有值。留空不修改，导入成功后清空 Cookie 配置值并保留加密登录态。");
     adapter = {
       set(v){ area.value = (v === null || v === undefined) ? "" : String(v); },
       get(){ return area.value; },
@@ -1288,7 +1292,7 @@ function buildControl(path, node, key, depth){
       line.appendChild(input);
       line.appendChild(toggle);
       shell.mount(line);
-      shell.note("敏感项：不会回显已保存的值；留空提交表示不修改，不会清空配置。");
+      shell.note("只写导入：修改任一 Cookie 时，须在本次同时提供 CASTGC 与 sid，或填写包含二者的完整 JSON。留空不修改，不会沿用旧值补齐本次输入。");
     }else{
       const cur = getValue(path);
       input.value = (cur === null || cur === undefined) ? "" : String(cur);
@@ -1488,13 +1492,32 @@ function buildPayload(){
     const leaf = String(path).split(".").pop();
     // 双保险：敏感项绝不回传掩码/空值。
     if(isSensitive(leaf)){
-      const text = String(value);
+      const text = String(value).trim();
       if(text === MASK || text.length === 0) continue;
     }
     setByPath(values, path, value);
     count++;
   }
   return { values: values, count: count };
+}
+
+function validateCookieConfig(values){
+  // JSON/原有文本格式及 JSON + 分项混合输入交由服务端统一解析，
+  // 这里提前拦截明确不完整的分项输入，绝不使用 CFG.values 中的旧值补齐。
+  const hasInput = key => {
+    const value = String(values[key] || "").trim();
+    return value.length > 0 && value !== MASK;
+  };
+  const fields = ["cookie_CASTGC", "cookie_sid", "cookie_hwid_cas_sid",
+    "cookie_HuaweiID_CAS_ISCASLOGIN", "cookie_CASLOGINSITE", "cookie_LOGINACCSITE"];
+  if(hasInput("cookie_json") || !fields.some(hasInput)) return null;
+  const missing = ["cookie_CASTGC", "cookie_sid"].filter(key => !hasInput(key));
+  if(!missing.length) return null;
+  return {
+    field: missing[0],
+    message: "本次 Cookie 导入还缺少 " + missing.map(key => key.slice(7)).join("、") +
+      "。修改任一 Cookie 时，须同时重新填写 CASTGC 与 sid，或使用包含二者的完整 JSON；已有值不会自动补齐。",
+  };
 }
 
 async function fetchConfig(keepDirty){
@@ -1599,6 +1622,8 @@ async function saveConfig(){
   const payload = buildPayload();
   if(!payload.count){ toast("没有需要保存的修改", "info"); return; }
   clearFieldErrors();
+  const cookieError = validateCookieConfig(payload.values);
+  if(cookieError){ handleSaveError(cookieError); return; }
   const btn = $("btnCfgSave");
   if(btn) btn.disabled = true;
   setMsg($("cfgMsg"), "正在保存…", "info");

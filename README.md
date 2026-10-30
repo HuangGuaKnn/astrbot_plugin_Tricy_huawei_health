@@ -1,6 +1,6 @@
 # 华为运动健康 · AstrBot 插件
 
-版本：v0.5.0-rc.4
+版本：v0.5.0-rc.2
 
 > 各版本变更见 [Releases](https://github.com/HuangGuaKnn/astrbot_plugin_Tricy_huawei_health/releases) 与 [CHANGELOG_v0.4.1.md](CHANGELOG_v0.4.1.md)、[CHANGELOG_v0.4.2.md](CHANGELOG_v0.4.2.md)、[CHANGELOG_v0.5.0.md](CHANGELOG_v0.5.0.md)。
 
@@ -66,13 +66,13 @@ WebUI 的 `/status` 也会在 `permission.invalid_umos` 里回显，便于当场
 
 插件配置页里能填的：
 
-非 Windows 平台请先完成下方「跨平台加密存储」配置，再导入 Cookie 或保存账号密码。主密钥不属于插件配置项，也不要放进聊天消息或 WebUI 表单。Cookie 分项和 `cookie_json` 是旧版兼容入口，内容仍由 AstrBot 保存到普通配置；希望避免这份明文副本时，请改用 WebUI 导入，并清空旧配置中的所有 Cookie 值。
+非 Windows 平台请先完成下方「跨平台加密存储」配置，再导入 Cookie 或保存账号密码。主密钥不属于插件配置项，也不要放进聊天消息或 WebUI 表单。插件 WebUI 的「设置」与「Cookie 导入」均使用加密保存；在「设置」成功提交完整 Cookie 后，七个旧配置字段会清空，页面只显示是否已有值。直接编辑 AstrBot 原始插件配置仍可能留下明文兼容副本；请优先使用插件控制台。
 
 | 配置项 | 说明 |
 |---|---|
 | `cookie_CASTGC` / `cookie_sid` / `cookie_hwid_cas_sid` | 从 `.id1.cloud.huawei.com` 复制对应 cookie 的值；CASTGC 会自动生成 `/CAS` 与 `/UnifiedIDMPortal` 两条 |
 | `cookie_HuaweiID_CAS_ISCASLOGIN` / `cookie_CASLOGINSITE` / `cookie_LOGINACCSITE` | 从 `.huawei.com` 复制对应 cookie 的值 |
-| `cookie_json` | 旧版兼容入口：Cookie-Editor 导出的整段 JSON（仍可使用；导入时同样会补齐 CASTGC 的两条路径） |
+| `cookie_json` | Cookie-Editor 导出的整段 JSON；控制台设置页仅作安全导入，成功后清空原始配置值 |
 | `page_timeout` | 认证浏览器/CDP 超时秒数（默认 90） |
 | `browser_path` | 浏览器路径，留空自动探测 Edge / Chrome |
 | `headless` | 无头模式（默认开） |
@@ -104,7 +104,7 @@ Cookie 文件由插件维护：`data/plugin_data/astrbot_plugin_Tricy_huawei_hea
    - `CASTGC`：`.id1.cloud.huawei.com`，插件自动生成 `/CAS` 与 `/UnifiedIDMPortal` 两个路径；
    - `sid`、`hwid_cas_sid`：`.id1.cloud.huawei.com`；
    - `HuaweiID_CAS_ISCASLOGIN`、`CASLOGINSITE`、`LOGINACCSITE`：`.huawei.com`；
-3. 把值填入插件设置页对应的 6 个分项字段，或在 WebUI 控制面板逐项填写；
+3. 在插件 WebUI 的设置页或 Cookie 导入页填写完整集合，至少同时提供 CASTGC 和 sid；也可粘贴包含这两项的完整 JSON。可选项需要随完整集合一起提交，留空表示不修改；
 4. 旧版也可继续导出整段 JSON，粘贴到 `cookie_json` 或 WebUI 的 JSON 框。
 
 `CASTGC` 是 session cookie，关闭原浏览器后会失效；重新登录后需重新复制有效值。
@@ -141,7 +141,7 @@ Cookie 文件由插件维护：`data/plugin_data/astrbot_plugin_Tricy_huawei_hea
 > WebUI 的「账号登录」区完成，会话会保留 5 分钟，完成后再问一次即可。
 >
 > 旧 Windows DPAPI 文件仍需原 Windows 用户和机器才能解密；迁移到其他平台时，请配置新的安全存储并重新导入 Cookie、保存账号密码。
-> **rc.4 起，非 Windows 平台也禁止将新 Cookie、账号密码或 token 持久化为明文。**未配置主密钥时，保存会明确报错。
+> **本次改动后，非 Windows 平台也禁止将新 Cookie、账号密码或 token 持久化为明文。**未配置主密钥时，保存会明确报错。
 
 加密失败时保存会明确报错，并保留原有文件。已有明文 Cookie 保留读取兼容；配置好主密钥后，在 WebUI 重新导入即可原子替换成加密文件，读取操作不会擅自回写。保存账号密码会清除旧 Cookie、token 与健康缓存，下次查询重新认证；清除账号密码则切回 Cookie 模式、保留已有 Cookie 并清空缓存。导入、清除或刷新登录态时，旧登录与旧查询结果会失效，避免换账号后继续显示上一个账号的数据。
 
@@ -214,6 +214,7 @@ Keychain 需要允许当前运行用户和 Python 进程访问；未登录、Key
 - 旧 DPAPI 凭据与旧 Cookie 文件仍按原格式识别。旧明文 Cookie 在重新导入或成功保存后才迁移；迁移失败保留原文件。
 - 主密钥与加密数据需要分别备份、分别授权；恢复时必须使用原主密钥。没有原主密钥无法恢复密文，需重新保存账号密码或重新导入 Cookie。
 - 错钥、锁定与文件损坏不会自动创建新密钥或降级成明文。先恢复正确的钥匙，再重试；确认放弃原凭据时才显式清除并重新配置。
+- 插件控制台设置页成功导入 Cookie 后，会清空七个旧配置字段；无关设置修改不会自动清除尚未迁移的旧副本。
 - 本功能保护插件持久化的登录凭据，不等于全盘加密。健康数据缓存、旧版备份、AstrBot 的旧 Cookie 配置副本、浏览器自身的运行时文件需要分别管理。
 - 运行时需要使用明文凭据，取得 root、同一用户代码执行能力或 AstrBot 进程控制权的攻击者仍可能读取它们；不要把不受信任的插件放在同一进程中。
 

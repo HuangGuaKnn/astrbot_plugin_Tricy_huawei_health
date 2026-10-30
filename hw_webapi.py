@@ -30,15 +30,16 @@ PAGE_PREFIX = "astrbot_plugin_Tricy_huawei_health/page"
 #: （HUAWEI_ID_CAS_ISCASLOGIN / __uni__uid），而 CASLOGINSITE / LOGINACCSITE 配了却
 #: 永远显示不出来。
 try:
-    from .hw_auth import MIN_COOKIE_SPECS
+    from .hw_auth import MIN_COOKIE_SPECS, REQUIRED_COOKIES, cookies_from_fields, parse_cookie_input
 except ImportError:
-    from hw_auth import MIN_COOKIE_SPECS
+    from hw_auth import MIN_COOKIE_SPECS, REQUIRED_COOKIES, cookies_from_fields, parse_cookie_input
 
 KEY_COOKIES = tuple(name for name, _, _ in MIN_COOKIE_SPECS)
 
 # ==================== T8：配置同源（WebUI 直接读写 AstrBot 配置）====================
 #
-# 铁律：只读写 self.plugin.config 这一份配置，绝不另存第二份配置文件。
+# 普通设置只读写 self.plugin.config 这一份配置，不另建配置副本。
+# Cookie 表单是只写安全导入入口；导入成功后清空普通配置中的七个敏感字段。
 # AstrBotConfig.__setattr__ 只做 self[key] = value（不落盘），所以保存必须显式调用
 # save_config_async()（异步 + 内部 revision 防旧快照覆盖）。
 
@@ -80,6 +81,14 @@ class ConfigValueError(Exception):
         super().__init__(message)
         self.field = field
         self.message = message
+
+
+class ConfigPersistError(Exception):
+    """A validated update could not be committed to the AstrBot config."""
+
+
+class ConfigRevisionError(Exception):
+    """The account/config changed while this request waited for its transaction."""
 
 
 def _schema_path() -> str:
@@ -140,6 +149,7 @@ def _get_path(values: dict, path: str):
 class HuaweiHealthWebApi:
     def __init__(self, plugin):
         self.plugin = plugin
+        self._config_lock = asyncio.Lock()
 
     # ---------- 注册 ----------
 
@@ -238,7 +248,7 @@ class HuaweiHealthWebApi:
         manager = getattr(p, "login_manager", None)
         data = {
             # 页面状态版本与插件元数据统一，避免前端误判部署版本。
-            "version": "v0.5.0-rc.4",
+            "version": "v0.5.0-rc.2",
             "data_dir": p.data_dir,
             "cookie_file": p.cookie_file,
             "login_mode": getattr(manager, "login_mode", "cookie"),
@@ -626,7 +636,11 @@ class HuaweiHealthWebApi:
                 mtime = os.stat(path).st_mtime_ns
             except OSError:
                 mtime = 0
-        return "%s-%s-%s" % (revision, committed, mtime)
+        # A dedicated Cookie/credentials update also invalidates a form opened
+        # before that account change, even when the AstrBot config was untouched.
+        return "%s-%s-%s-%s-%s" % (
+            revision, committed, mtime,
+            getattr(self.plugin, "_auth_epoch", 0), getattr(self.plugin, "_data_epoch", 0))
 
     def _config_mtime_text(self) -> str:
         path = getattr(self.plugin.config, "config_path", None)
@@ -639,7 +653,7 @@ class HuaweiHealthWebApi:
             return "-"
 
     def _read_values(self) -> dict:
-        """当前配置的完整视图（21 个叶子，未掩码）。
+        """当前配置的完整视图（21 个叶子，敏感项始终为掩码）。
 
         缺失项按 schema 的 default 补齐，保证前端拿到的永远是完整表单数据。
         """
@@ -649,7 +663,9 @@ class HuaweiHealthWebApi:
         for key, spec in schema.items():
             if not isinstance(spec, dict):
                 continue
-            if spec.get("type") == "object":
+            if key in SENSITIVE_KEYS:
+                values[key] = MASK
+            elif spec.get("type") == "object":
                 raw = cfg.get(key)
                 group = raw if isinstance(raw, dict) else {}
                 children = {}
@@ -673,10 +689,21 @@ class HuaweiHealthWebApi:
                 masked[key] = MASK
         return masked
 
-    @staticmethod
-    def _has_value(values: dict) -> dict:
-        """敏感项是否已配置——只暴露布尔，不暴露内容。"""
-        return {key: bool(str(values.get(key) or "").strip()) for key in SENSITIVE_KEYS}
+    def _has_value(self) -> dict:
+        """Expose presence only, from secure storage or an unmigrated legacy config."""
+        values = self.plugin.config
+        present = {key: bool(str(values.get(key) or "").strip()) for key in SENSITIVE_KEYS}
+        try:
+            cookies = self.plugin.auth.load_cookies()
+        except Exception:
+            cookies = []
+        if cookies:
+            present["cookie_json"] = True
+            for cookie in cookies:
+                name = "cookie_" + str(cookie.get("name") or "")
+                if name in present and str(cookie.get("value") or "").strip():
+                    present[name] = True
+        return present
 
     def _meta(self, values: dict = None) -> dict:
         if values is None:
@@ -684,7 +711,7 @@ class HuaweiHealthWebApi:
         return {
             "revision": self._config_revision(),
             "sensitive": list(SENSITIVE_KEYS),
-            "has_value": self._has_value(values),
+            "has_value": self._has_value(),
             "bounds": {key: list(pair) for key, pair in INT_BOUNDS.items()},
             "updated_at": self._config_mtime_text(),
             "source": "astrbot_config",
@@ -919,7 +946,7 @@ class HuaweiHealthWebApi:
         return True
 
     async def _apply_hot_effects(self, merged: dict, changed) -> None:
-        """保存后需要额外处理的三组配置。其余 18 项本来就是实时读取，天然生效。"""
+        """Apply local consumers after persistence; query epochs are handled by the transaction."""
         p = self.plugin
         changed = set(changed)
 
@@ -985,16 +1012,18 @@ class HuaweiHealthWebApi:
 
     async def get_config(self):
         """GET /page/config：当前值（敏感项掩码）+ 原样 schema + 版本戳。"""
-        values = self._read_values()
-        return json_response({"status": "ok", "data": {
-            "values": self._mask(values),
-            "schema": _load_schema(),
-            "meta": self._meta(values),
-        }})
+        def snapshot():
+            values = self._read_values()
+            return {"status": "ok", "data": {
+                "values": self._mask(values),
+                "schema": _load_schema(),
+                "meta": self._meta(values),
+            }}
+        async with self._config_lock:
+            return json_response(await asyncio.to_thread(snapshot))
 
     async def post_config(self):
         """POST /page/config：白名单 + 类型校验 + UMO 校验 + 并发防护 + 落盘 + 热生效。"""
-        p = self.plugin
         try:
             body = await request.json()
         except Exception:
@@ -1016,6 +1045,13 @@ class HuaweiHealthWebApi:
                 {"status": "error", "message": exc.message, "field": exc.field},
                 status_code=400)
 
+        # The revision check and the complete write must share one async lock.
+        # A framework save revision alone cannot undo prior Cookie side effects.
+        async with self._config_lock:
+            return await self._post_config_locked(body, writes, clamped, accepted)
+
+    async def _post_config_locked(self, body, writes, clamped, accepted):
+        p = self.plugin
         # 第 2 步：并发覆盖防护。
         current_revision = self._config_revision()
         expected = body.get("revision")
@@ -1032,51 +1068,93 @@ class HuaweiHealthWebApi:
         merged = self._apply_writes(copy.deepcopy(before), writes, _load_schema())
         changed = [
             path for path in accepted
-            if _get_path(merged, path) != _get_path(before, path)
+            if (_get_path(merged, path) != _get_path(before, path) or
+                (path in SENSITIVE_KEYS and bool(str(writes[path]).strip())))
         ]
 
         if not changed:
             # 值没变：不落盘、不触发副作用。applied 也不该报，否则前端会以为改了东西。
-            return json_response(self._config_payload(
-                [], [], clamped, "配置无变化，未写入"))
+            return json_response(await asyncio.to_thread(
+                self._config_payload, [], [], clamped, "配置无变化，未写入"))
 
-        # 第 4 步：cookie 组先导入（失败整单 400，且配置文件此时还没被写过）。
+        # Sensitive fields are a write-only secure-import form. Never merge an
+        # old account's Cookie/config into this request, or persist new secrets
+        # in AstrBot's ordinary JSON config.
         cookie_touched = any(path in SENSITIVE_KEYS for path in changed)
+        cookie_field = next((path for path in changed if path in SENSITIVE_KEYS), "cookie_json")
+        raw_json, fields = "", {}
         if cookie_touched:
             try:
-                raw_json = str(merged.get("cookie_json") or "")
+                raw_json = writes.get("cookie_json", "")
                 fields = {
-                    name: merged.get("cookie_" + name, "")
+                    name: writes.get("cookie_" + name, "")
                     for name, _, _ in MIN_COOKIE_SPECS
                 }
-                await asyncio.to_thread(
-                    p.auth.import_cookie_sources, raw_json, fields, True)
+                incoming = parse_cookie_input(raw_json) + cookies_from_fields(fields)
+                names = {cookie.get("name") for cookie in incoming
+                         if str(cookie.get("value") or "").strip()}
+                if any(name not in names for name in REQUIRED_COOKIES):
+                    raise ConfigValueError(cookie_field,
+                        "Cookie 修改需本次同时提供 CASTGC 和 sid，或包含二者的完整 JSON；"
+                        "不会沿用旧账号字段。清除请使用 Cookie 清除入口")
             except Exception as exc:
                 return json_response({
                     "status": "error",
                     "message": "cookie 导入失败：%s" % redact_error(exc),
-                    # 指到真正变更的那个 cookie 项，前端才能高亮对控件。
-                    "field": next(
-                        (path for path in changed if path in SENSITIVE_KEYS),
-                        "cookie_json",
-                    ),
+                    "field": cookie_field,
                 }, status_code=400)
+            for key in SENSITIVE_KEYS:
+                merged[key] = ""
 
-        # 第 5 步：落盘（同源：写的就是 AstrBot 注入的那个 config）。
-        if not await self._persist(merged):
-            return json_response(
-                {"status": "error", "message": "配置保存失败", "field": ""},
-                status_code=500)
+        imported = False
 
-        # 第 6 步：热生效。
-        await self._apply_hot_effects(merged, changed)
-        if cookie_touched:
-            # 换了 cookie 必须作废 token 与健康缓存，否则会用旧账号的 token 取新账号的数据。
-            try:
-                await p._invalidate_auth_cache()
-            except Exception as exc:
-                p.logger.warning(
-                    "[华为健康] cookie 变更后清缓存失败：%s" % redact_error(exc))
+        def import_cookies():
+            nonlocal imported
+            # No fingerprint shortcut: an unchanged legacy JSON file must still
+            # be encrypted before its config copy is removed.
+            result = p.auth.import_cookie_sources(raw_json, fields, replace_existing=True)
+            imported = True
+            return result
+
+        async def finalize(_result=None):
+            if not await self._persist(merged):
+                raise ConfigPersistError("配置保存失败")
+            await self._apply_hot_effects(merged, changed)
+
+        query_settings = {
+            "client_id", "api_version", "timezone", "token_ttl", "data_ttl",
+            "browser_path", "headless", "page_timeout",
+        }
+
+        def check_current():
+            if self._config_revision() != expected:
+                raise ConfigRevisionError()
+
+        try:
+            if cookie_touched or query_settings.intersection(changed):
+                # The plugin keeps its fail-closed state across async persistence,
+                # without holding a thread lock across await. This also invalidates
+                # inflight work produced with an old timezone/client/TTL setting.
+                await p._change_auth_state_async(
+                    import_cookies if cookie_touched else None, finalize,
+                    check_current=check_current)
+            else:
+                await finalize()
+        except ConfigRevisionError:
+            return json_response({"status": "error",
+                                  "message": "登录状态或配置已变化，请刷新后重试",
+                                  "field": "revision"}, status_code=409)
+        except ConfigPersistError:
+            message = ("Cookie 已安全更新，但配置副本清理保存失败；查询已暂停，"
+                       "请重新提交完整 Cookie 后重试" if imported else "配置保存失败")
+            return json_response({"status": "error", "message": message, "field": ""},
+                                 status_code=500)
+        except Exception as exc:
+            message = ("Cookie 已安全更新，但配置更新未完成；查询已暂停，请重试"
+                       if imported else "配置更新失败：%s" % redact_error(exc))
+            return json_response({"status": "error", "message": message,
+                                  "field": cookie_field if cookie_touched else ""},
+                                 status_code=400 if cookie_touched and not imported else 500)
 
         # 契约：applied 只统计「真的写下去并已生效」的项，值没变的不算（那属于 changed 为空）。
         applied = changed
@@ -1084,5 +1162,6 @@ class HuaweiHealthWebApi:
         if clamped:
             message += "（其中 %d 项已按上下限调整）" % len(clamped)
         p.logger.info("[华为健康] WebUI 保存配置：已生效 %s" % ", ".join(applied))
-        return json_response(self._config_payload(applied, changed, clamped, message))
+        return json_response(await asyncio.to_thread(
+            self._config_payload, applied, changed, clamped, message))
 
