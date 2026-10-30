@@ -1520,6 +1520,27 @@ function validateCookieConfig(values){
   };
 }
 
+function validateTimezone(values){
+  // 与后端 hw_client.parse_timezone 保持同一套规则：宽进窄出。
+  // 只拦明显写错的，别把用户能用的写法挡在门外。
+  if(!Object.prototype.hasOwnProperty.call(values, "timezone")) return null;
+  const raw = values["timezone"];
+  if(raw === undefined || raw === null) return null;
+  const text = String(raw).trim();
+  if(text.length === 0) return null;           // 留空 = 用默认值，后端兜底成 +0800
+  if(/^(UTC|Z)$/i.test(text)) return null;
+  const m = /^([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(text);
+  if(!m){
+    return { field: "timezone", message: "时区格式应为 +0800 或 +08:00（也接受 +8、UTC）" };
+  }
+  const hours = Number(m[2]);
+  const minutes = Number(m[3] || 0);
+  if(hours > 23 || minutes > 59){
+    return { field: "timezone", message: "时区偏移超出有效范围（小时 ≤ 23、分钟 ≤ 59）" };
+  }
+  return null;
+}
+
 async function fetchConfig(keepDirty){
   if(CFG.loading) return;
   CFG.loading = true;
@@ -1624,6 +1645,8 @@ async function saveConfig(){
   clearFieldErrors();
   const cookieError = validateCookieConfig(payload.values);
   if(cookieError){ handleSaveError(cookieError); return; }
+  const tzError = validateTimezone(payload.values);
+  if(tzError){ handleSaveError(tzError); return; }
   const btn = $("btnCfgSave");
   if(btn) btn.disabled = true;
   setMsg($("cfgMsg"), "正在保存…", "info");
