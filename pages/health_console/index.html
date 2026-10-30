@@ -562,14 +562,15 @@ async function selectMode(force){
 async function probeBridgeScript(){
   const el2 = document.querySelector('script[src*="bridge-sdk"]');
   DIAG.bridgeSrc = el2 ? el2.src.slice(0, 180) : "页面上没找到 bridge-sdk 标签";
-  DIAG.bridgeProbe = "-";
-  if(!el2) return;
-  try{
-    const r = await fetch(el2.src, { credentials:"include" });
-    DIAG.bridgeProbe = "HTTP " + r.status + (r.ok ? "（脚本可取）" : "（脚本取不到）");
-  }catch(e){
-    DIAG.bridgeProbe = "请求失败：" + e.message;
+  if(!el2){
+    DIAG.bridgeProbe = "无 bridge-sdk 标签";
+    return;
   }
+  // 不再 fetch 脚本内容：同源策略下会被 CORS/CSP 拦，只会得到一条
+  // 「Failed to fetch」的误导性红字。脚本是否真的加载成功，看它导出的
+  // 全局对象是否存在就够了——比取源码更直接，也不会误报。
+  const sdk = window.AstrBotPluginPage || window.AstrBotPluginView;
+  DIAG.bridgeProbe = sdk ? "已加载（全局对象可用）" : "标签在但全局对象缺失";
 }
 
 /* ---------- 诊断 ---------- */

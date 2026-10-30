@@ -249,6 +249,7 @@ class HuaweiLoginSession:
         """
         if state not in LOGIN_STATES:
             state = "FAILED"
+        previous = self._state
         changed = state != self._state
         self._state = state
         self._message = message or STATE_MESSAGES.get(state, STATE_MESSAGES["FAILED"])
@@ -256,6 +257,10 @@ class HuaweiLoginSession:
             deadline = self._session_timeout if state == "NEED_SMS" else STATE_DEADLINES.get(state, 0)
             self._deadline = time.time() + deadline
         self._updated_at = time.time()
+        if changed:
+            # 成功路径也必须留痕：在此之前这里完全静默，登录成功后日志里看不出
+            # 走过哪几步，排查只能靠文件时间戳猜。只在状态真变化时打，避免轮询刷屏。
+            self._log("info", "状态 %s → %s：%s" % (previous, state, self._message))
 
     def _fail(self, code: str = "failed"):
         messages = {
@@ -998,6 +1003,12 @@ class HuaweiLoginManager:
         except Exception:
             pass
 
+    def _log_info(self, msg: str):
+        try:
+            self.plugin.logger.info("[华为健康登录] " + msg)
+        except Exception:
+            pass
+
     def set_login_mode(self, mode: str):
         mode = str(mode or "").strip().lower()
         if mode not in ("cookie", "password"):
@@ -1126,6 +1137,9 @@ class HuaweiLoginManager:
                 if not manual:
                     self._check_auto_gate()
                     self._record_auto_attempt()
+            self._log_info(
+                "开始登录：mode=%s manual=%s auto_trust=%s prefer_auto=%s"
+                % (mode, manual, self.auto_trust, self.prefer_auto))
             session = HuaweiLoginSession(self, mode=mode, manual=manual)
             session._attempt_recorded = (mode == "auto" and not manual)
             self._session = session
