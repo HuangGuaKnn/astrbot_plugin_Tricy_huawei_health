@@ -204,6 +204,28 @@ class CookieAuthenticationTests(unittest.TestCase):
         self.assertFalse(status["encrypted"])
         self.assertNotIn("must-not-return", json.dumps(status))
 
+    def test_stop_process_without_proc_still_sweeps_orphans(self):
+        """proc 为 None 时也必须做兜底清扫。
+
+        实测背景（2026-10-30）：Edge 的启动器会先于浏览器主进程退出，
+        传进来的 proc 常常已经「结束」，但真正持有 profile 的子进程仍在。
+        旧实现在 proc is None 时直接 return True，残留越积越多
+        （现场累积到 14 个，把 browser_profile 锁死）。
+        """
+        calls = []
+        with patch.object(type(self.auth), "_cleanup_orphan_browsers",
+                          lambda _inst: calls.append(1)):
+            self.assertTrue(self.auth._stop_process(None, sweep_profile=True))
+        self.assertEqual(len(calls), 1)
+
+    def test_stop_process_without_proc_respects_sweep_flag(self):
+        """sweep_profile=False 时不许清扫——否则会误杀新会话刚起的浏览器。"""
+        calls = []
+        with patch.object(type(self.auth), "_cleanup_orphan_browsers",
+                          lambda _inst: calls.append(1)):
+            self.assertTrue(self.auth._stop_process(None, sweep_profile=False))
+        self.assertEqual(calls, [])
+
     @staticmethod
     def _fixture_serialization(cookies):
         # Test-only plaintext fixtures avoid depending on the host's DPAPI user.

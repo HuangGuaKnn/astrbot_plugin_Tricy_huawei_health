@@ -760,22 +760,29 @@ class HuaweiAuth:
             self._cleanup_orphan_browsers_posix()
             return
         needle = os.path.abspath(self.profile_dir).replace("'", "''")
+        # 用 Stop-Process 而不是 taskkill：后者每杀一个都要起一个子进程，
+        # 十几个残留时很容易吃满超时（实测累积到 14 个时 10 秒不够，留下一半）。
+        # Stop-Process 是 PowerShell 内建，全部走同一会话，快得多。
         script = (
             "$needle='%s'; "
-            "Get-CimInstance Win32_Process | "
+            "$p = @(Get-CimInstance Win32_Process | "
             "Where-Object { ($_.Name -eq 'msedge.exe' -or $_.Name -eq 'chrome.exe') "
-            "-and $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle.ToLower()) } | "
-            "ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null }"
+            "-and $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle.ToLower()) }); "
+            "$p | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }; "
+            "Write-Output $p.Count"
         ) % needle
         try:
-            subprocess.run(
+            r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", script],
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                timeout=10,
+                timeout=30,
                 check=False,
             )
             time.sleep(0.2)
+            out = (r.stdout or b"").decode("utf-8", "replace").strip()
+            if out.isdigit() and int(out) > 0:
+                self._log("info", "清理孤儿浏览器 %s 个" % out)
         except Exception as exc:
             self._log("warning", "孤儿浏览器清理失败：%s" % redact_error(exc))
 
@@ -1020,6 +1027,14 @@ class HuaweiAuth:
         已经被新会话取代时用它，否则会把新会话刚起的浏览器一起 taskkill。
         """
         if proc is None:
+            # 没有 proc 不代表没有残留：上一轮崩溃、或 Popen 拿到的是已经退出的
+            # 启动器时，真正的浏览器进程仍在。这里同样要做一次按 profile 路径的
+            # 兜底清扫，否则残留会一直累积到把 profile 锁死。
+            if sweep_profile:
+                try:
+                    self._cleanup_orphan_browsers()
+                except Exception:
+                    pass
             return True
         try:
             proc.terminate()
