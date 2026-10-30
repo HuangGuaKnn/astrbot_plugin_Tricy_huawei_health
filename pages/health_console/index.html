@@ -7,16 +7,16 @@
 <style>
   :root{
     --bg:#fafafa; --panel:#fff; --line:#e4e4e7; --fg:#18181b; --muted:#71717a;
-    --accent:#2563eb; --ok:#15803d; --warn:#b45309; --err:#b91c1c; --code:#f4f4f5;
+    --accent:#2563eb; --ok:#15803d; --warn:#b45309; --err:#b91c1c; --code:#f4f4f5; --bar-bg:rgba(250,250,250,.92);
   }
   @media (prefers-color-scheme: dark){
     :root{ --bg:#0f0f11; --panel:#17171a; --line:#2a2a30; --fg:#e9e9ec; --muted:#8f8f99;
-           --accent:#6ea8fe; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; --code:#1e1e22; }
+           --accent:#6ea8fe; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; --code:#1e1e22; --bar-bg:rgba(15,15,17,.94); }
   }
   html[data-theme="dark"]{ --bg:#0f0f11; --panel:#17171a; --line:#2a2a30; --fg:#e9e9ec; --muted:#8f8f99;
-           --accent:#6ea8fe; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; --code:#1e1e22; }
+           --accent:#6ea8fe; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; --code:#1e1e22; --bar-bg:rgba(15,15,17,.94); }
   html[data-theme="light"]{ --bg:#fafafa; --panel:#fff; --line:#e4e4e7; --fg:#18181b; --muted:#71717a;
-           --accent:#2563eb; --ok:#15803d; --warn:#b45309; --err:#b91c1c; --code:#f4f4f5; }
+           --accent:#2563eb; --ok:#15803d; --warn:#b45309; --err:#b91c1c; --code:#f4f4f5; --bar-bg:rgba(250,250,250,.92); }
 
   *{box-sizing:border-box}
   body{
@@ -24,7 +24,7 @@
     font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
   }
   .wrap{max-width:880px;margin:0 auto}
-  header{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+header{display:flex;align-items:baseline;gap:10px;margin-bottom:4px;position:sticky;top:0;z-index:50;background:var(--bar-bg);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);padding:10px 12px;margin-left:-12px;margin-right:-12px;border-radius:0 0 12px 12px}
   h1{font-size:17px;font-weight:600;margin:0;letter-spacing:.2px}
   .ver{font-size:12px;color:var(--muted)}
   .sub{font-size:12.5px;color:var(--muted);margin:0 0 14px}
@@ -35,7 +35,7 @@
   h2.cfg-h2:first-child{margin-top:0}
 
   /* ---------- Tab ---------- */
-  .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin:0 0 18px;
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin:0 0 18px;position:sticky;top:var(--chrome-h,44px);z-index:49;background:var(--bar-bg);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
     overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
   .tab{flex:0 0 auto;background:none;border:0;border-bottom:2px solid transparent;
     color:var(--muted);padding:8px 12px;font-size:13.5px;cursor:pointer;white-space:nowrap;
@@ -168,7 +168,16 @@
   .taglist input{flex:1 1 180px;min-width:130px;background:transparent;border:0;color:var(--fg);
     font:12px ui-monospace,SFMono-Regular,Consolas,monospace;padding:4px}
   .taglist input:focus{outline:none}
-  .cfg-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+/* 吸顶保存条：跟着页面滚动一直可用。层级低于 tabs，避免遮住分区按钮。 */
+.savebar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  position:sticky;top:calc(var(--chrome-h,44px) + var(--tabs-h,42px) + 8px);z-index:40;
+  background:var(--bar-bg);
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin:0 0 14px;
+  box-shadow:0 8px 24px rgba(0,0,0,.07)}
+.savebar .bar-note{font-size:12px;color:var(--muted);flex:1 1 240px;min-width:0}
+.savebar .bar-dirty{font-size:12px;color:var(--warn);font-weight:600}
+@media(max-width:640px){.savebar{top:calc(var(--chrome-h,40px) + var(--tabs-h,40px) + 6px)}}
 
   /* ---------- toast ---------- */
   #toast{position:fixed;right:16px;bottom:16px;z-index:20;max-width:min(430px,calc(100vw - 32px));
@@ -363,13 +372,14 @@
 
   <!-- ================= 设置 ================= -->
   <section class="panel" id="panel-config" role="tabpanel" aria-label="设置" hidden>
-    <div class="card">
-      <div class="cfg-bar">
+      <div class="savebar" id="savebar">
         <button class="act primary" type="button" id="btnCfgSave" disabled>保存修改</button>
         <button class="act" type="button" id="btnCfgReload">重新读取</button>
         <button class="act sm" type="button" id="btnCfgReset">放弃修改</button>
-        <span class="hint" id="cfgDirty" style="margin:0"></span>
+        <span class="bar-dirty" id="cfgDirty"></span>
+        <span class="bar-note">校验通过后写盘并即时生效：21 项设置全部热应用，不需要重启 AstrBot</span>
       </div>
+    <div class="card">
       <div class="hint" id="cfgState" style="margin-top:8px">未读取</div>
       <p class="hint" style="margin-bottom:0">
         Cookie 字段是本次安全导入入口：请同时重新填写 CASTGC 与 sid，其他 Cookie 也需随这份完整登录态一起提交，或使用包含二者的完整 JSON。
@@ -1802,6 +1812,27 @@ function bindAll(){
   $("btnClear").onclick = doClear;
 
   $("btnCfgSave").onclick = saveConfig;
+
+// ---------- 吸顶三层的高度同步 ----------
+// header 有 padding、tabs 可能有横向滚动条，高度在不同字号/主题/窄屏下都不一样。
+// 这里实测后写进 CSS 变量，tabs 与 savebar 的 top 跟着算，避免固定值错位。
+function syncStickyChromeMetrics(){
+  const root = document.documentElement;
+  const head = document.querySelector("header");
+  const tabs = document.getElementById("tabs");
+  if(head && head.offsetHeight) root.style.setProperty("--chrome-h", head.offsetHeight + "px");
+  if(tabs && tabs.offsetHeight) root.style.setProperty("--tabs-h", tabs.offsetHeight + "px");
+}
+syncStickyChromeMetrics();
+requestAnimationFrame(syncStickyChromeMetrics);
+window.addEventListener("resize", syncStickyChromeMetrics, {passive: true});
+if(typeof ResizeObserver === "function"){
+  const chromeObserver = new ResizeObserver(syncStickyChromeMetrics);
+  const headEl = document.querySelector("header");
+  const tabsEl = document.getElementById("tabs");
+  if(headEl) chromeObserver.observe(headEl);
+  if(tabsEl) chromeObserver.observe(tabsEl);
+}
   $("btnCfgReload").onclick = () => {
     if(DIRTY.size && !confirm("重新读取会丢弃未保存的修改，继续？")) return;
     DIRTY.clear();
