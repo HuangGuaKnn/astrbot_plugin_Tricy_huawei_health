@@ -761,6 +761,15 @@ class HuaweiHealthWebApi:
                     return format_timezone(value), False
                 except ValueError as exc:
                     raise ConfigValueError(path, "时区格式不合法：%s" % exc) from None
+            if name in ("client_id", "api_version"):
+                # 这两项会原样拼进 HTTP header。requests 对含换行/制表符的值抛
+                # InvalidHeader，而 main.py 只做了 .strip()，中间的控制字符挡不住。
+                # 单行输入框填不出换行，但 POST /page/config 的 JSON 可以。
+                cleaned = value.strip()
+                if not cleaned.isprintable():
+                    raise ConfigValueError(
+                        path, "%s 不能包含换行、制表符等控制字符" % name)
+                return cleaned, False
             return value, False
 
         if leaf_type == "list":
