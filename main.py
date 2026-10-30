@@ -138,7 +138,11 @@ class HuaweiHealthPlugin(Star):
         self._client_pool = ClientPool(max_size=3)
         # 记录每个缓存键的进行中任务，避免并发请求重复打华为接口。
         self._cache_inflight = {}
-        # generation 用于阻止刷新后旧请求把结果写回缓存。
+        # 历史遗留：这里原本打算用 generation 拦截「刷新后旧请求回写」，但实际防线
+        # 已经换成 (auth_epoch, data_epoch) 的 publish 复核（见 _cached）。这个字典
+        # 目前只被 _clear_health_cache 自增、被 test_v041 断言，**没有任何读取点**
+        # 参与放行/拒绝——保留字段本身只是为了不动 v0.4.1 验收基线。
+        # 判断防线位置时看 epoch，不要看这里（见 AUDIT_concurrency.md 发现 9）。
         self._cache_generation = {}
         self._warmup_task = None
         self.login_manager = HuaweiLoginManager(self)
@@ -599,6 +603,10 @@ class HuaweiHealthPlugin(Star):
                 # Cookie, token and health snapshots share the same account transition lock.
                 self.store.delete("token")
                 self.store.clear_except("token")
+                # 这里的账号切换同样是一次「数据代际」变更：在飞的旧账号查询会在
+                # publish 时用 (auth_epoch, data_epoch) 复核，不推进代际就会被放行，
+                # 把上一个账号的健康数据写进新账号的缓存（最长 data_ttl）。
+                self._data_epoch += 1
                 self._client_pool.invalidate()
                 if not session._auth.save_cookies(cookies):
                     return False

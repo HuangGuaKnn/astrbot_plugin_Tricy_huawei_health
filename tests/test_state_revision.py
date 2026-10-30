@@ -349,6 +349,241 @@ class TestStateRevision(unittest.IsolatedAsyncioTestCase):
                 stopped_auth._fetch_token_locked()
 
 
+    async def test_active_login_session_blocks_old_cookie_authentication(self):
+        """如果这条测试红了，说明：网页登录会话（正在等验证码 NEED_SMS）还没跑完时，
+        cookie 模式查询会绕开登录闸门去用旧 cookie 发请求——用户会拿到上一个账号/
+        过期凭据的数据，而且拉起的登录会话永远等不到用户输入。正确行为是在任何
+        auth.fetch_token 调用之前抛 LoginNeedsHuman，并且 token 存储保持为空。"""
+        p = self.plugin
+        session = SimpleNamespace(
+            is_running=lambda: True,
+            snapshot=lambda: {"state": "NEED_SMS"},
+            cancel=Mock(), join=Mock())
+        manager = SimpleNamespace(
+            login_mode="cookie",
+            current_session=lambda: session,
+            status=lambda: {"state": "NEED_SMS"},
+            invalidate=Mock(), stop=Mock())
+        auth = SimpleNamespace(
+            fetch_token=Mock(side_effect=AssertionError("旧 cookie 不得被用于认证")),
+            token_expire_at=time.time() + 600)
+        p.login_manager = manager
+        with patch.object(main_mod.HuaweiHealthPlugin, "auth", new_callable=PropertyMock,
+                          return_value=auth):
+            with self.assertRaises(main_mod.LoginNeedsHuman):
+                await asyncio.wait_for(p._token(), 3)
+        auth.fetch_token.assert_not_called()
+        self.assertIsNone(p.store.get("token"))
+
+    async def test_epoch_change_during_password_wait_raises_state_changed(self):
+        """如果这条测试红了，说明：账号/登录状态在等密码登录期间被切换后，等待方还在
+        继续轮询旧的登录会话，只能空等到 60~100 秒超时才失败（甚至可能把旧会话的
+        token 当成新账号的 token 返回）。正确行为是下一轮轮询立刻抛 StateChanged。"""
+        p = self.plugin
+        polled = threading.Event()
+
+        def snapshot():
+            polled.set()
+            return {"state": "SUBMITTING"}
+
+        session = SimpleNamespace(cancel=Mock(), snapshot=snapshot)
+        manager = SimpleNamespace(
+            session_timeout=300, start=Mock(return_value={}),
+            current_session=lambda: session,
+            status=lambda: {"state": "SUBMITTING"},
+            invalidate=Mock(), stop=Mock(), cancel=Mock())
+        p.login_manager = manager
+        waiting = asyncio.create_task(p._password_token())
+        try:
+            self.assertTrue(await asyncio.to_thread(polled.wait, 3))
+            await p._invalidate_auth_cache()
+            with self.assertRaises(main_mod.StateChanged):
+                await asyncio.wait_for(waiting, 2)
+        finally:
+            if not waiting.done():
+                waiting.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiting
+
+    async def test_auth_expired_retry_forces_new_token_and_rejects_old_result(self):
+        """如果这条测试红了，说明：token 过期后 AuthExpired 重试要么继续复用旧的缓存
+        token（第二次 producer 还是拿到死 token），要么在缓存里已经是新 token 时又重复
+        触发一次登录。前者会让用户一直看到「登录态失效」，后者会把一次查询放大成多次
+        浏览器登录（额度/风控）；而用旧 token 取回的结果绝不能写进缓存。"""
+        p = self.plugin
+        old_token = "old-token"
+        p.store.set("token", {"token": old_token, "expire_at": time.time() + 600})
+        calls = []
+
+        def producer(client):
+            calls.append(client.token)
+            if client.token == old_token:
+                raise main_mod.AuthExpired("token 过期")
+            return {"account": client.token}
+
+        auth = SimpleNamespace(
+            fetch_token=Mock(side_effect=["new-token",
+                                          AssertionError("缓存已有新 token 时不得重复登录")]),
+            token_expire_at=time.time() + 600)
+        with patch.object(main_mod.HuaweiHealthPlugin, "auth", new_callable=PropertyMock,
+                          return_value=auth):
+            result = await asyncio.wait_for(p._cached("hr:7", producer), 5)
+            self.assertEqual(result, {"account": "new-token"})
+            self.assertEqual(calls, [old_token, "new-token"],
+                             "旧 token 上的失败结果不得被采用")
+            self.assertEqual(p.store.get("token")["token"], "new-token")
+            auth.fetch_token.assert_called_once()
+            # 旧 token 已过期、缓存里已经是新 token 时，force 重试必须复用新 token。
+            self.assertEqual(
+                await asyncio.wait_for(p._token(force=True, stale_token=old_token), 5),
+                "new-token")
+            auth.fetch_token.assert_called_once()
+
+    async def test_identical_concurrent_queries_run_producer_once(self):
+        """如果这条测试红了，说明：同一 key 的并发查询各自起了一个 producer，同一个华为
+        接口会被重复打两次（触发限流/风控），两个调用方还可能拿到不同快照。正确行为是
+        第二个调用方复用 `_cache_inflight` 里第一次的 task，producer 只跑一次。"""
+        p = self.plugin
+        started, release = threading.Event(), threading.Event()
+        calls = []
+
+        class TrackingInflight(dict):
+            """记录第二个调用方读 in-flight 表的时刻（此时第一个 producer 已启动）。"""
+
+            def __init__(self):
+                super().__init__()
+                self.second_lookup_done = threading.Event()
+
+            def get(self, key, default=None):
+                value = super().get(key, default)
+                if started.is_set():
+                    self.second_lookup_done.set()
+                return value
+
+        inflight = TrackingInflight()
+        p._cache_inflight = inflight
+
+        def producer(client):
+            calls.append(client.token)
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("共享 producer 未被放行")
+            return {"value": 60}
+
+        p._client = AsyncMock(return_value=SimpleNamespace(token="test"))
+        first = asyncio.create_task(p._cached("shared", producer))
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 3))
+            second = asyncio.create_task(p._cached("shared", producer))
+            # 等第二个调用方真正查过 in-flight 表再放行，避免它碰巧在缓存写入后才查。
+            self.assertTrue(await asyncio.to_thread(inflight.second_lookup_done.wait, 3))
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(first, second), 5)
+        finally:
+            release.set()
+        self.assertEqual(results, [{"value": 60}, {"value": 60}])
+        self.assertEqual(calls, ["test"], "相同 key 的并发查询只能打一次华为接口")
+        self.assertEqual(p.store.get("shared"), {"value": 60})
+
+    async def test_login_commit_must_invalidate_inflight_old_account_publication(self):
+        """回归用例（AUDIT_concurrency.md 发现 2）：password 模式自动登录成功后，同 epoch
+        在飞的旧账号查询不得把结果 publish 进新账号缓存。
+
+        时序：Qb 用 store 里即将过期的 B 账号 token（cookie 回退路线的产物）进入生产
+        者；token 本地过期后 Qa 走 `_token` → `_password_token` → manager.start("auto")
+        → `_finish` 的提交步骤（真实 `_commit_login_result`）换成 A 账号；Qb 随后返回，
+        必须被 publish 的代数校验拒绝。
+
+        如果这条测试红了，说明 `_commit_login_result` 又丢了 `self._data_epoch += 1`
+        （或某处放宽了 publish 的代数校验）——后果是 **A 的登录态会读到 B 的健康数据**，
+        最长 data_ttl(600s)。这条用例在缺陷存在时曾是 @unittest.expectedFailure，
+        维护者应用 1 行修复后已转正；删掉那一行会让它重新变红（见报告变异 D2）。"""
+        p = self.plugin
+
+        class FakeSession:
+            def __init__(self, token):
+                self._lock = threading.RLock()
+                self._cancel = threading.Event()
+                self._auth = self
+                self._auth_epoch = p._auth_epoch
+                self._state = "SUBMITTING"
+                self._token = token
+
+            def save_cookies(self, _cookies):
+                return True
+
+            def is_running(self):
+                return True
+
+            def snapshot(self):
+                return {"state": self._state}
+
+            def cancel(self):
+                self._cancel.set()
+
+            def commit_then_done(self):
+                if not p._commit_login_result(
+                        self, [{"name": "CASTGC", "value": "A"}],
+                        self._token, time.time() + 3000):
+                    self._state = "FAILED"
+                    return
+                self._state = "DONE"
+
+        class FakeManager:
+            """模拟 password 自动登录：start() 起线程完成 _finish 的提交步骤。"""
+
+            login_mode = "password"
+            session_timeout = 300
+
+            def __init__(self):
+                self._session = None
+
+            def start(self, *_args, **_kwargs):
+                self._session = FakeSession("token-A")
+                threading.Thread(target=self._session.commit_then_done, daemon=True).start()
+                return self._session.snapshot()
+
+            def current_session(self):
+                return self._session
+
+            def status(self):
+                return self._session.snapshot() if self._session else {"state": "IDLE"}
+
+            def cancel(self):
+                if self._session:
+                    self._session.cancel()
+
+            invalidate = cancel
+            stop = cancel
+
+        p.login_manager = FakeManager()
+        # B 账号的 token 由 password 模式的 cookie 回退分支产生，且马上过期。
+        p.store.set("token", {"token": "token-B", "expire_at": time.time() + 0.25})
+        started, release = threading.Event(), threading.Event()
+
+        def slow_producer(client):
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("Qb producer 未被放行")
+            return {"account": client.token}
+
+        qb = asyncio.create_task(p._cached("hr:7", slow_producer))
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 3))
+            expire_deadline = time.monotonic() + 3
+            while time.monotonic() < expire_deadline:
+                if (p.store.get("token") or {}).get("expire_at", 0) <= time.time():
+                    break
+                await asyncio.sleep(0.02)
+            self.assertEqual(await asyncio.wait_for(p._token(), 5), "token-A")
+        finally:
+            release.set()
+        with self.assertRaises(main_mod.StateChanged):
+            await asyncio.wait_for(qb, 5)
+        self.assertIsNone(p.store.get("hr:7"),
+                          "A 账号登录后，在飞的 B 账号查询把数据 publish 进了共享缓存")
+
+
 class TestCompleteFormatting(unittest.TestCase):
     def setUp(self):
         self.plugin = boot.make_plugin(boot.load_main())

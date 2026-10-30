@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
@@ -23,6 +23,33 @@ sys.dont_write_bytecode = True
 import boot
 
 boot.install_paths()
+
+
+class _ObservedLock:
+    """在 ``_token`` 的锁上挂一个观察点，让测试能证明第二个请求确实被互相排斥。
+
+    正确实现里第二个 ``_token()`` 会停在这个包装锁的 ``acquire`` 上；把
+    ``self._lock`` 换成每次新建 ``asyncio.Lock()`` 的变异则会绕过包装锁，
+    另起一次认证。两种情形由不同的 Event 暴露，测试据此决定何时放行。
+    """
+
+    def __init__(self, inner, second_entrant):
+        self._inner = inner
+        self._second_entrant = second_entrant
+        self._entrants = 0
+        self._guard = threading.Lock()
+
+    async def __aenter__(self):
+        with self._guard:
+            self._entrants += 1
+            if self._entrants >= 2:
+                self._second_entrant.set()
+        await self._inner.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        self._inner.release()
+        return False
 
 
 class TestAuthTransactions(unittest.IsolatedAsyncioTestCase):
@@ -85,6 +112,32 @@ class TestAuthTransactions(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(done, "the change completed before its predecessor was released")
         if entered is not None:
             self.assertFalse(entered.is_set(), "the next mutator ran before the previous change completed")
+
+    def patch_auth(self, fake, real_fetch=True):
+        """用合成 auth 替换 ``plugin.auth``，并可恢复真实的 fetch 桥。
+
+        ``setUp`` 把 ``_fetch_auth`` 换成了「禁止网络/浏览器」的 tripwire。需要
+        模拟「worker 线程里正在跑认证」的用例必须走生产代码的
+        ``to_thread(auth.fetch_token)`` 边界，所以这里把真实方法装回去。
+        """
+        if real_fetch:
+            self.plugin._fetch_auth = self.main.HuaweiHealthPlugin._fetch_auth.__get__(
+                self.plugin, type(self.plugin))
+        patcher = patch.object(self.main.HuaweiHealthPlugin, "auth",
+                               new_callable=PropertyMock)
+        auth_property = patcher.start()
+        auth_property.return_value = fake
+        self.addCleanup(patcher.stop)
+        return fake
+
+    def synthetic_auth(self, fetch_token):
+        """假 auth：只实现 ``_token`` 用到的 fetch/token_expire_at/cancel 接口。"""
+        fake = Mock()
+        fake.token_expire_at = time.time() + 600
+        fake.cancel = Mock()
+        fake.fetch_token = Mock(side_effect=fetch_token)
+        fake.clear_cookies = Mock()
+        return fake
 
     async def test_async_finalizer_blocks_queries_until_success(self):
         p = self.plugin
@@ -268,6 +321,115 @@ class TestAuthTransactions(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(self.main.StateChanged):
             await p._change_auth_state_async(finalize=later)
         later.assert_not_awaited()
+
+
+    async def test_account_switch_during_token_fetch_rejects_old_token(self):
+        """旧账号认证在飞行中时切号，旧 token 绝不能被回写进 store。
+
+        红色意味着两件事之一：``_token`` 的 commit 边界缺少 epoch 校验（旧账号
+        token 覆盖了新账号的 store），或切号被旧认证拖死/永久卡死，即审计问题
+        「旧结果回写 _token」没有被防住。
+        """
+        p = self.plugin
+        started, release = threading.Event(), self.release_event(thread=True)
+
+        def fetch_token():
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("synthetic token fetch was not released")
+            return "old-account-token"
+
+        self.patch_auth(self.synthetic_auth(fetch_token))
+
+        fetching = self.task(p._token())
+        self.assertTrue(await asyncio.to_thread(started.wait, 3),
+                        "synthetic authentication never reached fetch_token")
+        # 旧认证还卡在 worker 里时切号必须能完成，而不是被它拖死。
+        await asyncio.wait_for(p._change_auth_state(), 3)
+        self.assertFalse(p._state_error)
+        release.set()
+        with self.assertRaises(self.main.StateChanged):
+            await asyncio.wait_for(fetching, 3)
+        self.assertIsNone(
+            p.store.get("token"),
+            "the replaced account's stale token was written into the store")
+        # 状态机没有被旧认证卡死：之后一次显式切号仍然成功。
+        await asyncio.wait_for(p._change_auth_state(), 2)
+        self.assertFalse(p._state_error)
+
+    async def test_concurrent_token_requests_share_one_authentication(self):
+        """两个并发 ``_token()`` 只能触发一次 ``auth.fetch_token``。
+
+        红色意味着互斥被破坏：两个请求各起一套浏览器/OAuth 互抢同一个 profile，
+        即认证没有做单飞（single-flight）。
+        """
+        p = self.plugin
+        started = threading.Event()
+        second_entrant = threading.Event()
+        second_fetch = threading.Event()
+        release = self.release_event(thread=True)
+        calls = []
+        calls_lock = threading.Lock()
+
+        def fetch_token():
+            with calls_lock:
+                calls.append("fetch")
+                concurrent = len(calls)
+            if concurrent >= 2:
+                second_fetch.set()
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("synthetic token fetch was not released")
+            return "shared-token"
+
+        self.patch_auth(self.synthetic_auth(fetch_token))
+        p._lock = _ObservedLock(p._lock, second_entrant)
+
+        def advanced(timeout):
+            # 正确实现：第二个请求停在共享锁上；变异实现：它自己又开了一次认证。
+            return second_entrant.wait(timeout) or second_fetch.wait(timeout)
+
+        first = self.task(p._token())
+        second = self.task(p._token())
+        self.assertTrue(await asyncio.to_thread(started.wait, 3),
+                        "synthetic authentication never started")
+        self.assertTrue(
+            await asyncio.to_thread(advanced, 3),
+            "the second _token() neither queued on the shared lock nor re-authenticated")
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second), 3)
+        self.assertEqual(list(results), ["shared-token", "shared-token"])
+        self.assertEqual(
+            len(calls), 1,
+            "concurrent _token() calls started %d authentications" % len(calls))
+
+    async def test_cookie_clear_failure_keeps_queries_blocked_and_cookie_file(self):
+        """``_change_auth_state(clear_cookies=True)`` 清 cookie 失败必须 fail-closed。
+
+        红色意味着异常被吞掉/事务收尾错误：查询被放行、旧 cookie 文件被提前删除，
+        或状态错误地恢复，即审计问题「切号事务失败后半完成」没有被防住。
+        """
+        p = self.plugin
+        self.seed_old_account()
+        pathlib.Path(p.cookie_file).write_bytes(b"synthetic-old-account-cookie-file")
+
+        fake = self.synthetic_auth(Mock(side_effect=AssertionError(
+            "fetch must not run while the change is failing")))
+        fake.clear_cookies = Mock(side_effect=OSError("synthetic clear failure"))
+        self.patch_auth(fake, real_fetch=False)
+
+        with self.assertRaises(OSError):
+            await p._change_auth_state(clear_cookies=True)
+        self.assertTrue(
+            p._state_error,
+            "a failed cookie clear left the authentication state unblocked")
+        self.assertTrue(
+            os.path.exists(p.cookie_file),
+            "the old cookie file was deleted by an incomplete account switch")
+        await self.assert_query_blocked()
+        # 失败之后必须还能靠一次显式切号恢复。
+        await p._change_auth_state()
+        self.assertFalse(p._state_error)
 
 
 if __name__ == "__main__":

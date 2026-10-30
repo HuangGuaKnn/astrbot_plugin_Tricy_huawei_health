@@ -233,5 +233,130 @@ class TestRequestBudget(unittest.TestCase):
         self.client.session.get.assert_called_once()
 
 
+class TestAbandonedWorkerReleasesSlot(unittest.IsolatedAsyncioTestCase):
+    """超时被放弃的 ``_cached`` 工作线程结束后必须把连接池槽位还回来。
+
+    协程超时只能取消 ``await``，``asyncio.to_thread`` 的工作线程无法取消，
+    会继续跑完 producer 并走完 ``ClientPool.run`` 的 ``finally``。若该 finally
+    漏了 ``entry["busy"] = False`` 或漏了 ``notify_all``，唯一被占住的槽位就
+    永久泄漏（对应审计问题「异常/超时后连接是否泄漏」）。
+
+    红了的含义：被放弃的 producer 线程已经结束，但 ``_checkout`` 仍拿不到
+    槽位、直到 deadline 抛 ``RequestDeadlineExceeded`` —— 一次超时就能把池饿死，
+    后续所有查询被永久拖到超时。单点变异「删掉 finally 里的 busy=False」必须
+    让本用例变红。
+    """
+
+    def setUp(self):
+        self.plugin = boot.make_plugin(boot.load_main())
+
+        async def synthetic_token(*_args, **_kwargs):
+            return "synthetic-token"
+
+        async def forbidden_fetch(*_args, **_kwargs):
+            raise AssertionError("abandoned-worker 用例禁止真实认证/网络")
+
+        # 只替换认证入口：池和客户端仍是真实实现（客户端构造不联网）。
+        self.plugin._token = synthetic_token
+        self.plugin._fetch_auth = forbidden_fetch
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+
+    async def test_abandoned_worker_releases_pool_slot_for_later_queries(self):
+        import asyncio
+
+        p = self.plugin
+        # 压到 1 个槽位：被放弃的线程占住唯一槽位 = 泄漏必然饿死后续查询。
+        p._client_pool.max_size = 1
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def slow_producer(client):
+            started.set()
+            try:
+                if not release.wait(5):
+                    raise AssertionError("producer was not released")
+            finally:
+                finished.set()
+            return {"ok": True, "token": client.token}
+
+        call = asyncio.create_task(
+            p._cached("slow", slow_producer, deadline=time.monotonic() + 0.15))
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 5),
+                            "producer 没有进入工作线程")
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(call, 2)
+        finally:
+            release.set()
+            if not call.done():
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+        self.assertTrue(await asyncio.to_thread(finished.wait, 5),
+                        "producer 线程没有结束")
+
+        # 关键断言：槽位已归还。若 finally 漏掉 busy=False，唯一槽位被永久占住，
+        # 这里会等满 deadline 后抛 RequestDeadlineExceeded（本用例变红）。
+        reused = await asyncio.wait_for(
+            asyncio.to_thread(p._client_pool.run, "synthetic-token",
+                              lambda client: client,
+                              deadline=time.monotonic() + 2),
+            6)
+        self.assertEqual(reused.token, "synthetic-token")
+
+        # 真实 _cached 路径也必须继续可用，而不是只把池「修好」上层却仍卡住。
+        result = await asyncio.wait_for(
+            p._cached("fast", lambda client: {"ok": True},
+                      deadline=time.monotonic() + 5),
+            5)
+        self.assertEqual(result, {"ok": True})
+
+
+class TestClientPoolKeyIsolation(unittest.TestCase):
+    """同一 token 下 timezone / api_version / client_id 变化必须另建会话。
+
+    池 key 若漏掉其中任一维度，配置切换后会复用按旧时区/旧 UA 构造的
+    ``requests.Session``：时区错位会让 startDay/endDay 差一天，版本/客户端 id
+    错位可能被服务端判成过期客户端（对应审计问题「配置切换后复用旧会话」）。
+
+    红了的含义：``pool.run(..., timezone="+0900")`` / ``version="v2"`` /
+    ``client_id="other"`` 返回了 base 的那个客户端实例，说明旧语义的 HTTP
+    会话被复用；单点变异「从 key 元组里去掉 tz 或 version」会让本用例变红。
+    """
+
+    def setUp(self):
+        self.factory = patch.object(hw_client, "HuaweiHealthClient", _FakeClient)
+        self.factory.start()
+        self.addCleanup(self.factory.stop)
+
+    def test_pool_key_separates_timezone_version_and_client_id(self):
+        pool = hw_client.ClientPool(max_size=6)
+        self.addCleanup(pool.close)
+        base = pool.run("tok", lambda client: client)
+        # 完全相同的参数必须复用同一会话（否则每查一次都新建连接，池就白做了）。
+        self.assertIs(pool.run("tok", lambda client: client), base)
+
+        tz_changed = pool.run("tok", lambda client: client, timezone="+0900")
+        self.assertIsNot(tz_changed, base,
+                         "timezone 变了仍复用旧会话：startDay/endDay 会按旧时区算")
+        self.assertIs(pool.run("tok", lambda client: client, timezone="+0900"),
+                      tz_changed)
+
+        version_changed = pool.run("tok", lambda client: client, version="v2")
+        self.assertIsNot(version_changed, base,
+                         "api_version 变了仍复用旧会话：请求头 x-version 语义串台")
+        self.assertIsNot(version_changed, tz_changed)
+        self.assertIs(pool.run("tok", lambda client: client, version="v2"),
+                      version_changed)
+
+        client_changed = pool.run("tok", lambda client: client, client_id="other")
+        self.assertIsNot(client_changed, base,
+                         "client_id 变了仍复用旧会话：请求头 x-client-id 语义串台")
+        self.assertIsNot(client_changed, tz_changed)
+        self.assertIsNot(client_changed, version_changed)
+        self.assertIs(pool.run("tok", lambda client: client, client_id="other"),
+                      client_changed)
+
+
 if __name__ == "__main__":
     unittest.main()
