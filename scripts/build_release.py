@@ -55,7 +55,6 @@ RUNTIME_MODULES = (
     "hw_login.py",
     "hw_privacy.py",
     "hw_store.py",
-    "hw_secure_storage.py",
     "hw_webapi.py",
 )
 

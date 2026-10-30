@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """华为运动健康 WebUI 登录会话（v0.4.1）。
 
-默认仍使用 Cookie 模式；账号密码模式使用加密凭据启动无头路线 B，遇到
+默认仍使用 Cookie 模式；账号密码模式使用 DPAPI 凭据启动无头路线 B，遇到
 验证码时复用 WebUI 半自动流程。自动登录失败且显式开启兜底时才打开可见窗口。
 账号密码和验证码不会进入日志或状态响应。
 
@@ -26,12 +26,9 @@ import math
 import os
 import queue
 import re
-import shutil
 import subprocess
 import threading
 import time
-import uuid
-from contextlib import nullcontext
 
 try:
     from .hw_auth import (
@@ -49,7 +46,7 @@ try:
         CredentialsError,
         CredentialsCorruptError,
         CredentialsLockedError,
-        CredentialsUnavailableError,
+        DPAPIUnavailableError,
         harden_file_permissions,
     )
     from .hw_privacy import redact_error
@@ -69,7 +66,7 @@ except ImportError:
         CredentialsError,
         CredentialsCorruptError,
         CredentialsLockedError,
-        CredentialsUnavailableError,
+        DPAPIUnavailableError,
         harden_file_permissions,
     )
     from hw_privacy import redact_error
@@ -177,10 +174,7 @@ class HuaweiLoginSession:
         self._proc = None
         self._ws = None
         self._auth = None
-        self._auth_epoch = getattr(self.plugin, "_auth_epoch", 0)
-        # 一个会话一份 profile，避免换账号时自动复用上一账号的持久登录态。
-        self._profile_dir = os.path.join(
-            self.plugin.data_dir, "login_browser_" + uuid.uuid4().hex)
+        self._profile_dir = os.path.join(self.plugin.data_dir, "login_browser_profile")
 
     # ---------- 生命周期 ----------
 
@@ -212,13 +206,11 @@ class HuaweiLoginSession:
             raise LoginFlowError("launch") from exc
 
     def cancel(self):
-        # 和插件认证提交使用同一锁顺序：插件状态 → 会话状态。
-        with getattr(self.plugin, "_state_lock", nullcontext()):
-            with self._lock:
-                self._cancel.set()
-                self._wake.set()
-                if self._state not in ("DONE", "FAILED"):
-                    self._set_state("FAILED", "登录已取消", refresh=True)
+        self._cancel.set()
+        self._wake.set()
+        with self._lock:
+            if self._state not in ("DONE", "FAILED"):
+                self._set_state("FAILED", "登录已取消", refresh=True)
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -255,12 +247,6 @@ class HuaweiLoginSession:
         ``_deadline`` 永远停在「现在 + 时长」，超时判定永远差 1 秒 ——
         NEED_SMS 可以无限期挂着，session_timeout 形同虚设。
         """
-        # CDP 调用不可立即中断；晚到的响应不能复活已取消/结束的会话。
-        if self._cancel.is_set():
-            if state != "FAILED" or self._state in ("DONE", "FAILED"):
-                return False
-        if self._state in ("DONE", "FAILED") and state != self._state:
-            return False
         if state not in LOGIN_STATES:
             state = "FAILED"
         previous = self._state
@@ -274,8 +260,7 @@ class HuaweiLoginSession:
         if changed:
             # 成功路径也必须留痕：在此之前这里完全静默，登录成功后日志里看不出
             # 走过哪几步，排查只能靠文件时间戳猜。只在状态真变化时打，避免轮询刷屏。
-            self._log("info", "状态 %s → %s：%s" % (previous, state, redact_error(self._message)))
-        return True
+            self._log("info", "状态 %s → %s：%s" % (previous, state, self._message))
 
     def _fail(self, code: str = "failed"):
         messages = {
@@ -288,9 +273,9 @@ class HuaweiLoginSession:
             "unsupported": "登录模式不受支持",
             "credentials_page": "自动登录页未准备好，请稍后重试",
             "credentials_missing": "账号密码凭据不存在，请先在 WebUI 保存",
-            "credentials_unavailable": "安全凭据存储不可用，请配置外部主密钥或检查系统加密服务",
+            "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式",
             "credentials_corrupt": "凭据文件损坏或无法解密，请在 WebUI 重新保存账号密码",
-            "credentials_locked": "凭据已锁定，请检查文件权限和原主密钥后重试",
+            "credentials_locked": "凭据文件被占用或无权读取，请关闭占用程序后重试",
             "bad_credentials": "账号或密码不正确，请在 WebUI 重新保存账号密码",
             "wronghost": "页面跳转到了非华为域名，已中止自动填表",
             "fallback": "自动登录失败，可见浏览器也未能启动，请改用 Cookie 导入",
@@ -312,11 +297,7 @@ class HuaweiLoginSession:
             self._log("info", "失败码 %s 不写冷却（用户可自行修复）" % code)
             return
         try:
-            with getattr(self.plugin, "_state_lock", nullcontext()):
-                if (self._cancel.is_set() or
-                        getattr(self.plugin, "_auth_epoch", 0) != self._auth_epoch):
-                    return
-                self.manager.record_auto_failure()
+            self.manager.record_auto_failure()
         except Exception:
             # A failed config write must not hide the safe FAILED state or
             # leave the login worker with an uncaught exception.
@@ -355,7 +336,6 @@ class HuaweiLoginSession:
             self._cleanup()
 
     def _launch(self):
-        self._ensure_active()
         browser_path = find_browser((self.plugin.config.get("browser_path") or "").strip())
         if not browser_path:
             raise LoginFlowError("browser")
@@ -395,8 +375,6 @@ class HuaweiLoginSession:
             self._auth._call(self._ws, "Network.enable")
             self._auth._call(self._ws, "Page.enable")
             self._auth._call(self._ws, "Runtime.enable")
-            self._inject_saved_cookies()
-            self._ensure_active()
             self._auth._call(self._ws, "Page.navigate", {"url": TRAINING_CAMP_URL})
             if self._headless:
                 if not self._wait_login_button():
@@ -413,33 +391,6 @@ class HuaweiLoginSession:
             if isinstance(exc, LoginFlowError):
                 raise
             raise LoginFlowError("launch") from exc
-
-    def _ensure_active(self):
-        with getattr(self.plugin, "_state_lock", nullcontext()):
-            with self._lock:
-                if (self._cancel.is_set() or
-                        getattr(self.plugin, "_auth_epoch", 0) != self._auth_epoch):
-                    raise LoginFlowError("cancelled")
-
-    def _inject_saved_cookies(self):
-        """Carry trusted-device cookies only into the current account's auto login.
-
-        Credential replacement clears the cookie file in the plugin's auth
-        transaction. Manual login intentionally starts without imported cookies.
-        """
-        if self.mode != "auto":
-            return
-        with getattr(self.plugin, "_state_lock", nullcontext()):
-            self._ensure_active()
-            try:
-                cookies = self._auth.load_cookies()
-            except HuaweiAuthError:
-                # A broken/old cookie file must not prevent fresh password login.
-                cookies = []
-        if cookies:
-            self._ensure_active()
-            self._auth._call(self._ws, "Network.setCookies", {"cookies": cookies})
-            self._ensure_active()
 
     def _wait_login_button(self):
         deadline = time.monotonic() + min(40, max(1, self._auth.page_timeout))
@@ -489,7 +440,7 @@ class HuaweiLoginSession:
             raise LoginFlowError("credentials_unavailable")
         try:
             values = store.load()
-        except CredentialsUnavailableError:
+        except DPAPIUnavailableError:
             raise LoginFlowError("credentials_unavailable")
         except CredentialsLockedError:
             raise LoginFlowError("credentials_locked")
@@ -520,7 +471,7 @@ class HuaweiLoginSession:
         raise LoginFlowError("credentials_page")
 
     def _try_visible_fallback(self, code: str) -> bool:
-        if (self._cancel.is_set() or not self._auto_attempted or self._fallback_used or
+        if (not self._auto_attempted or self._fallback_used or
                 not self.manager.allow_visible_fallback or
                 code in _FALLBACK_SKIP):
             return False
@@ -615,7 +566,7 @@ class HuaweiLoginSession:
 
     def _enqueue_action(self, kind: str, payload: str) -> bool:
         with self._lock:
-            if self._cancel.is_set() or self._state in ("DONE", "FAILED") or self._pending_action:
+            if self._pending_action:
                 return False
             self._pending_action = kind
             self._actions.put((kind, payload))
@@ -623,8 +574,6 @@ class HuaweiLoginSession:
             return True
 
     def _process_action(self):
-        if self._cancel.is_set():
-            return
         try:
             kind, payload = self._actions.get_nowait()
         except queue.Empty:
@@ -819,47 +768,34 @@ class HuaweiLoginSession:
 
     def _finish(self, token: str):
         with self._lock:
-            if not self._set_state("FINALIZING", refresh=True):
-                raise LoginFlowError("cancelled")
+            self._set_state("FINALIZING", refresh=True)
         try:
             result = self._auth._call(self._ws, "Network.getAllCookies")
             cookies = result.get("result", {}).get("cookies", [])
             cookies = [normalize_cookie(c) for c in cookies if isinstance(c, dict) and c.get("name")]
             if not cookies:
                 raise LoginFlowError("cookie")
+            if not self._auth.save_cookies(cookies):
+                raise LoginFlowError("cookie")
             expire = self._auth._js(self._ws, "sessionStorage.getItem('expireTime')")
             try:
                 self._auth.token_expire_at = float(expire) / (1000 if float(expire) > 10**11 else 1)
             except (TypeError, ValueError):
                 self._auth.token_expire_at = time.time() + 3000
+            self.plugin._clear_health_cache()
             ttl = self.plugin.config.get("token_ttl", 3000)
             expire_at = compute_expire_at(self._auth.token_expire_at, ttl)
-            commit = getattr(self.plugin, "_commit_login_result", None)
-            if callable(commit):
-                if not commit(self, cookies, token, expire_at):
-                    raise LoginFlowError("cancelled")
-            else:
-                # 兼容独立集成和测试桩。生产插件在统一的认证事务中完成这些写入。
-                with getattr(self.plugin, "_state_lock", nullcontext()):
-                    with self._lock:
-                        if (self._cancel.is_set() or
-                                getattr(self.plugin, "_auth_epoch", 0) != self._auth_epoch):
-                            raise LoginFlowError("cancelled")
-                        if not self._auth.save_cookies(cookies):
-                            raise LoginFlowError("cookie")
-                        self.plugin._clear_health_cache()
-                        self.plugin.store.set("token", {
-                            "token": token,
-                            "expire_at": expire_at,
-                            "obtained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        })
+            self.plugin.store.set("token", {
+                "token": token,
+                "expire_at": expire_at,
+                "obtained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
         except LoginFlowError:
             raise
         except Exception as exc:
             raise LoginFlowError("cookie") from exc
         with self._lock:
-            if not self._set_state("DONE", refresh=True):
-                return
+            self._set_state("DONE", refresh=True)
         if self._auto_attempted:
             try:
                 # 只归还自己那一格：manual=True 的会话不记账，成功后也不该 pop 别人的。
@@ -868,12 +804,20 @@ class HuaweiLoginSession:
                 pass
 
     def _sweep_allowed(self) -> bool:
-        """Each session owns a unique profile, including after it is replaced."""
-        return True
+        """本会话是否还「有资格」按 profile 路径清扫浏览器。
+
+        ``_cleanup_orphan_browsers()`` 按命令行里的 profile 路径 taskkill，而所有
+        登录会话共用同一个 ``login_browser_profile``。所以**只有自己仍是当前会话**
+        时才允许清扫——否则「取消 → 立刻重开」时，老会话的收尾会把新会话刚起的
+        浏览器一起杀掉（v0.4.0 的原始症状，v0.4.1 第一版只在 `_cleanup()` 里修了）。
+        """
+        try:
+            return self.manager.current_session() is self
+        except Exception:
+            return False
 
     def _close_browser(self, sweep_profile: bool = None):
         auth, ws, proc = self._auth, self._ws, self._proc
-        stopped = proc is None
         if sweep_profile is None:
             sweep_profile = self._sweep_allowed()
         self._auth = None
@@ -892,7 +836,7 @@ class HuaweiLoginSession:
         finally:
             if auth is not None:
                 try:
-                    stopped = auth._stop_process(proc, sweep_profile=sweep_profile) is True
+                    auth._stop_process(proc, sweep_profile=sweep_profile)
                 except TypeError:
                     # 兼容旧签名（没有 sweep_profile 参数）
                     try:
@@ -904,16 +848,6 @@ class HuaweiLoginSession:
                         auth._cleanup_orphan_browsers()
                     except Exception:
                         pass
-            if stopped:
-                # Only this session's generated child directory is eligible for removal.
-                parent = os.path.realpath(self.plugin.data_dir)
-                profile = os.path.realpath(self._profile_dir)
-                if (os.path.dirname(profile) == parent and
-                        os.path.basename(profile).startswith("login_browser_")):
-                    try:
-                        shutil.rmtree(profile)
-                    except (FileNotFoundError, OSError):
-                        pass
 
     def _cleanup(self):
         # 取消或结束时丢弃尚未发送的验证码/信任选项，避免会话对象继续持有敏感输入。
@@ -924,7 +858,8 @@ class HuaweiLoginSession:
             pass
         with self._lock:
             self._pending_action = ""
-        # 只清理本会话独立的 profile；旧会话不会触碰新会话的浏览器。
+        # 只有当自己仍是 manager 的当前会话时才做 profile 级清扫：
+        # v0.4.0 无条件清扫，会把「取消后立刻重开」的新会话浏览器一起杀掉。
         self._close_browser(sweep_profile=self._sweep_allowed())
 
     def _log(self, level: str, msg: str):
@@ -1136,8 +1071,7 @@ class HuaweiLoginManager:
         session = self.current_session()
         if session is None:
             return False
-        return (session.is_running() and
-                session.snapshot()["state"] not in ("IDLE", "DONE", "FAILED"))
+        return session.snapshot()["state"] not in ("IDLE", "DONE", "FAILED")
 
     def status(self) -> dict:
         with self._lock:
@@ -1181,21 +1115,18 @@ class HuaweiLoginManager:
                 raise LoginFlowError("fallback_invalid")
             self.allow_visible_fallback = allow_visible_fallback
             self._save_login_config()
-        with getattr(self.plugin, "_state_lock", nullcontext()), self._lock:
+        with self._lock:
             if self._session is not None:
                 current = self._session.snapshot()
                 if current["state"] not in ("DONE", "FAILED"):
-                    if self._session.is_running():
-                        return current
-                    # Recover a stale state left by an unexpectedly terminated worker.
-                    self._session.cancel()
+                    return current
             if mode == "auto":
                 store = getattr(self.plugin, "credentials", None)
                 if store is None or not store.available:
                     raise LoginFlowError("credentials_unavailable")
                 try:
                     store.load()
-                except CredentialsUnavailableError:
+                except DPAPIUnavailableError:
                     raise LoginFlowError("credentials_unavailable")
                 except CredentialsLockedError:
                     raise LoginFlowError("credentials_locked")
@@ -1234,17 +1165,10 @@ class HuaweiLoginManager:
             session = self._session
         if session is not None:
             session.cancel()
-            # 尽力等待资源释放；超时后的旧线程仍被取消标记和独立 profile 隔离。
+            # v0.4.0 只等 2 秒，线程还在 CDP 调用里时就允许新会话启动，
+            # 于是「取消 → 立刻重开」会两个会话抢同一个 profile。
             session.join(15)
         return self.status()
-
-    def invalidate(self):
-        """Invalidate the active worker without waiting while auth state is locked."""
-        with getattr(self.plugin, "_state_lock", nullcontext()):
-            with self._lock:
-                session = self._session
-            if session is not None:
-                session.cancel()
 
     def stop(self):
         with self._lock:

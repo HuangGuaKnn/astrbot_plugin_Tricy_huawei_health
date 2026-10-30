@@ -23,7 +23,6 @@ Path layout (derived from this file, no machine-specific absolute paths)::
 """
 
 import os
-import atexit
 import pathlib
 import sys
 import tempfile
@@ -59,26 +58,6 @@ FORBIDDEN_PREFIXES = (
 
 
 _CURRENT_PLUGIN_DIR = {"dir": None}
-_TEST_KEYS = None
-
-
-def _install_test_key():
-    """Give non-Windows acceptance tests an isolated, throw-away external key.
-
-    Never read a developer's deployment key or contact their Keychain. Security
-    tests override this process-local fixture explicitly for missing-key cases.
-    """
-    global _TEST_KEYS
-    if _TEST_KEYS is not None or os.name == "nt":
-        return
-    _TEST_KEYS = tempfile.TemporaryDirectory(prefix="hw_health_test_keys_")
-    atexit.register(_TEST_KEYS.cleanup)
-    key_file = pathlib.Path(_TEST_KEYS.name) / "example-master.key"
-    fd = os.open(str(key_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(os.urandom(32))
-    os.environ["HUAWEI_HEALTH_MASTER_KEY_FILE"] = str(key_file)
-    os.environ.pop("HUAWEI_HEALTH_KEYCHAIN", None)
 
 
 def install_paths(plugin_dir=None):
@@ -90,12 +69,11 @@ def install_paths(plugin_dir=None):
     只有切换到另一份插件目录时才清 ``sys.modules``，否则 ``make_plugin`` 之类的
     后续调用会把已经导入好的模块扔掉、再重新导入一份。
     """
-    _install_test_key()
     pdir = str(plugin_dir) if plugin_dir else (_CURRENT_PLUGIN_DIR["dir"] or _DEFAULT_PLUGIN_DIR)
     if _CURRENT_PLUGIN_DIR["dir"] != pdir:
         # 清掉旧的插件模块，避免两份代码互相污染
         for mod in ("main", "hw_auth", "hw_client", "hw_store", "hw_login",
-                    "hw_credentials", "hw_secure_storage", "hw_webapi"):
+                    "hw_credentials", "hw_webapi"):
             sys.modules.pop(mod, None)
         _CURRENT_PLUGIN_DIR["dir"] = pdir
     # STUBS 放最前（压过任何真实 astrbot），然后是目标插件目录

@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Protected credentials: Windows DPAPI or AES-GCM with an external key.
+"""Protected Huawei Health login credentials.
 
-Legacy DPAPI files remain readable. New non-Windows writes require a usable
-external key; neither missing keys nor encryption failures permit plaintext.
+The file written by :class:`HuaweiCredentialsStore` contains only a small
+header and a Windows DPAPI ciphertext.  DPAPI is deliberately the only
+backend in this module: silently falling back to plaintext (or to a key kept
+next to the plugin) would turn an optional feature into a credential leak.
+Callers should treat :class:`DPAPIUnavailableError` as "password login is
+disabled" and continue offering cookie/manual login.
 """
 
 from __future__ import annotations
@@ -20,20 +24,11 @@ from typing import Any, Dict
 
 try:  # 插件作为包加载
     from .hw_privacy import redact_error
-    from .hw_secure_storage import (
-        AES_MAGIC, AesSecretStorage, StorageUnavailableError,
-        StorageLockedError, StorageCorruptError,
-    )
 except ImportError:  # 插件目录在 sys.path 里
     from hw_privacy import redact_error
-    from hw_secure_storage import (
-        AES_MAGIC, AesSecretStorage, StorageUnavailableError,
-        StorageLockedError, StorageCorruptError,
-    )
 
 
 MAGIC = b"HWCRED1\0"
-PERSISTENT_MAGIC = b"HWDATA1\0"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
@@ -41,11 +36,7 @@ class CredentialsError(RuntimeError):
     """Base class for credential storage errors."""
 
 
-class CredentialsUnavailableError(CredentialsError):
-    """No usable encryption backend or external master key is configured."""
-
-
-class DPAPIUnavailableError(CredentialsUnavailableError):
+class DPAPIUnavailableError(CredentialsError):
     """Raised when Windows DPAPI cannot be used on this host."""
 
 
@@ -186,57 +177,6 @@ def _unprotect(data: bytes) -> bytes:
         del keepalive
 
 
-def _aes_operation(data: bytes, purpose: str, data_dir: str, *, decrypt=False) -> bytes:
-    storage = AesSecretStorage(data_dir)
-    try:
-        return storage.decrypt(data, purpose) if decrypt else storage.encrypt(data, purpose)
-    except StorageUnavailableError as exc:
-        raise CredentialsUnavailableError(str(exc)) from exc
-    except StorageLockedError as exc:
-        raise CredentialsLockedError(str(exc)) from exc
-    except StorageCorruptError as exc:
-        raise CredentialsCorruptError(str(exc)) from exc
-
-
-def persistent_storage_status(data_dir: str) -> Dict[str, Any]:
-    """Safe write-capability metadata, never key material or key paths."""
-    if sys.platform != "win32":
-        return AesSecretStorage(data_dir).status()
-    try:
-        _require_dpapi()
-        error = ""
-    except DPAPIUnavailableError:
-        error = "Windows DPAPI 不可用，请检查当前 Windows 用户环境"
-    return {"available": not error, "method": "dpapi", "key_source": "windows-user", "error": error}
-
-
-def protect_persistent_secret(data: bytes, purpose: str, data_dir: str) -> bytes:
-    """Protect a cache secret with a purpose-bound, versioned envelope."""
-    if sys.platform == "win32":
-        prefix = ("astrbot.huawei_health:v1:" + purpose + "\0").encode("utf-8")
-        return PERSISTENT_MAGIC + _protect(prefix + data)
-    return _aes_operation(data, purpose, data_dir)
-
-
-def unprotect_persistent_secret(blob: bytes, purpose: str, data_dir: str) -> bytes:
-    # Detect the stored format before choosing any backend: OS changes must not
-    # cause a DPAPI blob to be mistaken for AES-GCM or plaintext.
-    if blob.startswith(AES_MAGIC):
-        return _aes_operation(blob, purpose, data_dir, decrypt=True)
-    if not blob.startswith(PERSISTENT_MAGIC) or len(blob) <= len(PERSISTENT_MAGIC):
-        raise CredentialsCorruptError("受保护数据格式无效")
-    try:
-        plain = _unprotect(blob[len(PERSISTENT_MAGIC):])
-    except CredentialsUnavailableError:
-        raise
-    except CredentialsError as exc:
-        raise CredentialsLockedError("无法解密缓存，请检查原 Windows 用户环境") from exc
-    prefix = ("astrbot.huawei_health:v1:" + purpose + "\0").encode("utf-8")
-    if not plain.startswith(prefix):
-        raise CredentialsCorruptError("受保护数据用途不匹配")
-    return plain[len(prefix):]
-
-
 def mask_account(account: str) -> str:
     """Return a display mask that never reveals the whole secret.
 
@@ -267,7 +207,7 @@ def mask_account(account: str) -> str:
 
 
 class HuaweiCredentialsStore:
-    """Read/write encrypted ``credentials.bin`` for one plugin instance."""
+    """Read/write DPAPI-protected ``credentials.bin`` for one plugin instance."""
 
     def __init__(self, data_dir: str):
         self.data_dir = os.path.abspath(os.fspath(data_dir))
@@ -276,7 +216,11 @@ class HuaweiCredentialsStore:
 
     @property
     def available(self) -> bool:
-        return bool(persistent_storage_status(self.data_dir)["available"])
+        try:
+            _require_dpapi()
+            return True
+        except DPAPIUnavailableError:
+            return False
 
     def save(self, account: str, password: str) -> Dict[str, Any]:
         account = str(account or "").strip()
@@ -288,16 +232,11 @@ class HuaweiCredentialsStore:
         # JSON is created in memory and is immediately encrypted; it is never
         # written to a temporary plaintext file.
         with self._lock:
-            # A typo/replaced master key must never destroy the last readable
-            # copy. Explicit clear is required to discard an unrecoverable file.
-            if os.path.exists(self.path):
-                self.load()
             payload = json.dumps(
                 {"account": account, "password": password, "updated_at": int(time.time())},
                 ensure_ascii=False, separators=(",", ":"),
             ).encode("utf-8")
-            ciphertext = (MAGIC + _protect(payload) if sys.platform == "win32"
-                          else _aes_operation(payload, "credentials", self.data_dir))
+            ciphertext = MAGIC + _protect(payload)
             os.makedirs(self.data_dir, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".credentials.", suffix=".tmp", dir=self.data_dir)
             try:
@@ -320,22 +259,16 @@ class HuaweiCredentialsStore:
                 raise CredentialsError("credentials are not set")
             try:
                 with open(self.path, "rb") as stream:
-                    raw = stream.read(1024 * 1024 + 1)
+                    raw = stream.read()
             except OSError as exc:
                 # Locked / permission denied is NOT "never saved" — callers must
                 # be able to tell the user to close whatever holds the file.
                 raise CredentialsLockedError("cannot read credentials") from exc
-        if len(raw) > 1024 * 1024:
+        if not raw.startswith(MAGIC) or len(raw) <= len(MAGIC):
             raise CredentialsCorruptError("credentials file is invalid")
         try:
-            if raw.startswith(AES_MAGIC):
-                payload = _aes_operation(raw, "credentials", self.data_dir, decrypt=True)
-            elif raw.startswith(MAGIC) and len(raw) > len(MAGIC):
-                payload = _unprotect(raw[len(MAGIC):])
-            else:
-                raise CredentialsCorruptError("credentials file is invalid")
-            value = json.loads(payload.decode("utf-8"))
-        except (CredentialsUnavailableError, CredentialsLockedError, CredentialsCorruptError):
+            value = json.loads(_unprotect(raw[len(MAGIC):]).decode("utf-8"))
+        except DPAPIUnavailableError:
             raise
         except Exception as exc:
             raise CredentialsCorruptError("credentials cannot be decrypted") from exc
@@ -370,36 +303,24 @@ class HuaweiCredentialsStore:
             "updated_at": None,
             "state": "absent",
             "error": "",
-            "storage": persistent_storage_status(self.data_dir),
         }
         if not os.path.isfile(self.path):
             return result
         try:
-            with self._lock, open(self.path, "rb") as stream:
-                header = stream.read(len(AES_MAGIC))
-                if header == AES_MAGIC:
-                    result["storage"] = AesSecretStorage(self.data_dir).status()
-                elif header == MAGIC and sys.platform != "win32":
-                    result["storage"] = {
-                        "available": False, "method": "dpapi", "key_source": "windows-user",
-                        "error": "现有凭据使用 Windows DPAPI，需原 Windows 用户和机器解密；确认放弃时先清除再保存",
-                    }
-        except OSError:
-            # load() below returns the existing, precise locked/error state.
-            pass
-        try:
             value = self.load()
-        except CredentialsUnavailableError as exc:
+        except DPAPIUnavailableError:
+            # Keep status safe and useful on non-Windows hosts; callers can
+            # inspect ``available`` without receiving any ciphertext.
             result["state"] = "unavailable"
-            result["error"] = redact_error(exc)
+            result["error"] = "当前系统不支持 Windows DPAPI"
             return result
         except CredentialsLockedError:
             result["state"] = "locked"
-            result["error"] = "凭据已锁定，请检查文件权限、原主密钥及数据完整性；不要直接覆盖"
+            result["error"] = "凭据文件被占用或无权读取"
             return result
         except CredentialsCorruptError:
             result["state"] = "corrupt"
-            result["error"] = "凭据文件损坏或无法解密；确认无法恢复后先清除再保存"
+            result["error"] = "凭据文件损坏或无法解密，请重新保存"
             return result
         except CredentialsError:
             result["state"] = "corrupt"
@@ -421,8 +342,7 @@ CredentialsStore = HuaweiCredentialsStore
 
 
 __all__ = [
-    "CredentialsError", "CredentialsCorruptError", "CredentialsLockedError", "CredentialsUnavailableError",
+    "CredentialsError", "CredentialsCorruptError", "CredentialsLockedError",
     "DPAPIUnavailableError", "HuaweiCredentialsStore", "CredentialsStore",
     "mask_account", "harden_file_permissions", "harden_dir_permissions",
-    "protect_persistent_secret", "unprotect_persistent_secret", "persistent_storage_status",
 ]

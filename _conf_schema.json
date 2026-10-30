@@ -1,43 +1,43 @@
 {
     "cookie_json": {
         "description": "Cookie JSON（Cookie-Editor 从华为运动健康网页端导出，整段粘贴）",
-        "hint": "插件控制台仅作安全导入：本次 JSON 须包含 CASTGC 和 sid，成功后清空旧配置；留空不变。直接编辑 AstrBot 原始配置仍会留下明文。非 Windows 须先按 README 配置主密钥，主密钥不要填在这里",
+        "hint": "兼容旧配置：整段粘贴 Cookie-Editor JSON。新配置建议填写下面六条分项值；留空则读取插件数据目录下的 hw_cookies.json",
         "type": "text",
         "default": ""
     },
     "cookie_CASTGC": {
         "description": "CASTGC（分项 cookie 值）",
-        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .id1.cloud.huawei.com 复制，插件会自动补齐两个路径",
+        "hint": "从 .id1.cloud.huawei.com 的 /CAS 或 /UnifiedIDMPortal cookie 中复制，只填值；插件会自动生成两个路径",
         "type": "string",
         "default": ""
     },
     "cookie_sid": {
         "description": "sid（分项 cookie 值）",
-        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .id1.cloud.huawei.com 域复制，只填值",
+        "hint": "从 .id1.cloud.huawei.com 域复制，只填值",
         "type": "string",
         "default": ""
     },
     "cookie_hwid_cas_sid": {
         "description": "hwid_cas_sid（分项 cookie 值）",
-        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .id1.cloud.huawei.com 域复制，只填值",
+        "hint": "从 .id1.cloud.huawei.com 域复制，只填值",
         "type": "string",
         "default": ""
     },
     "cookie_HuaweiID_CAS_ISCASLOGIN": {
         "description": "HuaweiID_CAS_ISCASLOGIN（分项 cookie 值）",
-        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .huawei.com 域复制，通常为 true",
+        "hint": "从 .huawei.com 域复制，通常为 true",
         "type": "string",
         "default": ""
     },
     "cookie_CASLOGINSITE": {
         "description": "CASLOGINSITE（分项 cookie 值）",
-        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .huawei.com 域复制，只填值",
+        "hint": "从 .huawei.com 域复制，只填值",
         "type": "string",
         "default": ""
     },
     "cookie_LOGINACCSITE": {
         "description": "LOGINACCSITE（分项 cookie 值）",
-        "hint": "控制台须本次一起填写 CASTGC 和 sid；成功后加密保存并清空旧配置，留空不变。直接编辑 AstrBot 原始配置仍会留下明文。从 .huawei.com 域复制，只填值",
+        "hint": "从 .huawei.com 域复制，只填值",
         "type": "string",
         "default": ""
     },
@@ -67,7 +67,7 @@
     },
     "data_ttl": {
         "description": "健康数据缓存秒数",
-        "hint": "同一份数据在此时间内不重复请求华为，默认 600 秒；0 表示既不读取也不写入数据缓存",
+        "hint": "同一份数据在此时间内不重复请求华为，默认 600 秒",
         "type": "int",
         "default": 600
     },
@@ -85,7 +85,7 @@
     },
     "timezone": {
         "description": "取数用的时区偏移",
-        "hint": "查询日期与睡眠、运动时间统一使用此时区。默认 +0800；也支持 +08:00、UTC 等写法",
+        "hint": "华为接口的 startDay/endDay 口径。默认 +0800；不在东八区时改成 +0900 / -0500 这类写法",
         "type": "string",
         "default": "+0800"
     },

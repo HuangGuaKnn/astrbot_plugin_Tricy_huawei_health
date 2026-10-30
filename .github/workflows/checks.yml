@@ -37,7 +37,7 @@ jobs:
       - name: 安装依赖
         run: python -m pip install -r requirements.txt pytest
 
-      - name: 跑离线回归测试
+      - name: 跑 178 个验收测试
         run: python -m pytest tests -q
 
       - name: 编译检查
@@ -59,6 +59,8 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  # 拉真实 AstrBot 源码安装，验证插件依赖的 API 契约没有漂移。
+  # 两条通道：最低支持版本（来自 metadata.yaml 的 astrbot_version 下限）+ 最新稳定 v4.x。
   windows-dpapi:
     name: 单元测试（Windows / DPAPI 专属）
     runs-on: windows-latest
@@ -77,22 +79,6 @@ jobs:
       - name: 跑全部测试（含 DPAPI 专属用例）
         run: python -m pytest tests -q
 
-  macos-storage:
-    name: 单元测试（macOS / AES 与 Keychain 接口）
-    runs-on: macos-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: 安装依赖
-        run: python -m pip install -r requirements.txt pytest
-      - name: 离线回归（临时主密钥，Keychain 使用模拟）
-        run: python -m pytest tests -q
-
-  # 拉真实 AstrBot 源码验证最低支持版本与最新稳定 v4.x 的接口。
   astrbot-runner-contract:
     name: AstrBot 契约测试（${{ matrix.channel }}）
     runs-on: ubuntu-latest
