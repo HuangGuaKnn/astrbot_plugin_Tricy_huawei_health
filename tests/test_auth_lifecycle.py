@@ -544,6 +544,36 @@ class DailyQuotaWindowTests(unittest.TestCase):
         self.manager._prune_attempts()
         self.assertEqual(self.manager._attempts, [now - 10])
 
+    def test_loading_prunes_and_writes_back(self):
+        """过期条目要在启动时清掉并写回磁盘。
+
+        否则采样脚本（读磁盘）会一直报「额度 3/3」，而运行时其实是 0/3，
+        15:00 的巡检就会误报一次。
+        """
+        start = self.manager._day_window()[0]
+        stale = start - 3600  # 昨天 23:00，一定早于今日 0 点
+        path = self.manager.login_config_path
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"mode": "password", "daily_limit": 3,
+                       "attempts": [stale, stale + 60]}, f)
+        manager = hw_login.HuaweiLoginManager(self.plugin)
+        self.assertEqual(manager._attempts, [])
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["attempts"], [],
+                             "启动时裁剪后必须写回，否则磁盘上永远显示额度已满")
+
+    def test_loading_with_illegal_fields_does_not_rewrite(self):
+        """配置里有非法字段时不写回，免得把默认值当成用户意图固化掉。"""
+        start = self.manager._day_window()[0]
+        path = self.manager.login_config_path
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"daily_limit": "abc", "attempts": [start - 60]}, f)
+        with open(path, encoding="utf-8") as f:
+            before = f.read()
+        hw_login.HuaweiLoginManager(self.plugin)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

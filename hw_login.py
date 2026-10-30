@@ -1087,7 +1087,13 @@ class HuaweiLoginManager:
         if problems:
             self._log_warning("login_config.json 有非法字段，已按默认值处理：%s"
                               % redact_error("；".join(problems)))
+        before = len(self._attempts)
         self._prune_attempts()
+        # v0.5.2：裁剪只发生在内存里，磁盘上会一直留着过期条目。采样脚本、人工
+        # 打开 login_config.json 都会看到假的「额度已满」——和运行时不一致。
+        # 只在「配置本身没问题、确实裁掉了条目」时写回一次，非法值不借机固化。
+        if not problems and isinstance(attempts, list) and len(self._attempts) != before:
+            self._save_login_config()
 
     def set_daily_limit(self, value) -> int:
         """设置「每日自动登录失败次数上限」，值真的变化时落盘。
