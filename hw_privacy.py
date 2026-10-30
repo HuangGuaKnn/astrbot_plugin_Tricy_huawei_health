@@ -102,7 +102,10 @@ _AUTH_SCHEME_RE = re.compile(
 
 #: 规则 3：``token=xxx`` / ``"password": "xxx"`` / ``CASTGC=TGT-...``。
 _KV_RE = re.compile(
-    r"(?i)(?<![\w-])(?P<key>"
+    # 允许 ``cookie_`` 这类前缀：配置里的键名就是 cookie_CASTGC / cookie_sid，
+    # 而 (?<![\w-]) 会被下划线挡住，导致整条规则对这些键完全失效。
+    # 前缀只吃 [A-Za-z0-9]+_，不会把 ``my-token_xxx`` 之外的噪声卷进来。
+    r"(?i)(?<![\w-])(?P<prefix>(?:[A-Za-z0-9]+_)*)(?P<key>"
     + "|".join(re.escape(key) for key in sorted(_SENSITIVE_KEYS, key=len, reverse=True))
     + r")(?![\w-])[ \t]*[\"']?[ \t]*(?:=|:)[ \t]*"
     # 已经是 ``***`` 的别再洗一次：否则规则 1 输出的 ``Authorization: ***``
@@ -185,7 +188,10 @@ def redact_error(error) -> str:
     # 规则 2：Bearer / Basic。
     message = _AUTH_SCHEME_RE.sub(AUTH_MASK, message)
     # 规则 3：敏感键值对。
-    message = _KV_RE.sub(lambda m: "%s=%s" % (m.group("key"), VALUE_MASK), message)
+    message = _KV_RE.sub(
+        lambda m: "%s%s=%s" % (m.group("prefix") or "", m.group("key"), VALUE_MASK),
+        message,
+    )
     # 规则 4：已知 token 格式（含 PEM 私钥块）。
     message = _TOKEN_RE.sub(TOKEN_MASK, message)
     message = _PEM_RE.sub(TOKEN_MASK, message)

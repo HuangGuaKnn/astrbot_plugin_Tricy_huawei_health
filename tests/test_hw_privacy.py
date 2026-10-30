@@ -108,6 +108,31 @@ class TestRule3SensitiveKeyValues(unittest.TestCase):
         self.assertIn("CASTGC=***", out)
         self.assertIn("sid=***", out)
 
+    def test_prefixed_config_keys_are_redacted(self):
+        """配置里的真实键名带 ``cookie_`` 前缀，脱敏不能因为前缀而失效。
+
+        背景（2026-10-30）：规则 3 原本用 ``(?<![\\w-])`` 做左边界，而
+        ``cookie_CASTGC`` 里 ``CASTGC`` 前面是下划线（属于 \\w），导致这些键
+        **完全不脱敏**——错误消息一旦带上配置键值，cookie 就明文进日志。
+        """
+        cases = {
+            "cookie_CASTGC=TGT-1234567890-abcdef": "TGT-1234567890",
+            "cookie_sid=example-sid-value": "example-sid-value",
+            "cookie_hwid_cas_sid=deadbeef1234": "deadbeef1234",
+        }
+        for raw, secret in cases.items():
+            with self.subTest(raw=raw):
+                out = redact_error("配置校验失败：" + raw)
+                self.assertNotIn(secret, out, raw)
+                self.assertIn("***", out, raw)
+                # 键名要保留，否则排查时看不出是哪个配置项
+                self.assertIn(raw.split("=")[0], out, "键名不应被吃掉")
+
+    def test_prefixed_keys_in_json_form(self):
+        out = redact_error('{"cookie_CASTGC": "TGT-9999-zzzz"}')
+        self.assertNotIn("TGT-9999", out)
+        self.assertIn("cookie_CASTGC", out)
+
 
 class TestRule4KnownTokenFormats(unittest.TestCase):
     """规则 4：已知 token 格式 → ``***``。"""
