@@ -312,7 +312,29 @@ def _looks_like_credential(value: bytes) -> bool:
     return not any(byte in b" \t" for byte in value)
 
 
+#: 插件自身的配置键名。前端会把这些键当字符串字面量写（例如
+#: ``const COOKIE_JSON_PATH = "cookie_json";``），而 ``_SENSITIVE_ASSIGNMENT_PATTERN``
+#: 里有一条 ``[a-z0-9_-]*cookie[a-z0-9_-]*`` 且带 ``(?i)``，会把
+#: ``COOKIE_JSON_PATH = "x"`` 整个匹配上，右侧的键名字符串就被当成了凭据值——
+#: 每次新增 cookie 字段都会误报一次。新增 cookie 配置项时请同步这里。
+_CONFIG_KEY_LITERALS = frozenset(
+    name.encode("utf-8")
+    for name in (
+        "cookie_json",
+        "cookie_CASTGC",
+        "cookie_sid",
+        "cookie_hwid_cas_sid",
+        "cookie_HuaweiID_CAS_ISCASLOGIN",
+        "cookie_CASLOGINSITE",
+        "cookie_LOGINACCSITE",
+    )
+)
+
+
 def _is_secret_value(value: bytes) -> bool:
+    # 值本身就是配置键名 -> 不含任何凭据，别当泄露。
+    if value.strip() in _CONFIG_KEY_LITERALS:
+        return False
     return _looks_like_credential(value) and not _is_placeholder(value)
 
 
