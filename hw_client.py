@@ -297,21 +297,41 @@ def _parse_stats(raw) -> dict:
     return {"overall": overall, "daily": [{"day": d, **v} for d, v in sorted(daily.items())]}
 
 
+#: 时区写法统一到「±HHMM」。小时允许 1~2 位、分钟可省略或带冒号。
+#: 设置页是自由文本输入，用户写成 +8:00 / +8 都很常见；与其让取数在运行时
+#: 崩掉，不如在入口处宽进（接受常见写法）窄出（偏移范围仍必须有效）。
+_TIMEZONE_RE = re.compile(r"([+-])(\d{1,2})(?::?(\d{2}))?")
+
+
 def parse_timezone(value="+0800"):
-    """把配置中的 +0800 / +08:00 转为时区，避免依赖服务器本地时区。"""
+    """把 +0800 / +08:00 / +8:00 / +8 / UTC / Z 转为时区。
+
+    避免依赖服务器本地时区；偏移范围非法时抛 ``ValueError``。
+    """
     if isinstance(value, datetime.tzinfo):
         return value
-    text = str(value or "+0800").strip()
+    # 注意 ``"   "`` 是 truthy，单靠 ``or`` 兜不住纯空白；先 strip 再兜默认值。
+    text = str(value or "").strip() or "+0800"
     if text.upper() in ("UTC", "Z"):
         return datetime.timezone.utc
-    match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", text)
+    match = _TIMEZONE_RE.fullmatch(text)
     if not match:
-        raise ValueError("时区格式应为 +0800 或 +08:00")
-    hours, minutes = int(match[2]), int(match[3])
+        raise ValueError("时区格式应为 +0800、+08:00，或 UTC")
+    hours = int(match[2])
+    minutes = int(match[3] or 0)
     if hours > 23 or minutes > 59:
         raise ValueError("时区偏移超出有效范围")
     offset = datetime.timedelta(hours=hours, minutes=minutes)
     return datetime.timezone(offset if match[1] == "+" else -offset)
+
+
+def format_timezone(value="+0800") -> str:
+    """把任意受支持的写法归一化成 ``±HHMM``，用于写回配置。"""
+    tz = parse_timezone(value)
+    total = int(tz.utcoffset(None).total_seconds() // 60)
+    sign = "+" if total >= 0 else "-"
+    total = abs(total)
+    return "%s%02d%02d" % (sign, total // 60, total % 60)
 
 
 def _day_window(days: int, timezone="+0800"):

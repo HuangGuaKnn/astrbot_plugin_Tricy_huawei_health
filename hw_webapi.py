@@ -18,10 +18,12 @@ try:
     from .hw_login import LoginFlowError
     from .hw_credentials import CredentialsError, CredentialsUnavailableError, CredentialsLockedError
     from .hw_privacy import redact_error
+    from .hw_client import format_timezone
 except ImportError:
     from hw_login import LoginFlowError
     from hw_credentials import CredentialsError, CredentialsUnavailableError, CredentialsLockedError
     from hw_privacy import redact_error
+    from hw_client import format_timezone
 
 PAGE_PREFIX = "astrbot_plugin_Tricy_huawei_health/page"
 
@@ -752,6 +754,13 @@ class HuaweiHealthWebApi:
         if leaf_type in ("string", "text"):
             if not isinstance(value, str):
                 raise ConfigValueError(path, "%s 必须是字符串" % name)
+            if name == "timezone":
+                # 时区是自由文本输入，非法值会让每次取数都在 parse_timezone 抛 ValueError。
+                # 在入口处归一化成 ±HHMM 并校验，比运行时崩掉友好得多。
+                try:
+                    return format_timezone(value), False
+                except ValueError as exc:
+                    raise ConfigValueError(path, "时区格式不合法：%s" % exc) from None
             return value, False
 
         if leaf_type == "list":
