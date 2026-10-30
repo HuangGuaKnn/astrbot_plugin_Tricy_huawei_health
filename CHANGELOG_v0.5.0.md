@@ -1,6 +1,6 @@
 # v0.5.0 系列变更
 
-> 当前版本：**v0.5.0**（Pre-release · 观察期内）
+> 当前版本：**v0.5.1**（Pre-release · 观察期内）
 > 基线：v0.4.2（v0.4.1 的逐条修复对照见 `CHANGELOG_v0.4.1.md`）
 >
 > **这是一个 Pre-release。** 完整观察期尚未走完就发，是因为 v0.5.0 修掉了一项
@@ -11,6 +11,32 @@
 >
 > 功能层面已在真机验证：自动登录、手动登录（含验证码）、token 过期重认证、
 > 切账号、取消登录、WebUI 全流程、发布包解压后跑全量测试。
+
+---
+
+## v0.5.1（相对 v0.5.0）
+
+### 安装包内容清理
+
+v0.5.0 的市场安装包其实是**整份仓库源码树**（70 条目 / 466 KB）。原因：应用市场
+不读 GitHub Release 里的附件，而是直接拉 `archive/<sha>.zip` 构建——实测市场包与
+zipball 逐字节相同。
+
+仓库里没有 `.gitattributes`，于是内部工程文档和开发资产全被打进了用户安装包：
+
+- `AUDIT_concurrency.md` —— 内部并发审计报告，含**未修复缺陷的描述**
+- `DELIVERY_ENGINEERING.md` / `DELIVERY_WEBUI.md` —— 内部交付记录
+- `tests/` —— 24 个测试文件
+- `scripts/` —— 5 个内部工具与 CI 脚本
+- `.github/` —— ISSUE 模板与 CI 配置
+
+现在加了 `.gitattributes` 并标记 `export-ignore`，安装包收缩到 **20 条目 / 约 250 KB**，
+只剩运行必需的文件：源码、页面、schema、metadata、requirements、LICENSE、README、
+CHANGELOG、logo。
+
+这些文件仍在仓库里，GitHub 上随时可查，只是不再进入分发包。
+
+> 为什么必须发新版本号：市场的包按版本号冻在 S3，同一版本号不可重复提交。
 
 ---
 
