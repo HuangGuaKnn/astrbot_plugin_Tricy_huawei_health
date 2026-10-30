@@ -383,5 +383,61 @@ class CookieAuthenticationTests(unittest.TestCase):
                     self.assertEqual(self.cookie_file.read_bytes(), previous_bytes)
 
 
+class DailyLimitSyncTests(unittest.TestCase):
+    """``daily_limit`` 必须在内存与 ``login_config.json`` 两边一致。
+
+    背景（2026-10-31）：``main.py`` 曾在 ``__init__`` 里直接
+    ``manager.daily_limit = x``，只改内存；``login_config.json`` 里的旧值会在
+    下次启动被 ``_load_login_config`` 读回来，于是出现「配置页显示 3、磁盘写着
+    10」的两边不一致。统一走 ``set_daily_limit`` 才能保证写穿。
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.plugin = types.SimpleNamespace(
+            data_dir=self.temp.name, config={},
+            logger=Mock(), _state_lock=threading.RLock(), _auth_epoch=1)
+        self.manager = hw_login.HuaweiLoginManager(self.plugin)
+
+    def _on_disk(self):
+        with open(self.manager.login_config_path, encoding="utf-8") as handle:
+            return json.load(handle)["daily_limit"]
+
+    def test_value_change_is_written_through(self):
+        self.manager.set_daily_limit(7)
+        self.assertEqual(self.manager.daily_limit, 7)
+        self.assertEqual(self._on_disk(), 7, "改了内存却没写盘，下次启动会被旧值盖掉")
+
+    def test_unchanged_value_does_not_rewrite_file(self):
+        self.manager.set_daily_limit(4)
+        before = os.stat(self.manager.login_config_path).st_mtime_ns
+        self.manager.set_daily_limit(4)
+        after = os.stat(self.manager.login_config_path).st_mtime_ns
+        self.assertEqual(before, after, "值没变就不该重写整份配置")
+
+    def test_out_of_range_is_clamped_before_writing(self):
+        for raw, expect in ((0, 1), (-5, 1), (99, 10)):
+            with self.subTest(raw=raw):
+                self.manager.set_daily_limit(raw)
+                self.assertEqual(self.manager.daily_limit, expect)
+                self.assertEqual(self._on_disk(), expect)
+
+    def test_garbage_value_keeps_current_and_does_not_raise(self):
+        self.manager.set_daily_limit(5)
+        for bad in ("abc", None, [], {}):
+            with self.subTest(bad=bad):
+                self.manager.set_daily_limit(bad)
+                self.assertEqual(self.manager.daily_limit, 5)
+
+    def test_reload_picks_up_the_written_value(self):
+        """写穿之后，新建一个 manager 读同一目录必须拿到新值。"""
+        self.manager.set_daily_limit(6)
+        plugin2 = types.SimpleNamespace(
+            data_dir=self.temp.name, config={},
+            logger=Mock(), _state_lock=threading.RLock(), _auth_epoch=1)
+        self.assertEqual(hw_login.HuaweiLoginManager(plugin2).daily_limit, 6)
+
+
 if __name__ == "__main__":
     unittest.main()

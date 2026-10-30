@@ -982,8 +982,10 @@ class HuaweiHealthWebApi:
         if "login_daily_limit" in changed:
             try:
                 limit = int(merged.get("login_daily_limit"))
-                # 保留原有钳制语义（1~10）。
-                p.login_manager.daily_limit = max(1, min(10, limit))
+                # 走 set_daily_limit：内部保留 1~10 的钳制，同时把新值写回
+                # login_config.json。只改内存的话，下次启动会被磁盘上的旧值盖掉，
+                # 配置页和实际生效值就会出现「3 / 10」这种不一致。
+                p.login_manager.set_daily_limit(limit)
             except Exception as exc:
                 p.logger.warning(
                     "[华为健康] 重设每日登录额度失败：%s" % redact_error(exc))

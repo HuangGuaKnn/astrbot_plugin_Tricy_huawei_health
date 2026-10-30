@@ -147,10 +147,12 @@ class HuaweiHealthPlugin(Star):
         self._warmup_task = None
         self.login_manager = HuaweiLoginManager(self)
         # 允许用插件配置覆盖登录额度（默认 3 次/天，语义是「失败次数」）。
+        # 走 set_daily_limit 而不是直接赋值：它会同步 login_config.json，
+        # 否则配置页和磁盘会出现「3 / 10」这种不一致。
         limit = config.get("login_daily_limit")
         if limit is not None:
             try:
-                self.login_manager.daily_limit = max(1, min(10, int(limit)))
+                self.login_manager.set_daily_limit(limit)
             except (TypeError, ValueError):
                 pass
         # 权限白名单在 initialize() 里构建（含格式校验）；None 表示「尚未构建」。

@@ -1086,6 +1086,28 @@ class HuaweiLoginManager:
                               % redact_error("；".join(problems)))
         self._prune_attempts()
 
+    def set_daily_limit(self, value) -> int:
+        """设置「每日自动登录失败次数上限」，值真的变化时落盘。
+
+        背景：``HuaweiLoginManager.__init__`` 会先用 ``login_config.json`` 里的值
+        初始化 ``daily_limit``，随后 ``main.py`` 再按插件配置覆盖一次——但那次覆盖
+        只改内存。于是磁盘上的旧值会在下次启动被 ``_load_login_config`` 读回来，
+        出现「配置页显示 3、``login_config.json`` 写着 10」这种两边不一致。
+
+        统一走这个入口就能保证内存与磁盘同步。值没变时不写盘，避免每次启动都
+        无谓地改写文件（``_save_login_config`` 会重写整份配置）。
+        """
+        with self._lock:
+            try:
+                new_value = max(1, min(10, int(value)))
+            except (TypeError, ValueError):
+                return self.daily_limit
+            if new_value == self.daily_limit:
+                return new_value
+            self.daily_limit = new_value
+            self._save_login_config()
+            return new_value
+
     def _save_login_config(self):
         data = {
             "mode": self.login_mode,
