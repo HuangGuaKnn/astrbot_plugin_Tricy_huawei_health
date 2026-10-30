@@ -313,6 +313,7 @@
         <button class="act danger" type="button" id="btnClear">清除 cookie</button>
       </div>
       <div class="msg" id="ckMsg"></div>
+      <p class="hint" id="cookieProtection">正在读取 Cookie 存储保护方式…</p>
       <div class="sep"></div>
       <div class="kv"><span class="k">关键 COOKIE 明细</span></div>
       <div id="s_keys"><p class="hint" style="margin:0">尚未读取。</p></div>
@@ -469,9 +470,24 @@ const TOKEN = assetToken();
 function record(what, err){
   if(what) DIAG.lastReq = what;
   if(err){
-    DIAG.lastErr = String(err && err.message ? err.message : err).slice(0, 300);
+    DIAG.lastErr = diagnosticError(err);
     pushLog("err", DIAG.lastErr);
   }
+}
+
+function diagnosticUrl(value){
+  try{
+    const url = new URL(value, location.href);
+    // 页面认证参数会同时出现在 query 与 /_t/ 路径中；诊断不展示任何 query/hash。
+    const path = url.pathname.replace(/\/_t\/[^/]+/g, "/_t/[已隐藏]");
+    return (url.origin + path).slice(0, 200);
+  }catch(e){ return "地址已隐藏"; }
+}
+
+function diagnosticError(value){
+  let text = String(value && value.message ? value.message : value || "");
+  if(TOKEN) text = text.split(TOKEN).join("[已隐藏]");
+  return text.replace(/https?:\/\/[^\s<>"']+/gi, "[地址已隐藏]").slice(0, 300);
 }
 
 /* AstrBot 插件 API 的响应约定是 {status, message, data}，bridge 通常直接给 data；
@@ -528,9 +544,10 @@ async function bridgeApi(path, method, body){
 
 async function callApi(path, method, body){
   if(mode === "bridge" && bridge){
-    try{ return await bridgeApi(path, method, body); }
-    catch(e){ console.warn("[华为健康] bridge 调用失败，降级直连", e); }
+    // 业务错误同样会使 bridge reject；保留原错误，尤其不能重复提交 POST。
+    return bridgeApi(path, method, body);
   }
+  if(inIframe()) throw new Error("页面桥接未连接，请点击重连或重新打开插件页面");
   return directApi(path, method, body);
 }
 const apiGet = p => callApi(p, "GET");
@@ -542,7 +559,7 @@ async function selectMode(force){
   bridge = window.AstrBotPluginPage || window.AstrBotPluginView || null;
 
   if(!DIAG.inIframe){ mode = "direct"; DIAG.mode = mode; return "独立窗口，走直连"; }
-  if(!bridge){ mode = "direct"; DIAG.mode = mode; return "iframe 内但 bridge 未加载，降级直连"; }
+  if(!bridge){ mode = "unavailable"; DIAG.mode = mode; return "页面桥接未加载，请点击重连或重新打开插件页面"; }
   try{
     await Promise.race([
       bridge.ready(),
@@ -553,15 +570,15 @@ async function selectMode(force){
     return "iframe + bridge，走桥接";
   }catch(e){
     record(null, e);
-    mode = "direct";
+    mode = "unavailable";
     DIAG.mode = mode;
-    return "bridge 未就绪（" + e.message + "），降级直连";
+    return "页面桥接未就绪（" + diagnosticError(e) + "），请点击重连";
   }
 }
 
 async function probeBridgeScript(){
   const el2 = document.querySelector('script[src*="bridge-sdk"]');
-  DIAG.bridgeSrc = el2 ? el2.src.slice(0, 180) : "页面上没找到 bridge-sdk 标签";
+  DIAG.bridgeSrc = el2 ? diagnosticUrl(el2.src) : "页面上没找到 bridge-sdk 标签";
   if(!el2){
     DIAG.bridgeProbe = "无 bridge-sdk 标签";
     return;
@@ -586,7 +603,7 @@ function renderDiag(summary){
   $("diagSum").appendChild(tail);
 
   $("diagText").textContent = [
-    "页面地址      : " + location.href.slice(0, 200),
+    "页面地址      : " + diagnosticUrl(location.href),
     "运行环境      : " + (DIAG.inIframe ? "iframe（父窗口 = AstrBot WebUI）" : "独立窗口"),
     "bridge 对象   : " + (DIAG.hasBridge ? "存在（window.AstrBotPlugin" + (window.AstrBotPluginPage ? "Page" : "View") + "）" : "不存在"),
     "bridge 脚本   : " + DIAG.bridgeSrc,
@@ -644,6 +661,7 @@ function switchTab(name){
 function renderStatus(d){
   d = d || {};
   const ck = d.cookie || {};
+  $("cookieProtection").textContent = (ck.storage || {}).message || "Cookie 存储状态暂时不可用";
   const tk = d.token || {};
   const br = d.browser || {};
   const perm = d.permission || {};
@@ -938,6 +956,7 @@ async function doLoginTrust(choice){
 /* ---------- 账号凭据 ---------- */
 function renderCredentialsStatus(d){
   d = d || {};
+  if(d.cookie_storage) $("cookieProtection").textContent = d.cookie_storage.message || "Cookie 存储状态暂时不可用";
   const modeText = d.mode === "password" ? "账号密码模式" : "Cookie 模式";
   const state = d.state || (d.password_set ? "ok" : "absent");
   // 不再把「文件损坏 / 被占用」谎报成「未保存」——否则用户会反复保存却永远登不上。
@@ -973,7 +992,8 @@ async function doCredentialSave(){
   try{
     const d = unwrap(await apiPost("credentials", {mode:"password", account, password})) || {};
     renderCredentialsStatus(d);
-    setMsg($("credentialMsg"), "账号密码已加密保存", "ok");
+    setMsg($("credentialMsg"), "账号密码已加密保存，旧登录态已清除，下次查询会重新登录", "ok");
+    loadStatus(true);
   }catch(e){ setMsg($("credentialMsg"), "凭据保存失败：" + e.message, "err"); }
   finally{
     $("credentialAccount").value = "";
@@ -990,7 +1010,8 @@ async function doCredentialClear(){
   try{
     const d = unwrap(await apiPost("credentials", {clear:true})) || {};
     renderCredentialsStatus(d);
-    setMsg($("credentialMsg"), "账号密码凭据已清除", "ok");
+    setMsg($("credentialMsg"), "账号密码凭据已清除，已切换到 Cookie 模式并清空缓存", "ok");
+    loadStatus(true);
   }catch(e){ setMsg($("credentialMsg"), "凭据清除失败：" + e.message, "err"); }
   finally{ b.disabled = false; loadCredentialsStatus(true); renderDiag(); }
 }

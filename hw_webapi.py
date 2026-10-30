@@ -16,11 +16,11 @@ from astrbot.api.web import json_response, request
 
 try:
     from .hw_login import LoginFlowError
-    from .hw_credentials import CredentialsError, DPAPIUnavailableError
+    from .hw_credentials import DPAPIUnavailableError
     from .hw_privacy import redact_error
 except ImportError:
     from hw_login import LoginFlowError
-    from hw_credentials import CredentialsError, DPAPIUnavailableError
+    from hw_credentials import DPAPIUnavailableError
     from hw_privacy import redact_error
 
 PAGE_PREFIX = "astrbot_plugin_Tricy_huawei_health/page"
@@ -190,6 +190,13 @@ class HuaweiHealthWebApi:
             path = ""
         return {"path": path, "found": bool(path)}
 
+    def _cookie_storage_data(self) -> dict:
+        """只返回存储保护方式，不把 Cookie 内容或文件路径交给页面。"""
+        try:
+            return self.plugin.auth.cookie_storage_status()
+        except Exception:
+            return {"mode": "error", "encrypted": False, "message": "Cookie 存储状态暂时不可用"}
+
     # ---------- 接口 ----------
 
     @staticmethod
@@ -231,7 +238,7 @@ class HuaweiHealthWebApi:
         manager = getattr(p, "login_manager", None)
         data = {
             # 页面状态版本与插件元数据统一，避免前端误判部署版本。
-            "version": "v0.5.0-rc.2",
+            "version": "v0.5.0-rc.3",
             "data_dir": p.data_dir,
             "cookie_file": p.cookie_file,
             "login_mode": getattr(manager, "login_mode", "cookie"),
@@ -249,6 +256,7 @@ class HuaweiHealthWebApi:
         # cookie
         cf = p.cookie_file
         cinfo = {"exists": os.path.exists(cf), "count": 0, "mtime": "-", "keys": [], "error": ""}
+        cinfo["storage"] = await asyncio.to_thread(self._cookie_storage_data)
         if cinfo["exists"]:
             try:
                 cookies = p.auth.load_cookies()
@@ -297,7 +305,10 @@ class HuaweiHealthWebApi:
         同样的并发上限、同样的整体超时兜底（v0.4.0 这里是复制粘贴的一份实现）。
         """
         p = self.plugin
-        items = await p._overview_items()
+        try:
+            items = await p._overview_items()
+        except Exception as exc:
+            return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         return json_response({"status": "ok", "data": {
             "items": items,
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -313,47 +324,46 @@ class HuaweiHealthWebApi:
         if not isinstance(body, dict):
             return json_response({"status": "error", "message": "请求体必须是 JSON 对象"},
                                  status_code=400)
-        text = (body.get("json") or "").strip()
-        fields = body.get("fields") if isinstance(body.get("fields"), dict) else {}
-        if not text and not any(str(v or "").strip() for v in fields.values()):
+        text = body.get("json", "")
+        if not isinstance(text, str):
+            return json_response({"status": "error", "message": "json 字段必须是字符串"}, status_code=400)
+        text = text.strip()
+        fields = body.get("fields", {})
+        if not isinstance(fields, dict) or any(not isinstance(v, str) for v in fields.values()):
+            return json_response({"status": "error", "message": "fields 必须是 Cookie 名称与字符串值组成的对象"},
+                                 status_code=400)
+        if not text and not any(v.strip() for v in fields.values()):
             return json_response({"status": "error", "message": "cookie 内容为空"},
                                  status_code=400)
         try:
-            # v0.4.1：与磁盘上已有的 cookie 合并 + 补齐 CASTGC 两条路径 + 缺关键项直接报错。
-            n = p.auth.import_cookie_sources(text, fields)
+            # 显式导入替换整个 Cookie 集合；不混入上一账号的辅助会话 Cookie。
+            n = await p._change_auth_state(lambda: p.auth.import_cookie_sources(text, fields, replace_existing=True))
         except Exception as exc:
             return json_response(
                 {"status": "error", "message": redact_error(exc)}, status_code=400)
-        # 换 cookie 时清除 token 及全部健康缓存，避免跨账号泄露旧数据。
-        await p._invalidate_auth_cache()
         p.logger.info("[华为健康] WebUI 导入了 %d 条 cookie" % n)
         return json_response({
             "status": "ok",
-            "message": "已导入 %d 条 cookie（已与现有 cookie 合并），token 缓存已作废，下次查询会重新认证" % n,
+            "message": "已导入 %d 条 cookie（已替换旧会话），token 缓存已作废，下次查询会重新认证" % n,
             "count": n,
         })
 
     async def clear_cookie(self):
         p = self.plugin
         try:
-            # 通过认证层的共享锁清除，避免与浏览器回写并发时旧 cookie 被恢复。
-            p.auth.clear_cookies()
+            await p._change_auth_state(clear_cookies=True)
         except Exception as exc:
             return json_response(
                 {"status": "error", "message": redact_error(exc)}, status_code=500)
-        await p._invalidate_auth_cache()
         p.logger.warning("[华为健康] WebUI 清除了 cookie 文件")
         return json_response({"status": "ok", "message": "cookie 已清除，token 缓存已作废"})
 
     async def refresh(self):
         p = self.plugin
         try:
-            # 统一推进缓存 generation，防止并发旧请求在刷新后写回。
-            await p._invalidate_auth_cache()
-        except Exception:
-            pass
-        try:
-            await p._token(force=True)
+            # 清理失败必须中止，不可继续认证后把失败误报为成功。
+            await p._change_auth_state()
+            await asyncio.wait_for(p._token(force=True), timeout=getattr(p, "QUERY_TIMEOUT", 90))
         except Exception as exc:
             return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         return json_response({"status": "ok", "message": "缓存已清空，并已重新拿到最新 token"})
@@ -387,10 +397,12 @@ class HuaweiHealthWebApi:
             "state": str(raw.get("state") or "absent"),
             "error": str(raw.get("error") or ""),
             "available": bool(getattr(store, "available", False)) if store is not None else False,
+            "cookie_storage": self._cookie_storage_data(),
         }
 
     async def credentials_status(self):
-        return json_response({"status": "ok", "data": self._credentials_status_data()})
+        data = await asyncio.to_thread(self._credentials_status_data)
+        return json_response({"status": "ok", "data": data})
 
     async def credentials_write(self):
         try:
@@ -406,17 +418,20 @@ class HuaweiHealthWebApi:
         mode = str(body.get("mode") or "").strip().lower()
         clear = body.get("clear") is True or mode == "cookie"
         if clear:
-            try:
+            def clear_credentials():
                 store.clear()
                 self.plugin.login_manager.set_login_mode("cookie")
                 try:
                     self.plugin.login_manager.clear_cooldown()
                 except Exception:
                     pass
-            except (CredentialsError, LoginFlowError):
+            try:
+                await self.plugin._change_auth_state(clear_credentials)
+            except Exception:
                 return json_response({"status": "error", "message": "凭据清除失败，请稍后重试"}, status_code=500)
             return json_response({
-                "status": "ok", "data": self._credentials_status_data(), "message": "账号密码凭据已清除",
+                "status": "ok", "data": await asyncio.to_thread(self._credentials_status_data),
+                "message": "账号密码凭据已清除，已切换到 Cookie 模式并清空缓存",
             })
 
         account = body.get("account")
@@ -429,7 +444,7 @@ class HuaweiHealthWebApi:
             return json_response({
                 "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
             }, status_code=409)
-        try:
+        def save_credentials():
             store.save(account, password)
             self.plugin.login_manager.set_login_mode("password")
             # 用户刚把密码改对：把 6 小时失败冷却立刻清掉，否则提示会自相矛盾
@@ -438,18 +453,23 @@ class HuaweiHealthWebApi:
                 self.plugin.login_manager.clear_cooldown()
             except Exception:
                 pass
+
+        try:
+            # 保存新账号时撤销旧登录态，避免新账号认证失败后回退到旧账号 Cookie。
+            await self.plugin._change_auth_state(save_credentials, clear_cookies=True)
         except DPAPIUnavailableError:
             return json_response({
                 "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
             }, status_code=409)
-        except CredentialsError:
+        except Exception:
             return json_response({"status": "error", "message": "凭据保存失败，请稍后重试"}, status_code=500)
         finally:
             # Do not retain request fields after the write path returns.
             account = None
             password = None
         return json_response({
-            "status": "ok", "data": self._credentials_status_data(), "message": "账号密码已加密保存",
+            "status": "ok", "data": await asyncio.to_thread(self._credentials_status_data),
+            "message": "账号密码已加密保存，旧登录态已清除，下次查询会重新登录",
         })
 
     # ---------- 登录会话（v0.4.0 第 4 阶段：自动登录与降级） ----------
@@ -470,17 +490,20 @@ class HuaweiHealthWebApi:
         )
         prefer_auto = body.get("prefer_auto") if isinstance(body.get("prefer_auto"), bool) else None
         try:
+            session = p.login_manager.current_session()
+            if (session is not None and session.is_running()
+                    and session.snapshot().get("state") not in ("DONE", "FAILED")):
+                return json_response({"status": "ok", "data": p.login_manager.status()})
             # 用户在 WebUI 主动点「开始登录」不占用每日自动登录额度，
             # 只有取数路径触发的自动登录才计入额度与失败冷却。
-            # manager.start() 里有文件 fsync + DPAPI 解密，别在事件循环线程上跑。
-            await asyncio.to_thread(
-                p.login_manager.start,
+            # 清理与启动共用状态锁、同一个线程任务，避免中间查询用旧 Cookie 认证。
+            await p._change_auth_state(lambda: p.login_manager.start(
                 mode,
                 auto_trust=auto_trust,
                 allow_visible_fallback=allow_visible_fallback,
                 manual=True,
                 prefer_auto=prefer_auto,
-            )
+            ))
         except LoginFlowError as exc:
             message = {
                 "trust_invalid": "自动信任选项无效",
@@ -499,6 +522,8 @@ class HuaweiHealthWebApi:
                 "status": "error",
                 "message": message,
             }, status_code=status)
+        except Exception as exc:
+            return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         # v0.4.1：返回体与 /login/status 统一（原来用 session.snapshot()，
         # 少 daily_used / daily_limit / prefer_auto，点完登录那一次额度行不刷新）。
         return json_response({"status": "ok", "data": p.login_manager.status()})

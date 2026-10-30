@@ -366,6 +366,8 @@ def _forbidden_path_reason(relative_path: str) -> str | None:
         part in {"logs", "log", "screenshots", "screenshot"} for part in lowered_parts
     ):
         return "private-artifact-path"
+    if any(part == "browser_profile" or part.startswith("login_browser_") for part in lowered_parts):
+        return "browser-profile-path"
     if lowered_name == ".env" or lowered_name.startswith(".env."):
         if lowered_name not in {".env.example", ".env.template"}:
             return "environment-file"

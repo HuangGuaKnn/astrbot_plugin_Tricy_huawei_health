@@ -1012,15 +1012,16 @@ class TestThreadStartFailure(unittest.TestCase):
 
 
 class TestCleanupSweep(unittest.TestCase):
-    """P1-7：被新会话取代的旧会话不能清扫 profile。"""
+    """每个会话独占 profile，旧会话只清扫自身目录。"""
 
-    def test_superseded_session_does_not_sweep(self):
+    def test_superseded_session_sweeps_only_its_unique_profile(self):
         s, mgr, _ = new_session()
         seen = {}
         s._auth._stop_process = lambda proc, sweep_profile=True: seen.setdefault("sweep", sweep_profile)
-        mgr._session = object()             # 已经被新会话取代
+        mgr._session = hw_login.HuaweiLoginSession(mgr)
+        self.assertNotEqual(s._profile_dir, mgr._session._profile_dir)
         s._cleanup()
-        self.assertFalse(seen.get("sweep"))
+        self.assertTrue(seen.get("sweep"))
 
     def test_current_session_sweeps(self):
         s, mgr, _ = new_session()
@@ -1098,6 +1099,8 @@ class TestGate(unittest.TestCase):
         s, _, _ = new_session()
         s._set_state("NEED_SMS")
         self.mgr._session = s
+        self.assertFalse(self.mgr.is_busy(), "已退出工作线程的状态不能永久阻塞新登录")
+        s.is_running = lambda: True
         self.assertTrue(self.mgr.is_busy())
         s._set_state("DONE")
         self.assertFalse(self.mgr.is_busy())
@@ -1422,7 +1425,7 @@ if __name__ == "__main__":
 # ==================== 第二轮修复（对抗性复核 verify_auth 之后） ====================
 
 class TestRound2SweepDefault(unittest.TestCase):
-    """P1-A：`_close_browser()` 的默认清扫资格必须看「自己是否还是当前会话」。"""
+    """旧会话在独立 profile 内清理，不能触及新会话目录。"""
 
     def _session_with_recorder(self):
         s, mgr, _ = new_session()
@@ -1443,11 +1446,12 @@ class TestRound2SweepDefault(unittest.TestCase):
         s._proc = object()
         return s, mgr, seen
 
-    def test_superseded_session_does_not_sweep_by_default(self):
+    def test_superseded_session_cleans_own_profile_by_default(self):
         s, mgr, seen = self._session_with_recorder()
-        mgr._session = object()          # 已被新会话取代
+        mgr._session = hw_login.HuaweiLoginSession(mgr)
+        self.assertNotEqual(s._profile_dir, mgr._session._profile_dir)
         s._close_browser()               # 默认参数
-        self.assertFalse(seen["sweep"])
+        self.assertTrue(seen["sweep"])
 
     def test_current_session_sweeps_by_default(self):
         s, mgr, seen = self._session_with_recorder()
@@ -1455,11 +1459,12 @@ class TestRound2SweepDefault(unittest.TestCase):
         s._close_browser()
         self.assertTrue(seen["sweep"])
 
-    def test_launch_failure_when_superseded_does_not_sweep(self):
+    def test_launch_failure_cleans_only_its_unique_profile(self):
         """P1-A 的真正危险路径：`_launch()` 的 except。"""
         s, mgr, _ = new_session()
         s._profile_dir = boot.sandbox_dir("t_launch")
-        mgr._session = object()          # 已被新会话取代
+        mgr._session = hw_login.HuaweiLoginSession(mgr)
+        self.assertNotEqual(s._profile_dir, mgr._session._profile_dir)
         seen = {}
         orig_find = hw_login.find_browser
         orig_popen = hw_login.subprocess.Popen
@@ -1494,7 +1499,7 @@ class TestRound2SweepDefault(unittest.TestCase):
             hw_login.read_devtools_port = orig_port
             hw_auth.HuaweiAuth._stop_process = orig_stop
         self.assertIn("sweep", seen, "_launch 的失败收尾没有走 _stop_process")
-        self.assertFalse(seen["sweep"])
+        self.assertTrue(seen["sweep"])
 
 
 class TestRound2NeedsHuman(unittest.TestCase):
@@ -2039,28 +2044,31 @@ class TestGenerationOnClear(unittest.TestCase):
 
     def test_inflight_write_is_discarded_after_clear(self):
         plugin = make_plugin()
-        plugin.store.set("k", {"old": True}, ttl=600)
-        started = {"at": None}
+        started, release = threading.Event(), threading.Event()
 
         def producer(client):
-            time.sleep(0.25)
+            started.set()
+            if not release.wait(3):
+                raise AssertionError("producer was not released")
             return {"stale": True}
 
         async def _client(force=False, stale_token=""):
             class C:
                 token = "T"
             return C()
-
         plugin._client = _client
 
         async def run():
             task = asyncio.create_task(plugin._cached("k", producer, ttl=600))
-            await asyncio.sleep(0.05)
-            # 模拟「导入 cookie」：清缓存
-            await asyncio.to_thread(plugin._clear_auth_cache_blocking)
-            await task
-
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                await asyncio.to_thread(plugin._clear_auth_cache_blocking)
+            finally:
+                release.set()
+            with self.assertRaises(main_mod.StateChanged):
+                await task
         asyncio.run(run())
+        self.assertTrue(started.is_set())
         self.assertIsNone(plugin.store.get("k"))
 
     def test_clear_bumps_generation(self):

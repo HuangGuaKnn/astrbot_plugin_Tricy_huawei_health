@@ -30,6 +30,7 @@ v0.4.1 变更（对应检测报告 P1-1 / P1-9 / P1-11 / P1-12 / P2-9 / P2-15 / 
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -37,6 +38,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from contextlib import nullcontext
 
 try:  # 延迟到真正需要浏览器时才失败，缺包不应该让整个插件加载不了
     import websocket
@@ -408,6 +410,10 @@ class HuaweiAuthError(Exception):
     """认证流程失败。"""
 
 
+class HuaweiAuthInvalidated(HuaweiAuthError):
+    """The account configuration changed while authentication was running."""
+
+
 class HuaweiAuth:
     """负责「拿 token」这一件事。"""
 
@@ -428,6 +434,8 @@ class HuaweiAuth:
         headless: bool = True,
         page_timeout: int = 90,
         logger=None,
+        commit_lock=None,
+        is_current=None,
     ):
         self.cookie_file = cookie_file
         self.profile_dir = profile_dir
@@ -439,6 +447,9 @@ class HuaweiAuth:
         except (TypeError, ValueError):
             self.page_timeout = 90.0
         self.log = logger
+        self._commit_lock = commit_lock
+        self._is_current = is_current
+        self._cancel = threading.Event()
         # 共享文件锁避免导入、认证回写和清除同时修改 cookie 文件。
         lock_key = os.path.abspath(cookie_file)
         with self._state_lock:
@@ -453,21 +464,50 @@ class HuaweiAuth:
 
     # ---------- cookie 读写 ----------
 
+    def cancel(self):
+        """Discard this worker's result without cancelling later auth instances."""
+        with self._commit_lock or nullcontext():
+            self._cancel.set()
+
+    def _check_current(self):
+        # Caller holds the optional plugin state lock at commit boundaries.
+        if self._cancel.is_set() or (self._is_current is not None and not self._is_current()):
+            raise HuaweiAuthInvalidated("登录配置已变化或认证已取消，已丢弃旧认证结果，请重新查询")
+
     def _serialize_cookies(self, cookies) -> bytes:
         payload = json.dumps(cookies, ensure_ascii=False, indent=1).encode("utf-8")
         try:
             return COOKIE_MAGIC + _protect(payload)
         except DPAPIUnavailableError:
-            # 非 Windows：DPAPI 不可用，退回明文（下面会 chmod 0600）。
+            if os.name == "nt":
+                raise HuaweiAuthError("Windows DPAPI 不可用，未保存 Cookie；请检查当前 Windows 用户环境")
+            # 非 Windows 的明文存储是明确的平台策略，不用于掩盖 Windows 加密故障。
             if not self._plaintext_warned:
                 self._plaintext_warned = True
                 self._log("warning", "当前系统不支持 DPAPI，cookie 文件将以 0600 明文保存")
             return payload
         except Exception as exc:
-            if not self._plaintext_warned:
-                self._plaintext_warned = True
-                self._log("warning", "cookie 加密失败（%s），退回明文保存" % redact_error(exc))
-            return payload
+            raise HuaweiAuthError("Cookie 加密失败，已保留原文件；请检查当前 Windows 用户环境") from exc
+
+    def cookie_storage_status(self) -> dict:
+        """Describe the on-disk protection without returning any cookie values."""
+        try:
+            with self._cookie_lock:
+                with open(self.cookie_file, "rb") as stream:
+                    encrypted = stream.read(len(COOKIE_MAGIC)) == COOKIE_MAGIC
+        except FileNotFoundError:
+            return {"mode": "absent", "method": "absent", "encrypted": False, "message": "尚未保存 Cookie"}
+        except OSError:
+            return {"mode": "error", "method": "unreadable", "encrypted": False, "message": "Cookie 文件无法读取"}
+        if encrypted:
+            if os.name != "nt":
+                return {"mode": "unavailable", "method": "dpapi", "encrypted": True,
+                        "message": "Cookie 已由 Windows DPAPI 加密，当前系统无法解密"}
+            return {"mode": "dpapi", "method": "dpapi", "encrypted": True,
+                    "message": "Cookie 已由 Windows DPAPI 加密"}
+        message = ("现有 Cookie 为明文，请重新导入以启用 Windows DPAPI 加密"
+                   if os.name == "nt" else "当前系统不支持 DPAPI，Cookie 以明文保存并限制为 0600 权限")
+        return {"mode": "plaintext", "method": "plaintext", "encrypted": False, "message": message}
 
     def _deserialize_cookies(self, raw: bytes):
         if raw.startswith(COOKIE_MAGIC):
@@ -597,15 +637,14 @@ class HuaweiAuth:
         return len(cookies)
 
     def import_cookie_sources(self, json_text: str = "", fields=None,
-                              only_if_changed: bool = False) -> int:
-        """合并旧 JSON 和设置页分项 cookie，兼容两种配置入口。
+                              only_if_changed: bool = False,
+                              replace_existing: bool = False) -> int:
+        """Import JSON and/or the six form fields.
 
-        v0.4.1：
-          - 与磁盘上已有的 cookie **合并**，不再整份覆盖（否则 OAuth 期间下发的
-            __uni__uid / JSESSIONID 会被删掉，滚续结果也被旧快照覆盖）；
-          - 按 MIN_COOKIE_SPECS 补齐 CASTGC 的两条路径；
-          - 缺 CASTGC / sid 直接报错，缺其余只告警；
-          - ``only_if_changed=True`` 时用配置指纹判重，配置没变就什么都不做。
+        ``replace_existing=True`` is for explicit imports/account changes: the
+        incoming set must contain valid CASTGC and sid, and no old auxiliary
+        cookies are retained. The default keeps partial-update compatibility.
+        An unchanged config fingerprint always preserves renewed cookies.
         """
         groups = []
         if str(json_text or "").strip():
@@ -615,31 +654,39 @@ class HuaweiAuth:
         if not incoming:
             raise HuaweiAuthError("cookie 内容为空，请至少填写一条有效 cookie")
 
-        digest = None
-        if only_if_changed:
-            digest = self._config_digest(incoming)
-            if digest == self._read_config_marker():
-                return 0
+        with self._cookie_lock:
+            digest = None
+            if only_if_changed:
+                digest = self._config_digest(incoming)
+                if digest == self._read_config_marker():
+                    return 0
 
-        try:
-            existing = self.load_cookies()
-        except HuaweiAuthError:
             existing = []
-        merged = _merge_cookies(existing, incoming)
-        merged = _canonical_complete(merged)
+            if not replace_existing:
+                try:
+                    existing = self.load_cookies()
+                except HuaweiAuthError:
+                    pass
+            merged = _canonical_complete(_merge_cookies(existing, incoming))
 
-        missing = _missing_names(merged)
-        fatal = [n for n in missing if n in REQUIRED_COOKIES]
-        if fatal:
-            raise HuaweiAuthError(
-                "缺少必要的 cookie：%s。请把六项都填上，或改用整段 JSON 导出。"
-                % "、".join(fatal))
-        if missing:
-            self._log("warning", "导入的 cookie 里缺少：%s（如登录失败请补齐）" % "、".join(missing))
+            missing = _missing_names(merged)
+            fatal = [n for n in missing if n in REQUIRED_COOKIES]
+            if replace_existing:
+                # Required values must come entirely from this import. Empty
+                # JSON values must not borrow an old account's valid cookie.
+                fatal = [name for name in REQUIRED_COOKIES if not any(
+                    c.get("name") == name and str(c.get("value") or "").strip()
+                    for c in incoming)]
+            if fatal:
+                raise HuaweiAuthError(
+                    "缺少必要的 cookie：%s。请把六项都填上，或改用整段 JSON 导出。"
+                    % "、".join(fatal))
+            if missing:
+                self._log("warning", "导入的 cookie 里缺少：%s（如登录失败请补齐）" % "、".join(missing))
 
-        self.save_cookies(merged)
-        if digest is not None:
-            self._write_config_marker(digest)
+            self.save_cookies(merged)
+            if digest is not None:
+                self._write_config_marker(digest)
         self.clear_failure()
         return len(incoming)
 
@@ -714,7 +761,7 @@ class HuaweiAuth:
         needle = os.path.abspath(self.profile_dir)
         try:
             out = subprocess.run(
-                ["pgrep", "-f", needle],
+                ["pgrep", "-f", re.escape(needle)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
@@ -738,6 +785,8 @@ class HuaweiAuth:
 
     def fetch_token(self) -> str:
         """起浏览器 → 注入 cookie → 自动登录 → 返回 accessToken。阻塞调用。"""
+        with self._commit_lock or nullcontext():
+            self._check_current()
         with self._failure_lock:
             self._last_failure = self._failure_state_item["last"]
             remain = self.failure_cooldown - (time.time() - self._last_failure)
@@ -755,6 +804,8 @@ class HuaweiAuth:
             self._auth_mutex.release()
 
     def _fetch_token_locked(self) -> str:
+        with self._commit_lock or nullcontext():
+            self._check_current()
         started = time.monotonic()
         self._log("info", "认证阶段开始")
         # 上一次异常退出可能留下 Edge 子进程，启动前先清理本插件自己的 profile。
@@ -792,7 +843,10 @@ class HuaweiAuth:
         ws = None
         try:
             port = read_devtools_port(
-                self.profile_dir, timeout=min(40, self.page_timeout), proc=proc)
+                self.profile_dir, timeout=min(40, self.page_timeout),
+                cancel=self._cancel, proc=proc)
+            with self._commit_lock or nullcontext():
+                self._check_current()
             if not port:
                 raise HuaweiAuthError(
                     "浏览器调试端口未就绪；可能是上次浏览器未退出，请重试或手动结束 msedge 进程")
@@ -815,26 +869,42 @@ class HuaweiAuth:
                     "多半是 cookie 已过期，请重新从浏览器导出 cookie 导入插件。"
                 )
 
-            # 回写新 cookie（滚续）
-            try:
-                fresh = self._call(ws, "Network.getAllCookies").get("result", {}).get("cookies", [])
-                if len(fresh) >= max(5, len(cookies) // 2):
-                    if self.save_cookies([normalize_cookie(c) for c in fresh], cookie_mtime_ns):
-                        self._log("info", "cookie 已回写：%d → %d 条" % (len(cookies), len(fresh)))
-            except Exception as exc:  # 回写失败不影响本次取数
-                self._log("warning", "cookie 回写失败：%s" % redact_error(exc))
-
-            # 页面提供的过期时间优先用于后续缓存 TTL；旧页面没有该字段时保留安全默认值。
+            # 先读完页面数据，再在 cookie 锁中校验来源并提交；旧账号结果不能
+            # 因为「跳过 cookie 回写」而继续返回 token。
             expire = self._js(ws, "sessionStorage.getItem('expireTime')")
             try:
                 self.token_expire_at = float(expire) / (1000 if float(expire) > 10**11 else 1)
             except (TypeError, ValueError):
                 self.token_expire_at = time.time() + 3000
-            self.clear_failure()
-            self._log("info", "认证成功，耗时 %.1f 秒" % (time.monotonic() - started))
-            return token
+            fresh = []
+            try:
+                fresh = self._call(ws, "Network.getAllCookies").get("result", {}).get("cookies", [])
+            except Exception as exc:
+                self._log("warning", "获取续期 cookie 失败：%s" % redact_error(exc))
+            # The plugin state lock also covers this final cookie write, so a
+            # stopped/reconfigured plugin cannot be resurrected by to_thread.
+            with self._commit_lock or nullcontext(), self._cookie_lock:
+                self._check_current()
+                try:
+                    current_mtime_ns = os.stat(self.cookie_file).st_mtime_ns
+                except OSError:
+                    current_mtime_ns = None
+                if cookie_mtime_ns is None or current_mtime_ns != cookie_mtime_ns:
+                    raise HuaweiAuthInvalidated("登录配置已变化，已丢弃旧认证结果，请重新查询")
+                if len(fresh) >= max(5, len(cookies) // 2):
+                    if not self.save_cookies([normalize_cookie(c) for c in fresh], cookie_mtime_ns):
+                        raise HuaweiAuthInvalidated("登录配置已变化，已丢弃旧认证结果，请重新查询")
+                    self._log("info", "cookie 已回写：%d → %d 条" % (len(cookies), len(fresh)))
+                self.clear_failure()
+                self._log("info", "认证成功，耗时 %.1f 秒" % (time.monotonic() - started))
+                return token
+        except HuaweiAuthInvalidated:
+            # 用户主动换号/清除不是一次华为登录失败，不应恢复失败冷却。
+            raise
         except Exception as exc:
-            self._mark_failure()
+            with self._commit_lock or nullcontext():
+                self._check_current()
+                self._mark_failure()
             self._log("warning", "认证失败，耗时 %.1f 秒：%s"
                       % (time.monotonic() - started, redact_error(exc)))
             raise
@@ -853,6 +923,8 @@ class HuaweiAuth:
         # 页面超时是整个 CDP 初始化阶段的上限，避免单独的端口轮询越界。
         deadline = time.monotonic() + min(max(1, timeout), max(1, self.page_timeout))
         while time.monotonic() < deadline:
+            if self._cancel.is_set():
+                raise HuaweiAuthInvalidated("认证已取消，已丢弃旧认证结果")
             try:
                 with urllib.request.urlopen(
                     "http://127.0.0.1:%d/json/version" % port,
@@ -925,7 +997,7 @@ class HuaweiAuth:
         已经被新会话取代时用它，否则会把新会话刚起的浏览器一起 taskkill。
         """
         if proc is None:
-            return
+            return True
         try:
             proc.terminate()
         except Exception:
@@ -978,6 +1050,32 @@ class HuaweiAuth:
                 self._cleanup_orphan_browsers()
             except Exception:
                 pass
+        return self._profile_processes_exited()
+
+    def _profile_processes_exited(self) -> bool:
+        """Only permit deleting a profile after its browser processes have exited."""
+        needle = os.path.abspath(self.profile_dir)
+        try:
+            if os.name == "nt":
+                script = (
+                    "$needle='%s'; try { $matches=@(Get-CimInstance Win32_Process -ErrorAction Stop | "
+                    "Where-Object { ($_.Name -eq 'msedge.exe' -or $_.Name -eq 'chrome.exe') "
+                    "-and $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle.ToLower()) }) } "
+                    "catch { exit 2 }; "
+                    "if ($matches.Count -eq 0) { exit 0 } else { exit 1 }"
+                ) % needle.replace("'", "''")
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", script],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False)
+                return result.returncode == 0
+            # pgrep treats the pattern as a regexp; quote the literal profile path.
+            result = subprocess.run(
+                ["pgrep", "-f", re.escape(needle)], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10, check=False)
+            return result.returncode == 1
+        except Exception:
+            return False
 
     def _js(self, ws, expr: str):
         r = self._call(ws, "Runtime.evaluate", {
@@ -989,6 +1087,8 @@ class HuaweiAuth:
         """轮询 sessionStorage.accessToken，避免死等固定秒数。"""
         deadline = time.monotonic() + min(timeout, max(1, self.page_timeout))
         while time.monotonic() < deadline:
+            if self._cancel.is_set():
+                raise HuaweiAuthInvalidated("认证已取消，已丢弃旧认证结果")
             try:
                 tok = self._js(ws, "sessionStorage.getItem('accessToken')")
             except HuaweiAuthError:
@@ -1012,6 +1112,8 @@ class HuaweiAuth:
         # 点击轮询也必须受 page_timeout 约束，避免 CDP 正常超时后仍长时间阻塞。
         deadline = time.monotonic() + max(1, self.page_timeout)
         while time.monotonic() < deadline:
+            if self._cancel.is_set():
+                raise HuaweiAuthInvalidated("认证已取消，已丢弃旧认证结果")
             try:
                 if self._js(ws, expr) == "clicked":
                     return True
