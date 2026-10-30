@@ -27,20 +27,35 @@
   header{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
   h1{font-size:17px;font-weight:600;margin:0;letter-spacing:.2px}
   .ver{font-size:12px;color:var(--muted)}
-  .sub{font-size:12.5px;color:var(--muted);margin:0 0 18px}
-  .theme-btn{margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);
-    border-radius:6px;padding:3px 9px;font-size:12px;cursor:pointer}
-  .theme-btn:hover{color:var(--fg)}
-
+  .sub{font-size:12.5px;color:var(--muted);margin:0 0 14px}
+  .theme-btn{margin-left:auto}
   h2{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
-     color:var(--muted);margin:24px 0 10px}
+     color:var(--muted);margin:22px 0 10px}
+  h2.cfg-h2{margin:20px 0 8px}
+  h2.cfg-h2:first-child{margin-top:0}
 
+  /* ---------- Tab ---------- */
+  .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin:0 0 18px;
+    overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
+  .tab{flex:0 0 auto;background:none;border:0;border-bottom:2px solid transparent;
+    color:var(--muted);padding:8px 12px;font-size:13.5px;cursor:pointer;white-space:nowrap;
+    transition:color .12s,border-color .12s}
+  .tab:hover{color:var(--fg)}
+  .tab[aria-selected="true"]{color:var(--fg);border-bottom-color:var(--accent);font-weight:600}
+  .panel[hidden]{display:none}
+
+  /* ---------- 卡片 ---------- */
   .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
-
+  .card + .card{margin-top:10px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px}
+  .cell{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;
+    display:flex;flex-direction:column;gap:3px}
+  .cell .k{font-size:11.5px;color:var(--muted);letter-spacing:.03em}
+  .cell .v{font-size:13.5px;line-height:1.5;word-break:break-all}
+  .cell .note{font-size:11.5px;color:var(--muted);line-height:1.5}
   .kv{display:flex;flex-direction:column;gap:2px}
   .kv .k{font-size:11.5px;color:var(--muted);letter-spacing:.03em}
-  .kv .v{font-size:13.5px;word-break:break-all}
+  .kv .v{font-size:13px;word-break:break-all}
   .mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
 
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
@@ -48,12 +63,15 @@
 
   table{width:100%;border-collapse:collapse;font-size:12.5px}
   th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
-  th{color:var(--muted);font-weight:500;font-size:11.5px}
+  th{color:var(--muted);font-weight:500;font-size:11px;letter-spacing:.06em;text-transform:uppercase}
   tr:last-child td{border-bottom:none}
+  #s_keys{margin-top:6px}
+  #s_keys .mono{font-size:11.5px;line-height:1.45}
 
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   button.act{background:var(--panel);border:1px solid var(--line);color:var(--fg);
-    border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer}
+    border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer;
+    transition:border-color .12s,color .12s}
   button.act:hover{border-color:var(--accent);color:var(--accent)}
   button.act[disabled]{opacity:.5;cursor:default}
   button.act.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -61,19 +79,25 @@
   button.act.danger:hover{border-color:var(--err);color:var(--err)}
   button.act.sm{padding:4px 10px;font-size:12px}
 
-  textarea{width:100%;min-height:110px;background:var(--code);color:var(--fg);
-    border:1px solid var(--line);border-radius:6px;padding:10px;font-size:12px;
+  textarea,input.field-input,.cookie-field input,.credential-field input,#loginSmsCode{
+    background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;
+    padding:8px 9px;font-size:13px;font-family:inherit;
+  }
+  textarea{width:100%;min-height:110px;font-size:12px;
     font-family:ui-monospace,SFMono-Regular,Consolas,monospace;resize:vertical}
-  textarea:focus{outline:none;border-color:var(--accent)}
-  .cookie-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px;margin:10px 0}
-  .cookie-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11.5px}
-  .cookie-field input{width:100%;background:var(--code);color:var(--fg);border:1px solid var(--line);
-    border-radius:6px;padding:7px 8px;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}
-  .cookie-field input:focus{outline:none;border-color:var(--accent)}
+  textarea:focus,input.field-input:focus,.cookie-field input:focus,
+  .credential-field input:focus,#loginSmsCode:focus{outline:none;border-color:var(--accent)}
+
+  .cookie-fields,.credential-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+    gap:8px;margin:10px 0}
+  .cookie-field,.credential-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11.5px}
+  .cookie-field input,.credential-field input{width:100%;font-size:12px;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
 
   pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:12px;
     font-size:12.5px;line-height:1.65;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-word;
     font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+  #diagLog{font-size:11.5px;max-height:260px;margin-top:8px}
 
   .msg{margin-top:10px;font-size:12.5px;min-height:18px}
   .msg.ok{color:var(--ok)} .msg.err{color:var(--err)} .msg.info{color:var(--muted)}
@@ -86,24 +110,83 @@
   .diag .st{color:var(--muted)}
   #diagBox{margin-top:8px}
 
+  /* ---------- 数据概览 ---------- */
   .ovgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:10px}
   .ovbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
   .ovcard{border:1px solid var(--line);border-radius:8px;padding:12px 14px;background:var(--code)}
-  .ovcard h3{font-size:12.5px;font-weight:600;margin:0 0 8px;display:flex;align-items:center;gap:6px;color:var(--fg);
-    cursor:pointer;user-select:none}
-  .ovcard h3 .caret{margin-left:auto;font-size:10px;color:var(--muted)}
+  .ovcard h3{font-size:12.5px;font-weight:600;margin:0 0 8px;display:flex;align-items:center;gap:6px;
+    color:var(--fg);cursor:pointer;user-select:none}
+  .ovcard h3 .caret{width:12px;height:12px;margin-left:auto;color:var(--muted);
+    transition:transform .12s}
   .ovcard.collapsed h3{margin-bottom:0}
+  .ovcard.collapsed h3 .caret{transform:rotate(-90deg)}
   .ovcard.collapsed pre{display:none}
   .ovcard pre{background:none;border:none;padding:0;font-size:12px;line-height:1.62}
   .ovcard.bad h3{color:var(--err)}
   .login-state{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:13px}
   .login-state .left{color:var(--muted)}
-  .login-state .deadline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted);font-size:12px}
-  .credential-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px;margin:10px 0}
-  .credential-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11.5px}
-  .credential-field input{width:100%;background:var(--code);color:var(--fg);border:1px solid var(--line);
-    border-radius:6px;padding:7px 8px;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}
-  .credential-field input:focus{outline:none;border-color:var(--accent)}
+  .login-state .deadline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+    color:var(--muted);font-size:12px}
+
+  /* ---------- 设置表单 ---------- */
+  .fields{display:flex;flex-direction:column}
+  .part-title{font-size:11.5px;color:var(--muted);letter-spacing:.04em;margin:14px 0 2px;
+    padding-top:10px;border-top:1px solid var(--line)}
+  .card > .part-title:first-of-type{margin-top:4px;padding-top:0;border-top:none}
+  .field{display:flex;flex-direction:column;gap:4px;padding:11px 0;border-bottom:1px solid var(--line)}
+  .field:last-child{border-bottom:none}
+  .field-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .field-label{font-size:13px;font-weight:600}
+  .field-key{font-size:11px;color:var(--muted);
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+  .field-hint{font-size:12px;color:var(--muted);line-height:1.6}
+  .field-input{width:100%;max-width:440px}
+  .field-input.num{max-width:180px}
+  .field .row .field-input{flex:1 1 240px}
+  textarea.field-input{max-width:100%;min-height:88px;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+  .field.field-err .field-input,.field.field-err .taglist,.field.field-err .check-line{
+    border-color:var(--err)}
+  .field.field-err .field-label{color:var(--err)}
+  .field-err-text{display:none;font-size:12px;color:var(--err)}
+  .field.field-err .field-err-text{display:block}
+  .check-line{display:inline-flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;
+    border:1px solid transparent;border-radius:6px;padding:2px 4px;width:max-content}
+  .check-line input{accent-color:var(--accent);width:15px;height:15px;cursor:pointer}
+  .chip{font-size:11px;padding:0 6px;border:1px solid var(--line);border-radius:4px;color:var(--muted)}
+  .chip.on{color:var(--ok);border-color:var(--ok)}
+  .taglist{display:flex;flex-wrap:wrap;gap:6px;align-items:center;background:var(--code);
+    border:1px solid var(--line);border-radius:6px;padding:6px;max-width:560px}
+  .tag{display:inline-flex;align-items:center;gap:3px;background:var(--panel);
+    border:1px solid var(--line);border-radius:4px;padding:2px 3px 2px 7px;
+    font:12px ui-monospace,SFMono-Regular,Consolas,monospace;max-width:100%}
+  .tag .tag-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tag.bad{border-color:var(--err)}
+  .tag-x{background:none;border:0;color:var(--muted);cursor:pointer;font-size:14px;
+    line-height:1;padding:0 3px}
+  .tag-x:hover{color:var(--err)}
+  .taglist input{flex:1 1 180px;min-width:130px;background:transparent;border:0;color:var(--fg);
+    font:12px ui-monospace,SFMono-Regular,Consolas,monospace;padding:4px}
+  .taglist input:focus{outline:none}
+  .cfg-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
+  /* ---------- toast ---------- */
+  #toast{position:fixed;right:16px;bottom:16px;z-index:20;max-width:min(430px,calc(100vw - 32px));
+    background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:8px;padding:10px 14px;font-size:13px;color:var(--fg);
+    opacity:0;visibility:hidden;transition:opacity .15s,visibility .15s}
+  #toast.show{opacity:1;visibility:visible}
+  #toast.ok{border-left-color:var(--ok)}
+  #toast.err{border-left-color:var(--err)}
+  #toast.warn{border-left-color:var(--warn)}
+
+  @media (max-width:640px){
+    body{padding:14px 12px 32px}
+    .grid{grid-template-columns:1fr}
+    .ovgrid{grid-template-columns:1fr}
+    .tabs{margin-left:-12px;margin-right:-12px;padding:0 12px}
+    .field-input{max-width:100%}
+  }
 </style>
 </head>
 <body>
@@ -111,131 +194,197 @@
   <header>
     <h1>华为运动健康</h1>
     <span class="ver" id="ver">v-</span>
-    <button class="theme-btn" id="themeBtn">主题</button>
+    <button class="act sm theme-btn" id="themeBtn">主题</button>
   </header>
-  <p class="sub">数据来自华为运动健康网页端。cookie 注入 → 自动 OAuth 登录 → accessToken → 只读取数。</p>
+  <p class="sub">数据来自华为运动健康网页端：cookie 注入、自动 OAuth 登录、accessToken、只读取数。</p>
 
-  <div class="diag">
-    <span id="diagSum"><span class="dot warn"></span>连接方式检测中…</span>
-    <button class="act sm" id="btnDiag" style="margin-left:auto">诊断详情</button>
-    <button class="act sm" id="btnReconnect">重连</button>
-  </div>
-  <div id="diagBox" style="display:none"><pre id="diagText">-</pre></div>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="功能分区">
+    <button class="tab" type="button" role="tab" data-tab="overview" aria-selected="true">概览</button>
+    <button class="tab" type="button" role="tab" data-tab="data" aria-selected="false">数据</button>
+    <button class="tab" type="button" role="tab" data-tab="login" aria-selected="false">登录</button>
+    <button class="tab" type="button" role="tab" data-tab="config" aria-selected="false">设置</button>
+    <button class="tab" type="button" role="tab" data-tab="diag" aria-selected="false">诊断</button>
+  </nav>
 
-  <h2>通道状态</h2>
-  <div class="card">
-    <div class="grid">
-      <div class="kv"><span class="k">COOKIE</span><span class="v" id="s_cookie">-</span></div>
-      <div class="kv"><span class="k">ACCESS TOKEN</span><span class="v" id="s_token">-</span></div>
-      <div class="kv"><span class="k">浏览器</span><span class="v mono" id="s_browser">-</span></div>
-      <div class="kv"><span class="k">缓存条目</span><span class="v" id="s_cache">-</span></div>
+  <!-- ================= 概览 ================= -->
+  <section class="panel" id="panel-overview" role="tabpanel" aria-label="概览">
+    <div class="grid" id="ovCards">
+      <div class="cell">
+        <div class="k">登录方式</div>
+        <div class="v" id="c_mode"><span class="dot warn"></span>读取中…</div>
+      </div>
+      <div class="cell">
+        <div class="k">ACCESS TOKEN</div>
+        <div class="v" id="c_token">-</div>
+      </div>
+      <div class="cell">
+        <div class="k">COOKIE</div>
+        <div class="v" id="c_cookie">-</div>
+      </div>
+      <div class="cell">
+        <div class="k">缓存条目</div>
+        <div class="v" id="c_cache">-</div>
+      </div>
+      <div class="cell">
+        <div class="k">当前权限</div>
+        <div class="v" id="c_perm">-</div>
+        <div class="note" id="c_perm_note"></div>
+      </div>
     </div>
-    <div class="sep"></div>
-    <div class="kv"><span class="k">数据目录</span><span class="v mono" id="s_dir">-</span></div>
-    <div id="s_keys" style="margin-top:12px"></div>
-  </div>
 
-  <h2>操作</h2>
-  <div class="card">
-    <div class="row">
-      <button class="act" id="btnRefresh">清缓存并重新认证</button>
-      <button class="act" id="btnStatus">刷新状态</button>
+    <div class="card">
+      <div class="row">
+        <button class="act primary" type="button" id="btnRefresh">清缓存并重新认证</button>
+        <button class="act" type="button" id="btnOverviewQuick">拉取全部数据</button>
+        <button class="act sm" type="button" id="btnStatus">刷新状态</button>
+      </div>
+      <div class="msg info" id="opMsg"></div>
     </div>
-    <div class="msg info" id="opMsg"></div>
-  </div>
 
-  <h2>账号登录</h2>
-  <div class="card">
-    <div class="hint" style="margin-top:0">
-      默认使用已保存的 DPAPI 凭据做<b>无头自动登录</b>（不弹窗口）；需要自己输账号密码时，取消勾选「无头自动登录」即可。
-      遇到手机验证码时，可以把 6 位验证码填到这里提交。账号密码和验证码不会写入状态或日志。
+    <h2>通道与明细</h2>
+    <div class="card">
+      <div class="grid">
+        <div class="kv"><span class="k">数据目录</span><span class="v mono" id="s_dir">-</span></div>
+        <div class="kv"><span class="k">COOKIE 文件</span><span class="v mono" id="s_cookie_file">-</span></div>
+        <div class="kv"><span class="k">浏览器</span><span class="v" id="s_browser">-</span></div>
+        <div class="kv"><span class="k">浏览器路径</span><span class="v mono" id="s_browser_path">-</span></div>
+      </div>
+      <div class="sep"></div>
+      <p class="hint" style="margin:0">
+        首次导入后插件会起一个无头浏览器完成 OAuth 授权（约 30 秒），之后按需取数走纯 HTTP。
+        cookie 过期时重新导出一次即可。<b>别删 <code>browser_profile</code> 目录</b> —— 里面是「信任设备」的浏览器指纹。
+      </p>
     </div>
-    <div class="row" style="margin-top:10px">
-      <button class="act primary" id="btnLoginStart">打开浏览器开始登录</button>
-      <button class="act danger" id="btnLoginCancel" disabled>取消登录</button>
-      <button class="act sm" id="btnLoginStatus">刷新登录状态</button>
-      <label class="hint" style="margin:0"><input type="checkbox" id="loginAutoTrust" checked> 自动信任此浏览器</label>
-      <label class="hint" style="margin:0"><input type="checkbox" id="loginUseAuto" checked> 无头自动登录</label>
-      <label class="hint" style="margin:0"><input type="checkbox" id="loginVisibleFallback"> 自动失败时打开可见窗口</label>
-    </div>
-    <div class="login-state">
-      <span class="left" id="loginState">未开始</span>
-      <span class="deadline" id="loginDeadline"></span>
-      <span class="hint" id="loginQuota" style="margin:0"></span>
-    </div>
-    <div class="msg info" id="loginMsg"></div>
-    <div class="row" style="margin-top:10px">
-      <input id="loginSmsCode" inputmode="numeric" autocomplete="one-time-code" maxlength="8"
-             placeholder="验证码（4~8 位）" style="width:170px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;font:13px ui-monospace,SFMono-Regular,Consolas,monospace">
-      <button class="act" id="btnLoginSms" disabled>提交验证码</button>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <button class="act sm" data-login-trust="true" disabled>信任此浏览器</button>
-      <button class="act sm" data-login-trust="false" disabled>不信任</button>
-      <button class="act sm" data-login-trust="later" disabled>稍后再说</button>
-    </div>
-    <p class="hint" id="loginHint" style="margin-bottom:0">登录会话只允许同时存在一个。</p>
-  </div>
+  </section>
 
-  <h2>账号密码登录（可选）</h2>
-  <div class="card">
-    <div class="hint" style="margin-top:0">
-      仅在你主动保存后启用账号密码模式。凭据只写入本机 Windows DPAPI 加密文件，页面不会回填密码；
-      登录区可选择无头自动登录；遇到验证码仍由 WebUI 提交，自动失败时可选择打开可见窗口兜底。
+  <!-- ================= 数据 ================= -->
+  <section class="panel" id="panel-data" role="tabpanel" aria-label="数据" hidden>
+    <div class="card">
+      <div class="ovbar">
+        <button class="act primary" type="button" id="btnOverview">拉取全部数据</button>
+        <button class="act sm" type="button" id="btnOvToggle">全部展开</button>
+        <span class="hint" id="ovAt" style="margin:0"></span>
+      </div>
+      <div class="msg" id="ovMsg"></div>
+      <div id="overview" class="ovgrid">
+        <p class="hint" style="margin:0">点「拉取全部数据」，把已接入的各类数据一次拉齐。默认只展开前三项，点标题可逐张折叠。</p>
+      </div>
     </div>
-    <div class="credential-fields">
-      <label class="credential-field">华为账号<input id="credentialAccount" autocomplete="username"></label>
-      <label class="credential-field">密码<input id="credentialPassword" type="password" autocomplete="new-password"></label>
-    </div>
-    <div class="row">
-      <button class="act primary" id="btnCredentialSave">保存并加密</button>
-      <button class="act danger" id="btnCredentialClear">清除凭据</button>
-      <button class="act sm" id="btnCredentialStatus">刷新状态</button>
-      <span class="hint" id="credentialState" style="margin:0">未读取</span>
-    </div>
-    <div class="msg" id="credentialMsg"></div>
-  </div>
+  </section>
 
-  <h2>数据概览</h2>
-  <div class="card">
-    <div class="ovbar">
-      <button class="act primary" id="btnOverview">拉取全部数据</button>
-      <button class="act sm" id="btnOvToggle">全部收起</button>
-      <span class="hint" id="ovAt" style="margin:0"></span>
+  <!-- ================= 登录 ================= -->
+  <section class="panel" id="panel-login" role="tabpanel" aria-label="登录" hidden>
+    <h2 style="margin-top:0">账号密码（可选）</h2>
+    <div class="card">
+      <div class="hint" style="margin-top:0">
+        仅在你主动保存后启用账号密码模式。凭据只写入本机 Windows DPAPI 加密文件，页面不会回填密码；
+        登录区可选择无头自动登录；遇到验证码仍由 WebUI 提交，自动失败时可选择打开可见窗口兜底。
+      </div>
+      <div class="credential-fields">
+        <label class="credential-field">华为账号<input id="credentialAccount" autocomplete="username"></label>
+        <label class="credential-field">密码<input id="credentialPassword" type="password" autocomplete="new-password"></label>
+      </div>
+      <div class="row">
+        <button class="act primary" type="button" id="btnCredentialSave">保存并加密</button>
+        <button class="act danger" type="button" id="btnCredentialClear">清除凭据</button>
+        <button class="act sm" type="button" id="btnCredentialStatus">刷新状态</button>
+        <span class="hint" id="credentialState" style="margin:0">未读取</span>
+      </div>
+      <div class="msg" id="credentialMsg"></div>
     </div>
-    <div class="msg" id="ovMsg"></div>
-    <div id="overview" class="ovgrid">
-      <p class="hint" style="margin:0">点「拉取全部数据」，把已接入的各类数据一次拉齐。</p>
-    </div>
-  </div>
 
-  <h2>重新导入 Cookie</h2>
-  <div class="card">
-    <div class="hint" style="margin-top:0">
-      推荐按下面六项填写 cookie 值；CASTGC、sid、hwid_cas_sid 从 <code>id1.cloud.huawei.com</code> 域查看，
-      其余三项从健康页面查看。也可继续把 Cookie-Editor 导出的整段 JSON 粘到下方。
+    <h2>Cookie（导入 · 清除 · 明细）</h2>
+    <div class="card">
+      <div class="hint" style="margin-top:0">
+        推荐按下面六项填写 cookie 值；CASTGC、sid、hwid_cas_sid 从 <code>id1.cloud.huawei.com</code> 域查看，
+        其余三项从健康页面查看。也可继续把 Cookie-Editor 导出的整段 JSON 粘到下方。
+      </div>
+      <div class="cookie-fields">
+        <label class="cookie-field">CASTGC（自动生成两个路径）<input id="cookie_CASTGC" autocomplete="off"></label>
+        <label class="cookie-field">sid<input id="cookie_sid" autocomplete="off"></label>
+        <label class="cookie-field">hwid_cas_sid<input id="cookie_hwid_cas_sid" autocomplete="off"></label>
+        <label class="cookie-field">HuaweiID_CAS_ISCASLOGIN<input id="cookie_HuaweiID_CAS_ISCASLOGIN" autocomplete="off"></label>
+        <label class="cookie-field">CASLOGINSITE<input id="cookie_CASLOGINSITE" autocomplete="off"></label>
+        <label class="cookie-field">LOGINACCSITE<input id="cookie_LOGINACCSITE" autocomplete="off"></label>
+      </div>
+      <textarea id="cookieBox" placeholder='[{"domain":".huawei.com","name":"sid","value":"...","path":"/","secure":true,"httpOnly":true,"sameSite":"no_restriction","expirationDate":1792669201}]'></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="act primary" type="button" id="btnImport">导入</button>
+        <button class="act danger" type="button" id="btnClear">清除 cookie</button>
+      </div>
+      <div class="msg" id="ckMsg"></div>
+      <div class="sep"></div>
+      <div class="kv"><span class="k">关键 COOKIE 明细</span></div>
+      <div id="s_keys"><p class="hint" style="margin:0">尚未读取。</p></div>
     </div>
-    <div class="cookie-fields">
-      <label class="cookie-field">CASTGC（自动生成两个路径）<input id="cookie_CASTGC" autocomplete="off"></label>
-      <label class="cookie-field">sid<input id="cookie_sid" autocomplete="off"></label>
-      <label class="cookie-field">hwid_cas_sid<input id="cookie_hwid_cas_sid" autocomplete="off"></label>
-      <label class="cookie-field">HuaweiID_CAS_ISCASLOGIN<input id="cookie_HuaweiID_CAS_ISCASLOGIN" autocomplete="off"></label>
-      <label class="cookie-field">CASLOGINSITE<input id="cookie_CASLOGINSITE" autocomplete="off"></label>
-      <label class="cookie-field">LOGINACCSITE<input id="cookie_LOGINACCSITE" autocomplete="off"></label>
-    </div>
-    <textarea id="cookieBox" placeholder='[{"domain":".huawei.com","name":"sid","value":"...","path":"/","secure":true,"httpOnly":true,"sameSite":"no_restriction","expirationDate":1792669201}]'></textarea>
-    <div class="row" style="margin-top:10px">
-      <button class="act primary" id="btnImport">导入</button>
-      <button class="act danger" id="btnClear">清除 cookie</button>
-    </div>
-    <div class="msg" id="ckMsg"></div>
-  </div>
 
-  <p class="hint">
-    首次导入后插件会起一个无头浏览器完成 OAuth 授权（约 30 秒），之后按需取数走纯 HTTP。
-    cookie 过期时重新导出一次即可。<b>别删 <code>browser_profile</code> 目录</b> —— 里面是「信任设备」的浏览器指纹。
-  </p>
+    <h2>手动登录</h2>
+    <div class="card">
+      <div class="hint" style="margin-top:0">
+        默认使用已保存的 DPAPI 凭据做<b>无头自动登录</b>（不弹窗口）；需要自己输账号密码时，取消勾选「无头自动登录」即可。
+        遇到手机验证码时，可以把 4~8 位验证码填到这里提交。账号密码和验证码不会写入状态或日志。
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="act primary" type="button" id="btnLoginStart">打开浏览器开始登录</button>
+        <button class="act danger" type="button" id="btnLoginCancel" disabled>取消登录</button>
+        <button class="act sm" type="button" id="btnLoginStatus">刷新登录状态</button>
+        <label class="hint" style="margin:0"><input type="checkbox" id="loginAutoTrust" checked> 自动信任此浏览器</label>
+        <label class="hint" style="margin:0"><input type="checkbox" id="loginUseAuto" checked> 无头自动登录</label>
+        <label class="hint" style="margin:0"><input type="checkbox" id="loginVisibleFallback"> 自动失败时打开可见窗口</label>
+      </div>
+      <div class="login-state">
+        <span class="left" id="loginState">未开始</span>
+        <span class="deadline" id="loginDeadline"></span>
+        <span class="hint" id="loginQuota" style="margin:0"></span>
+      </div>
+      <div class="msg info" id="loginMsg"></div>
+      <div class="row" style="margin-top:10px">
+        <input id="loginSmsCode" inputmode="numeric" autocomplete="one-time-code" maxlength="8"
+               placeholder="验证码（4~8 位）" style="width:170px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace">
+        <button class="act" type="button" id="btnLoginSms" disabled>提交验证码</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="act sm" type="button" data-login-trust="true" disabled>信任此浏览器</button>
+        <button class="act sm" type="button" data-login-trust="false" disabled>不信任</button>
+        <button class="act sm" type="button" data-login-trust="later" disabled>稍后再说</button>
+      </div>
+      <p class="hint" id="loginHint" style="margin-bottom:0">登录会话只允许同时存在一个。</p>
+    </div>
+  </section>
+
+  <!-- ================= 设置 ================= -->
+  <section class="panel" id="panel-config" role="tabpanel" aria-label="设置" hidden>
+    <div class="card">
+      <div class="cfg-bar">
+        <button class="act primary" type="button" id="btnCfgSave" disabled>保存修改</button>
+        <button class="act" type="button" id="btnCfgReload">重新读取</button>
+        <button class="act sm" type="button" id="btnCfgReset">放弃修改</button>
+        <span class="hint" id="cfgDirty" style="margin:0"></span>
+      </div>
+      <div class="hint" id="cfgState" style="margin-top:8px">未读取</div>
+      <div class="msg" id="cfgMsg"></div>
+    </div>
+    <div id="cfgForm">
+      <p class="hint">正在等待配置读取…</p>
+    </div>
+  </section>
+
+  <!-- ================= 诊断 ================= -->
+  <section class="panel" id="panel-diag" role="tabpanel" aria-label="诊断" hidden>
+    <div class="diag">
+      <span id="diagSum"><span class="dot warn"></span>连接方式检测中…</span>
+      <button class="act sm" type="button" id="btnReconnect" style="margin-left:auto">重连</button>
+      <button class="act sm" type="button" id="btnDiag">展开详情</button>
+    </div>
+    <div id="diagBox" style="display:none">
+      <pre id="diagText">-</pre>
+      <h2>最近日志尾</h2>
+      <pre id="diagLog">（暂无）</pre>
+    </div>
+  </section>
 </div>
+
+<div id="toast" role="status" aria-live="polite"></div>
 
 <!-- bridge SDK：AstrBot 会在响应时把它重写成带 asset_token 的完整 URL -->
 <script src="/api/plugin/page/bridge-sdk.js"></script>
@@ -244,15 +393,68 @@
 "use strict";
 
 const $ = id => document.getElementById(id);
+const $all = sel => Array.prototype.slice.call(document.querySelectorAll(sel));
+const MASK = "***";
+
 const DIAG = {
   hasBridge: false, inIframe: false, mode: "-", token: "",
   bridgeSrc: "-", bridgeProbe: "-", lastReq: "-", lastErr: "-",
 };
+const LOG = [];
 let bridge = null;
 let mode = "direct";
 
-/* ---------- 工具 ---------- */
+/* ---------- 小工具 ---------- */
+function el(tag, cls, text){
+  const node = document.createElement(tag);
+  if(cls) node.className = cls;
+  if(text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+}
+function dot(kind){ return el("span", "dot " + kind); }
+function textNode(text){ return document.createTextNode(String(text)); }
+function setMsg(node, text, cls){
+  if(!node) return;
+  node.className = "msg " + (cls || "info");
+  node.textContent = text || "";
+}
 function inIframe(){ try{ return window.self !== window.top; }catch(e){ return true; } }
+
+/* 折叠箭头：内联 SVG，不用字符图标。 */
+function chevron(){
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 12 12");
+  svg.setAttribute("class", "caret");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", "M2 4l4 4 4-4");
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", "1.6");
+  path.setAttribute("stroke-linecap", "round");
+  svg.appendChild(path);
+  return svg;
+}
+
+let toastTimer = null;
+function toast(text, kind){
+  const node = $("toast");
+  if(!node) return;
+  node.className = "toast show " + (kind || "info");
+  node.textContent = text;
+  if(toastTimer) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => { node.className = "toast"; }, 4200);
+}
+
+/* 诊断用「最近日志尾」：内存环形缓冲，最多 40 条。 */
+function pushLog(level, text){
+  const ts = new Date().toTimeString().slice(0, 8);
+  LOG.unshift(ts + " [" + level + "] " + String(text).slice(0, 240));
+  if(LOG.length > 40) LOG.length = 40;
+  const box = $("diagLog");
+  if(box) box.textContent = LOG.length ? LOG.join("\n") : "（暂无）";
+}
 
 function assetToken(){
   try{
@@ -265,15 +467,23 @@ function assetToken(){
 const TOKEN = assetToken();
 
 function record(what, err){
-  DIAG.lastReq = what || DIAG.lastReq;
-  if(err) DIAG.lastErr = String(err && err.message ? err.message : err).slice(0, 300);
+  if(what) DIAG.lastReq = what;
+  if(err){
+    DIAG.lastErr = String(err && err.message ? err.message : err).slice(0, 300);
+    pushLog("err", DIAG.lastErr);
+  }
 }
 
 /* AstrBot 插件 API 的响应约定是 {status, message, data}，bridge 通常直接给 data；
-   两种形态都兼容，免得再踩一次。 */
+   两种形态都兼容。错误分支把 field / HTTP 码一并挂到 Error 上，供设置页定位控件。 */
 function unwrap(r){
   if(r && typeof r === "object" && !Array.isArray(r) && "status" in r){
-    if(r.status === "error") throw new Error(r.message || "接口返回错误");
+    if(r.status === "error"){
+      const err = new Error(r.message || "接口返回错误");
+      if(r.field) err.field = r.field;
+      err.payload = r;
+      throw err;
+    }
     if("data" in r) return r.data;
   }
   return r;
@@ -290,8 +500,17 @@ async function directApi(path, method, body){
   const r = await fetch(url, opt);
   if(!r.ok){
     let m = "HTTP " + r.status;
-    try{ const j = await r.json(); if(j && (j.message || j.msg)) m = j.message || j.msg; }catch(e){}
+    let payload = null;
+    try{
+      payload = await r.json();
+      if(payload && (payload.message || payload.msg)) m = payload.message || payload.msg;
+    }catch(e){}
     const err = new Error(m);
+    err.httpStatus = r.status;
+    if(payload && typeof payload === "object"){
+      if(payload.field) err.field = payload.field;
+      err.payload = payload;
+    }
     record(null, err);
     throw err;
   }
@@ -322,8 +541,8 @@ async function selectMode(force){
   DIAG.inIframe = inIframe();
   bridge = window.AstrBotPluginPage || window.AstrBotPluginView || null;
 
-  if(!DIAG.inIframe){ mode = "direct"; DIAG.mode = mode; return "独立窗口 → 直连"; }
-  if(!bridge){ mode = "direct"; DIAG.mode = mode; return "iframe 内但 bridge 未加载 → 直连"; }
+  if(!DIAG.inIframe){ mode = "direct"; DIAG.mode = mode; return "独立窗口，走直连"; }
+  if(!bridge){ mode = "direct"; DIAG.mode = mode; return "iframe 内但 bridge 未加载，降级直连"; }
   try{
     await Promise.race([
       bridge.ready(),
@@ -331,26 +550,40 @@ async function selectMode(force){
     ]);
     mode = "bridge";
     DIAG.mode = mode;
-    return "iframe + bridge → 桥接";
+    return "iframe + bridge，走桥接";
   }catch(e){
     record(null, e);
     mode = "direct";
     DIAG.mode = mode;
-    return "bridge 未就绪（" + e.message + "）→ 直连";
+    return "bridge 未就绪（" + e.message + "），降级直连";
+  }
+}
+
+async function probeBridgeScript(){
+  const el2 = document.querySelector('script[src*="bridge-sdk"]');
+  DIAG.bridgeSrc = el2 ? el2.src.slice(0, 180) : "页面上没找到 bridge-sdk 标签";
+  DIAG.bridgeProbe = "-";
+  if(!el2) return;
+  try{
+    const r = await fetch(el2.src, { credentials:"include" });
+    DIAG.bridgeProbe = "HTTP " + r.status + (r.ok ? "（脚本可取）" : "（脚本取不到）");
+  }catch(e){
+    DIAG.bridgeProbe = "请求失败：" + e.message;
   }
 }
 
 /* ---------- 诊断 ---------- */
 function renderDiag(summary){
   const okBridge = DIAG.mode === "bridge";
-  // summary 里可能带 bridge.ready() 的 e.message，用 DOM API 赋值而不是 innerHTML。
+  // summary 里可能带 bridge.ready() 的 e.message，用 DOM API 赋值而不是拼 HTML。
   $("diagSum").replaceChildren();
-  const dot = document.createElement("span");
-  dot.className = "dot " + (okBridge ? "ok" : "warn");
-  $("diagSum").appendChild(dot);
+  const dotNode = document.createElement("span");
+  dotNode.className = "dot " + (okBridge ? "ok" : "warn");
+  $("diagSum").appendChild(dotNode);
   const tail = document.createElement("span");
   tail.textContent = "当前通道：" + DIAG.mode + "　" + (summary || "");
   $("diagSum").appendChild(tail);
+
   $("diagText").textContent = [
     "页面地址      : " + location.href.slice(0, 200),
     "运行环境      : " + (DIAG.inIframe ? "iframe（父窗口 = AstrBot WebUI）" : "独立窗口"),
@@ -361,28 +594,23 @@ function renderDiag(summary){
     "API 模式      : " + DIAG.mode,
     "最近请求      : " + DIAG.lastReq,
     "最近错误      : " + DIAG.lastErr,
+    "未保存改动    : " + (DIRTY.size ? DIRTY.size + " 项" : "无"),
+    "配置 revision : " + (CFG.revision || "-"),
   ].join("\n");
-}
-
-async function probeBridgeScript(){
-  const el = document.querySelector('script[src*="bridge-sdk"]');
-  DIAG.bridgeSrc = el ? el.src.slice(0, 180) : "页面上没找到 bridge-sdk 标签";
-  if(!el) return;
-  try{
-    const r = await fetch(el.src, { credentials:"include" });
-    DIAG.bridgeProbe = "HTTP " + r.status + (r.ok ? "（脚本可取）" : "（脚本取不到）");
-  }catch(e){
-    DIAG.bridgeProbe = "请求失败：" + e.message;
-  }
+  const logBox = $("diagLog");
+  if(logBox) logBox.textContent = LOG.length ? LOG.join("\n") : "（暂无）";
 }
 
 /* ---------- 主题 ---------- */
+const THEME_NAMES = { auto:"自动", light:"浅色", dark:"深色" };
 function applyTheme(t){
   if(t === "auto") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", t);
   try{ localStorage.setItem("hw_health_theme", t); }catch(e){}
+  const btn = $("themeBtn");
+  if(btn) btn.textContent = "主题：" + (THEME_NAMES[t] || "自动");
 }
-(function initTheme(){
+function initTheme(){
   let t = "auto";
   try{ t = localStorage.getItem("hw_health_theme") || "auto"; }catch(e){}
   applyTheme(t);
@@ -391,31 +619,93 @@ function applyTheme(t){
     try{ cur = localStorage.getItem("hw_health_theme") || "auto"; }catch(e){}
     applyTheme(cur === "auto" ? "light" : cur === "light" ? "dark" : "auto");
   };
-})();
+}
 
-/* ---------- 渲染 ---------- */
-function setMsg(el, text, cls){ el.className = "msg " + (cls || "info"); el.textContent = text; }
+/* ---------- Tab 切换 ---------- */
+const TAB_NAMES = ["overview", "data", "login", "config", "diag"];
+let activeTab = "overview";
 
+function switchTab(name){
+  if(TAB_NAMES.indexOf(name) < 0) name = "overview";
+  activeTab = name;
+  $all(".tab").forEach(btn => {
+    btn.setAttribute("aria-selected", btn.getAttribute("data-tab") === name ? "true" : "false");
+  });
+  TAB_NAMES.forEach(t => {
+    const panel = $("panel-" + t);
+    if(panel) panel.hidden = (t !== name);
+  });
+  if(name === "config") ensureConfig();
+  if(name === "diag") renderDiag();
+}
+
+/* ---------- 状态渲染 ---------- */
 function renderStatus(d){
-  $("ver").textContent = d.version || "v-";
+  d = d || {};
   const ck = d.cookie || {};
-  if(ck.error){ $("s_cookie").innerHTML = '<span class="dot err"></span>读取失败'; }
-  else if(!ck.exists){ $("s_cookie").innerHTML = '<span class="dot err"></span>没有，需要导入'; }
-  else { $("s_cookie").innerHTML = '<span class="dot ok"></span>' + ck.count + ' 条 · ' + ck.mtime; }
-
   const tk = d.token || {};
-  if(tk.cached && tk.left > 0){ $("s_token").innerHTML = '<span class="dot ok"></span>有效，剩 ' + tk.left + ' 秒'; }
-  else if(tk.cached){ $("s_token").innerHTML = '<span class="dot warn"></span>已过期（下次查询自动续）'; }
-  else{ $("s_token").innerHTML = '<span class="dot warn"></span>未缓存'; }
-
   const br = d.browser || {};
-  $("s_browser").innerHTML = br.found
-    ? '<span class="dot ok"></span>' + (br.path || "").split(/[\\/]/).pop()
-    : '<span class="dot err"></span>未找到';
-  $("s_browser").title = br.path || "";
+  const perm = d.permission || {};
 
-  $("s_cache").textContent = (d.cache && d.cache.count != null) ? d.cache.count + " 条" : "-";
+  $("ver").textContent = d.version || "v-";
+
+  const modeCell = $("c_mode");
+  modeCell.replaceChildren();
+  modeCell.appendChild(dot(d.login_mode === "password" ? "ok" : "warn"));
+  modeCell.appendChild(textNode(d.login_mode === "password" ? "账号密码模式" : "Cookie 模式"));
+
+  const tokCell = $("c_token");
+  tokCell.replaceChildren();
+  if(tk.cached && tk.left > 0){
+    tokCell.appendChild(dot("ok"));
+    tokCell.appendChild(textNode("有效，剩 " + tk.left + " 秒"));
+  }else if(tk.cached){
+    tokCell.appendChild(dot("warn"));
+    tokCell.appendChild(textNode("已过期（下次查询自动续）"));
+  }else{
+    tokCell.appendChild(dot("warn"));
+    tokCell.appendChild(textNode("未缓存"));
+  }
+
+  const ckCell = $("c_cookie");
+  ckCell.replaceChildren();
+  if(ck.error){
+    ckCell.appendChild(dot("err"));
+    ckCell.appendChild(textNode("读取失败"));
+  }else if(!ck.exists){
+    ckCell.appendChild(dot("err"));
+    ckCell.appendChild(textNode("没有，需要导入"));
+  }else{
+    ckCell.appendChild(dot("ok"));
+    ckCell.appendChild(textNode((ck.count || 0) + " 条 · " + (ck.mtime || "-")));
+  }
+
+  $("c_cache").textContent = (d.cache && d.cache.count != null) ? d.cache.count + " 条" : "-";
+
+  const permCell = $("c_perm");
+  permCell.replaceChildren();
+  permCell.appendChild(dot(perm.allow_private || perm.allow_group ? "ok" : "err"));
+  permCell.appendChild(textNode([
+    perm.allow_private ? "私聊允许" : "私聊禁止",
+    perm.allow_group ? "群聊允许" : "群聊禁止",
+    perm.admin_only ? "仅管理员" : "非管理员可用",
+  ].join(" · ")));
+  const extra = Number(perm.extra_umo_count || 0);
+  const bad = Array.isArray(perm.invalid_umos) ? perm.invalid_umos : [];
+  const noteBits = [];
+  if(extra) noteBits.push("额外白名单 " + extra + " 条");
+  if(bad.length) noteBits.push("不合法 UMO " + bad.length + " 条");
+  $("c_perm_note").textContent = noteBits.join(" · ");
+
   $("s_dir").textContent = d.data_dir || "-";
+  $("s_cookie_file").textContent = d.cookie_file || "-";
+
+  const brCell = $("s_browser");
+  brCell.replaceChildren();
+  brCell.appendChild(dot(br.found ? "ok" : "err"));
+  brCell.appendChild(textNode(br.found ? String(br.path || "").split(/[\\/]/).pop() : "未找到"));
+  brCell.title = br.path || "";
+  $("s_browser_path").textContent = br.path || "-";
 
   const keys = (ck.keys || []);
   // cookie 名称和域名来自本地导入文件，使用 DOM API 赋值，避免恶意值被当作 HTML 解析。
@@ -426,9 +716,7 @@ function renderStatus(d){
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
     for(const label of ["关键 cookie", "域", "路径", "到期"]){
-      const th = document.createElement("th");
-      th.textContent = label;
-      headRow.appendChild(th);
+      headRow.appendChild(el("th", "", label));
     }
     thead.appendChild(headRow);
     table.appendChild(thead);
@@ -436,17 +724,18 @@ function renderStatus(d){
     for(const k of keys){
       const row = document.createElement("tr");
       // CASTGC 有 /CAS 与 /UnifiedIDMPortal 两条，靠「路径」列区分，否则是两行同名。
-      for(const [value, className] of [[k.name, "mono"], [k.domain || "", "mono"],
-                                       [k.path || "/", "mono"], [k.expires, ""]]){
-        const td = document.createElement("td");
-        if(className) td.className = className;
-        td.textContent = value == null ? "" : String(value);
+      const cells = [[k.name, "mono"], [k.domain || "", "mono"], [k.path || "/", "mono"], [k.expires, ""]];
+      for(const pair of cells){
+        const td = el("td", pair[1] || "");
+        td.textContent = pair[0] == null ? "" : String(pair[0]);
         row.appendChild(td);
       }
       tbody.appendChild(row);
     }
     table.appendChild(tbody);
     keyBox.appendChild(table);
+  }else{
+    keyBox.appendChild(el("p", "hint", "没有关键 cookie，或尚未导入。"));
   }
 }
 
@@ -461,59 +750,77 @@ async function loadStatus(silent){
   renderDiag();
 }
 
+/* ---------- 数据概览 ---------- */
+function collapseCard(card, collapsed){
+  card.classList.toggle("collapsed", collapsed);
+}
+
+function syncOvToggle(){
+  const cards = $all("#overview .ovcard");
+  const btn = $("btnOvToggle");
+  if(!btn) return;
+  const anyOpen = cards.some(c => !c.classList.contains("collapsed"));
+  btn.textContent = anyOpen ? "全部收起" : "全部展开";
+}
+
 function renderOverview(d){
   const box = $("overview");
-  box.innerHTML = "";
+  box.replaceChildren();
   const items = (d && d.items) || [];
   if(!items.length){
-    box.innerHTML = '<p class="hint" style="margin:0">没有拿到任何数据项。</p>';
+    box.appendChild(el("p", "hint", "没有拿到任何数据项。"));
+    $("ovAt").textContent = "";
     return;
   }
-  for(const it of items){
-    const div = document.createElement("div");
-    div.className = "ovcard" + (it.ok ? "" : " bad");
-    const h = document.createElement("h3");
+  items.forEach((it, idx) => {
+    const card = el("div", "ovcard" + (it.ok ? "" : " bad"));
+    const head = document.createElement("h3");
+    head.appendChild(dot(it.ok ? "ok" : "err"));
     // 标题当前来自服务端常量，但仍用 textContent，避免未来接入动态数据后形成注入面。
-    const dot = document.createElement("span");
-    dot.className = "dot " + (it.ok ? "ok" : "err");
-    h.appendChild(dot);
-    const title = document.createElement("span");
-    title.textContent = it.title || it.key || "";
-    h.appendChild(title);
-    const caret = document.createElement("span");
-    caret.className = "caret";
-    caret.textContent = "▾";
-    h.appendChild(caret);
-    const pre = document.createElement("pre");
-    pre.textContent = it.text || "-";
-    // 点标题即可折叠单张卡片，数据多时方便逐项浏览。
-    h.addEventListener("click", () => {
-      const collapsed = div.classList.toggle("collapsed");
-      caret.textContent = collapsed ? "▸" : "▾";
+    head.appendChild(el("span", "", it.title || it.key || ""));
+    head.appendChild(chevron());
+    const pre = el("pre", "", it.text || "-");
+    // 默认只展开前 3 项，其余折叠，避免一屏被 9 张卡片淹没。
+    if(idx >= 3) collapseCard(card, true);
+    head.addEventListener("click", () => {
+      collapseCard(card, !card.classList.contains("collapsed"));
+      syncOvToggle();
     });
-    div.appendChild(h);
-    div.appendChild(pre);
-    box.appendChild(div);
-  }
+    card.appendChild(head);
+    card.appendChild(pre);
+    box.appendChild(card);
+  });
   $("ovAt").textContent = d.at ? "取数时间 " + d.at : "";
+  syncOvToggle();
 }
 
 async function doOverview(){
-  const b = $("btnOverview"); b.disabled = true;
+  const b = $("btnOverview");
+  const bq = $("btnOverviewQuick");
+  if(b) b.disabled = true;
+  if(bq) bq.disabled = true;
+  switchTab("data");
   setMsg($("ovMsg"), "正在从华为云端拉取全部数据…（首次可能需要 30 秒走一次自动认证）", "info");
-  $("overview").innerHTML = '<p class="hint" style="margin:0">取数中…</p>';
+  $("overview").replaceChildren(el("p", "hint", "取数中…"));
   try{
     const d = unwrap(await apiGet("overview")) || {};
     renderOverview(d);
     setMsg($("ovMsg"), "取数完成", "ok");
+    pushLog("ok", "数据概览已拉取");
     loadStatus(true);
   }catch(e){
-    $("overview").innerHTML = '<p class="hint" style="margin:0">取数失败。</p>';
+    $("overview").replaceChildren(el("p", "hint", "取数失败。"));
     setMsg($("ovMsg"), "取数失败：" + e.message, "err");
-  }finally{ b.disabled = false; renderDiag(); }
+  }finally{
+    if(b) b.disabled = false;
+    if(bq) bq.disabled = false;
+    renderDiag();
+  }
 }
 
 async function doRefresh(){
+  // §5.2：清缓存属于危险操作，必须二次确认。
+  if(!confirm("确定清空 token 与已缓存的健康数据并重新认证？\n下次取数需要重新走一次认证（首次约 30 秒）。")) return;
   const b = $("btnRefresh"); b.disabled = true;
   setMsg($("opMsg"), "正在清缓存并重新认证…", "info");
   try{
@@ -524,7 +831,7 @@ async function doRefresh(){
   finally{ b.disabled = false; renderDiag(); }
 }
 
-/* ---------- 账号登录（第 4 阶段：自动登录与降级） ---------- */
+/* ---------- 账号登录 ---------- */
 let loginPollTimer = null;
 let loginAutoTouched = false;
 
@@ -546,7 +853,7 @@ function renderLoginStatus(d){
   const need = d.need || {};
   $("loginSmsCode").disabled = !need.sms;
   $("btnLoginSms").disabled = !need.sms;
-  document.querySelectorAll("[data-login-trust]").forEach(btn => { btn.disabled = !need.trust; });
+  $all("[data-login-trust]").forEach(btn => { btn.disabled = !need.trust; });
   if(typeof d.auto_trust === "boolean") $("loginAutoTrust").checked = d.auto_trust;
   // 未手动改过时跟随服务端保存的偏好；用户改过就不再覆盖，避免 2 秒轮询把勾选弹回去。
   if(typeof d.prefer_auto === "boolean" && !loginAutoTouched) $("loginUseAuto").checked = d.prefer_auto;
@@ -618,8 +925,7 @@ async function doLoginSms(){
 }
 
 async function doLoginTrust(choice){
-  const buttons = document.querySelectorAll("[data-login-trust]");
-  buttons.forEach(btn => { btn.disabled = true; });
+  $all("[data-login-trust]").forEach(btn => { btn.disabled = true; });
   try{
     const d = unwrap(await apiPost("login/trust", {trust:choice})) || {};
     renderLoginStatus(d);
@@ -628,22 +934,22 @@ async function doLoginTrust(choice){
   finally{ loadLoginStatus(true); renderDiag(); }
 }
 
-/* ---------- 账号凭据（第 3 阶段：只写 + DPAPI 状态） ---------- */
+/* ---------- 账号凭据 ---------- */
 function renderCredentialsStatus(d){
   d = d || {};
-  const mode = d.mode === "password" ? "账号密码模式" : "Cookie 模式";
+  const modeText = d.mode === "password" ? "账号密码模式" : "Cookie 模式";
   const state = d.state || (d.password_set ? "ok" : "absent");
+  // 不再把「文件损坏 / 被占用」谎报成「未保存」——否则用户会反复保存却永远登不上。
   if(state === "corrupt" || state === "locked" || state === "unavailable"){
-    // 不再把「文件损坏 / 被占用」谎报成「未保存」——否则用户会反复保存却永远登不上。
-    $("credentialState").textContent = mode + " · " + (d.error || "凭据不可用");
+    $("credentialState").textContent = modeText + " · " + (d.error || "凭据不可用");
     return;
   }
   if(d.password_set){
     const account = d.account_masked || "已保存账号";
     const at = d.updated_at && d.updated_at !== "-" ? " · " + d.updated_at : "";
-    $("credentialState").textContent = mode + " · " + account + at;
+    $("credentialState").textContent = modeText + " · " + account + at;
   }else{
-    $("credentialState").textContent = mode + " · 未保存账号密码";
+    $("credentialState").textContent = modeText + " · 未保存账号密码";
   }
 }
 
@@ -688,6 +994,7 @@ async function doCredentialClear(){
   finally{ b.disabled = false; loadCredentialsStatus(true); renderDiag(); }
 }
 
+/* ---------- Cookie 导入 / 清除 ---------- */
 async function doImport(){
   const text = $("cookieBox").value.trim();
   const fieldIds = ["CASTGC", "sid", "hwid_cas_sid", "HuaweiID_CAS_ISCASLOGIN", "CASLOGINSITE", "LOGINACCSITE"];
@@ -719,55 +1026,641 @@ async function doClear(){
     setMsg($("ckMsg"), d.message || "cookie 已清除", "ok");
     loadStatus(true);
   }catch(e){ setMsg($("ckMsg"), "失败：" + e.message, "err"); }
-  finally{ b.disabled = false; }
+  finally{ b.disabled = false; renderDiag(); }
 }
 
-/* ---------- 启动 ---------- */
-(async function(){
+/* ================================================================
+   设置 Tab：schema 驱动表单
+   - 控件全部由 GET config 的 schema 生成（bool/int/float/string/text/list/object）
+   - 分组只是展示分组；schema 里没列到的 key 自动进「其他」
+   - 敏感项：不回显、type=password、未修改绝不回传
+   - 保存只发脏字段；成功后用响应里的 values/meta 刷新
+   ================================================================ */
+
+const CFG = { values: {}, schema: {}, meta: {}, revision: "", loaded: false, loading: false };
+const DIRTY = new Map();   // 叶子路径 -> 待提交值
+const CTRL = new Map();    // 叶子路径 -> 控件适配器 {set, get, markErr, clearErr}
+
+const CFG_GROUPS = [
+  { title: "登录与凭据", parts: [
+      { title: "Cookie 导入入口（整段 JSON）", keys: ["cookie_json"] },
+      { title: "Cookie 分项值（留空表示不修改）", keys: [
+          "cookie_CASTGC", "cookie_sid", "cookie_hwid_cas_sid",
+          "cookie_HuaweiID_CAS_ISCASLOGIN", "cookie_CASLOGINSITE", "cookie_LOGINACCSITE"] },
+      { title: "浏览器与登录行为", keys: ["browser_path", "headless", "page_timeout", "login_daily_limit"] },
+  ] },
+  { title: "数据与缓存", parts: [
+      { keys: ["token_ttl", "data_ttl", "timezone", "warmup"] },
+  ] },
+  { title: "权限与可见范围", parts: [
+      { keys: ["permission_settings"] },
+  ] },
+  { title: "高级", parts: [
+      { keys: ["client_id", "api_version"] },
+  ] },
+];
+
+function getValue(path){
+  let cur = CFG.values;
+  const parts = String(path).split(".");
+  for(const part of parts){
+    if(cur === null || cur === undefined || typeof cur !== "object") return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+function setByPath(target, path, value){
+  const parts = String(path).split(".");
+  let cur = target;
+  for(let i = 0; i < parts.length - 1; i++){
+    const k = parts[i];
+    if(!cur[k] || typeof cur[k] !== "object" || Array.isArray(cur[k])) cur[k] = {};
+    cur = cur[k];
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+function metaSensitiveList(){
+  return (CFG.meta && Array.isArray(CFG.meta.sensitive)) ? CFG.meta.sensitive : [];
+}
+function isSensitive(key){
+  if(metaSensitiveList().indexOf(key) >= 0) return true;
+  return /^cookie_/.test(String(key));
+}
+function hasValue(key){
+  const hv = (CFG.meta && CFG.meta.has_value && typeof CFG.meta.has_value === "object") ? CFG.meta.has_value : {};
+  return hv[key] === true;
+}
+function boundsFor(path, key){
+  const b = (CFG.meta && CFG.meta.bounds && typeof CFG.meta.bounds === "object") ? CFG.meta.bounds : {};
+  const hit = b[path] || b[key];
+  if(Array.isArray(hit) && hit.length === 2) return hit;
+  return null;
+}
+
+function markDirtyUI(){
+  const n = DIRTY.size;
+  const node = $("cfgDirty");
+  if(node) node.textContent = n ? ("未保存修改 " + n + " 项") : "";
+  const btn = $("btnCfgSave");
+  if(btn) btn.disabled = n === 0;
+}
+function setDirty(path, value){
+  DIRTY.set(path, value);
+  markDirtyUI();
+}
+function clearDirtyFor(path){
+  if(DIRTY.delete(path)) markDirtyUI();
+}
+
+function updateCfgState(){
+  const meta = CFG.meta || {};
+  const bits = [];
+  bits.push((meta.updated_at && meta.updated_at !== "-") ? "更新于 " + meta.updated_at : "更新时间未知");
+  if(meta.source) bits.push("来源 " + meta.source);
+  if(CFG.revision) bits.push("revision " + String(CFG.revision).slice(0, 40));
+  const node = $("cfgState");
+  if(node){
+    node.textContent = bits.join(" · ") || "已读取";
+    node.title = CFG.revision ? String(CFG.revision) : "";
+  }
+}
+
+function clearFieldErrors(){
+  $all(".field.field-err").forEach(node => node.classList.remove("field-err"));
+  $all(".field-err-text").forEach(node => { node.textContent = ""; });
+}
+
+/* 控件外壳：标题（description）+ 键名 + 说明（hint）+ 控件槽 + 错误行。 */
+function fieldShell(path, node, key){
+  const field = el("div", "field");
+  field.setAttribute("data-path", path);
+  const head = el("div", "field-head");
+  head.appendChild(el("div", "field-label", node.description || key));
+  head.appendChild(el("span", "field-key", path));
+  field.appendChild(head);
+  if(node.hint) field.appendChild(el("div", "field-hint", node.hint));
+  const errText = el("div", "field-err-text");
+  field.appendChild(errText);
+  return {
+    field: field,
+    head: head,
+    mount(control){ field.insertBefore(control, errText); },
+    note(text){
+      const tip = el("div", "field-hint", text);
+      field.insertBefore(tip, errText);
+    },
+    markErr(msg){ field.classList.add("field-err"); errText.textContent = msg || "该项校验失败"; },
+    clearErr(){ field.classList.remove("field-err"); errText.textContent = ""; },
+  };
+}
+
+function buildControl(path, node, key, depth){
+  node = node || {};
+  const type = String(node.type || "string").toLowerCase();
+  if(type === "object") return buildObjectControl(path, node, key, depth);
+  if(type === "list") return buildListControl(path, node, key, depth);
+
+  const shell = fieldShell(path, node, key);
+  const sensitive = isSensitive(key);
+  if(sensitive){
+    shell.head.appendChild(el("span", "chip" + (hasValue(key) ? " on" : ""), hasValue(key) ? "已配置" : "未配置"));
+  }
+  const bounds = boundsFor(path, key);
+  let adapter = null;
+
+  if(type === "bool"){
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = getValue(path) === true;
+    const line = el("label", "check-line");
+    const stateText = el("span", "", input.checked ? "已开启" : "已关闭");
+    const sync = () => { stateText.textContent = input.checked ? "已开启" : "已关闭"; };
+    input.addEventListener("change", () => {
+      sync();
+      setDirty(path, input.checked);
+    });
+    line.appendChild(input);
+    line.appendChild(stateText);
+    shell.mount(line);
+    adapter = {
+      set(v){ input.checked = (v === true); sync(); },
+      get(){ return input.checked; },
+    };
+  }else if(type === "int" || type === "float" || type === "number"){
+    const input = document.createElement("input");
+    input.type = "number";
+    input.className = "field-input num";
+    input.step = (type === "int") ? "1" : "any";
+    if(bounds){ input.min = String(bounds[0]); input.max = String(bounds[1]); }
+    const cur = getValue(path);
+    input.value = (cur === null || cur === undefined) ? "" : String(cur);
+    input.addEventListener("input", () => {
+      const raw = String(input.value || "").trim();
+      if(!raw){ clearDirtyFor(path); return; }
+      const num = Number(raw);
+      if(!isFinite(num)){ clearDirtyFor(path); return; }
+      setDirty(path, (type === "int") ? Math.trunc(num) : num);
+    });
+    shell.mount(input);
+    if(bounds) shell.field.appendChild(el("div", "field-hint", "允许范围 " + bounds[0] + " ~ " + bounds[1] + "，超出会被服务端按上下限调整。"));
+    adapter = {
+      set(v){ input.value = (v === null || v === undefined) ? "" : String(v); },
+      get(){ return input.value; },
+    };
+  }else if(type === "text"){
+    const area = document.createElement("textarea");
+    area.className = "field-input";
+    if(sensitive){
+      area.value = "";
+      area.placeholder = hasValue(key) ? "已配置（敏感值不回显，留空表示不修改）" : "未配置，粘贴后保存";
+      area.addEventListener("input", () => {
+        const v = area.value;
+        if(!v || v === MASK) clearDirtyFor(path);
+        else setDirty(path, v);
+      });
+    }else{
+      const cur = getValue(path);
+      area.value = (cur === null || cur === undefined) ? "" : String(cur);
+      area.addEventListener("input", () => setDirty(path, area.value));
+    }
+    shell.mount(area);
+    if(sensitive) shell.note("敏感项：不会回显已保存的值；留空提交表示不修改，不会清空配置。");
+    adapter = {
+      set(v){ area.value = (v === null || v === undefined) ? "" : String(v); },
+      get(){ return area.value; },
+    };
+  }else{
+    const input = document.createElement("input");
+    input.className = "field-input";
+    input.type = sensitive ? "password" : "text";
+    input.autocomplete = sensitive ? "new-password" : "off";
+    if(sensitive){
+      input.value = "";
+      input.placeholder = hasValue(key) ? "已配置（敏感值不回显，留空表示不修改）" : "未配置，输入后保存";
+      input.addEventListener("input", () => {
+        const v = input.value;
+        if(!v || v === MASK) clearDirtyFor(path);
+        else setDirty(path, v);
+      });
+      const toggle = el("button", "act sm", "显示");
+      toggle.type = "button";
+      toggle.addEventListener("click", () => {
+        const show = input.type === "password";
+        input.type = show ? "text" : "password";
+        toggle.textContent = show ? "隐藏" : "显示";
+      });
+      const line = el("div", "row");
+      line.appendChild(input);
+      line.appendChild(toggle);
+      shell.mount(line);
+      shell.note("敏感项：不会回显已保存的值；留空提交表示不修改，不会清空配置。");
+    }else{
+      const cur = getValue(path);
+      input.value = (cur === null || cur === undefined) ? "" : String(cur);
+      input.addEventListener("input", () => setDirty(path, input.value));
+      shell.mount(input);
+    }
+    adapter = {
+      set(v){ input.value = (v === null || v === undefined) ? "" : String(v); },
+      get(){ return input.value; },
+    };
+  }
+
+  const finalAdapter = {
+    set: v => { if(adapter && adapter.set) adapter.set(v); },
+    get: () => (adapter && adapter.get ? adapter.get() : undefined),
+    markErr: msg => shell.markErr(msg),
+    clearErr: () => shell.clearErr(),
+  };
+  CTRL.set(path, finalAdapter);
+  return shell.field;
+}
+
+function buildObjectControl(path, node, key, depth){
+  const wrap = el("div", "field field-object");
+  wrap.setAttribute("data-path", path);
+  const head = el("div", "field-head");
+  head.appendChild(el("div", "field-label", node.description || key));
+  head.appendChild(el("span", "field-key", path));
+  wrap.appendChild(head);
+  if(node.hint) wrap.appendChild(el("div", "field-hint", node.hint));
+  const errText = el("div", "field-err-text");
+  const body = el("div", "fields");
+  const items = (node.items && typeof node.items === "object") ? node.items : {};
+  for(const subKey of Object.keys(items)){
+    const child = buildControl(path + "." + subKey, items[subKey], subKey, depth + 1);
+    if(child) body.appendChild(child);
+  }
+  // schema 的 items 没列到、但配置里已经存在的子键也不许丢。
+  const cur = getValue(path);
+  if(cur && typeof cur === "object" && !Array.isArray(cur)){
+    for(const subKey of Object.keys(cur)){
+      if(items[subKey]) continue;
+      const probe = cur[subKey];
+      const guessed = Array.isArray(probe) ? "list"
+        : (typeof probe === "boolean") ? "bool"
+        : (typeof probe === "number") ? "int" : "string";
+      const child = buildControl(path + "." + subKey, { type: guessed, description: subKey }, subKey, depth + 1);
+      if(child) body.appendChild(child);
+    }
+  }
+  wrap.appendChild(body);
+  wrap.appendChild(errText);
+  CTRL.set(path, {
+    set(){},
+    get(){ return undefined; },
+    markErr(msg){ wrap.classList.add("field-err"); errText.textContent = msg || "该项校验失败"; },
+    clearErr(){ wrap.classList.remove("field-err"); errText.textContent = ""; },
+  });
+  return wrap;
+}
+
+const UMO_RE = /^[^\s:]+:[^\s:]+:[^\s]+$/;
+
+function buildListControl(path, node, key, depth){
+  const shell = fieldShell(path, node, key);
+  let items = [];
+  const cur = getValue(path);
+  if(Array.isArray(cur)) items = cur.slice();
+  const baseline = JSON.stringify(Array.isArray(cur) ? cur : []);
+
+  const box = el("div", "taglist");
+  const tags = el("span", "tags");
+  tags.style.display = "contents";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.autocomplete = "off";
+  input.placeholder = "输入后回车添加";
+
+  function commit(){
+    if(JSON.stringify(items) === baseline) clearDirtyFor(path);
+    else setDirty(path, items.slice());
+  }
+  function renderTags(focusInput){
+    tags.replaceChildren();
+    items.forEach((item, idx) => {
+      const tag = el("span", "tag" + (UMO_RE.test(String(item)) ? "" : " bad"));
+      tag.appendChild(el("span", "tag-txt", item));
+      const x = el("button", "tag-x", "\u00d7");
+      x.type = "button";
+      x.title = "删除这一条";
+      x.addEventListener("click", () => {
+        items.splice(idx, 1);
+        renderTags(false);
+        commit();
+      });
+      tag.appendChild(x);
+      tags.appendChild(tag);
+    });
+    if(focusInput) input.focus();
+  }
+  input.addEventListener("keydown", ev => {
+    if(ev.key !== "Enter") return;
+    ev.preventDefault();
+    const value = String(input.value || "").trim();
+    if(!value) return;
+    if(items.indexOf(value) < 0) items.push(value);
+    input.value = "";
+    renderTags(true);
+    commit();
+  });
+  box.appendChild(tags);
+  box.appendChild(input);
+  shell.mount(box);
+  if(!node.hint){
+    const tip = el("div", "field-hint", "每项回车添加；点右侧叉删除。");
+    shell.field.insertBefore(tip, shell.field.querySelector(".field-err-text"));
+  }
+  renderTags(false);
+
+  CTRL.set(path, {
+    set(v){ items = Array.isArray(v) ? v.slice() : []; renderTags(false); },
+    get(){ return items.slice(); },
+    markErr(msg){ shell.markErr(msg); },
+    clearErr(){ shell.clearErr(); },
+  });
+  return shell.field;
+}
+
+function renderConfig(){
+  const form = $("cfgForm");
+  form.replaceChildren();
+  CTRL.clear();
+  const schema = CFG.schema || {};
+  const schemaKeys = Object.keys(schema);
+  if(!schemaKeys.length){
+    form.appendChild(el("p", "hint", "没有拿到配置 schema，无法生成表单。点「重新读取」重试。"));
+    $("cfgState").textContent = "未读取（响应里没有 schema）";
+    markDirtyUI();
+    return;
+  }
+  const rendered = {};
+  for(const group of CFG_GROUPS){
+    const parts = group.parts || [{ keys: group.keys || [] }];
+    const card = el("div", "card");
+    form.appendChild(el("h2", "cfg-h2", group.title));
+    let count = 0;
+    for(const part of parts){
+      const keys = (part.keys || []).filter(k => Object.prototype.hasOwnProperty.call(schema, k));
+      if(!keys.length) continue;
+      if(part.title) card.appendChild(el("div", "part-title", part.title));
+      const wrap = el("div", "fields");
+      for(const k of keys){
+        const control = buildControl(k, schema[k], k, 0);
+        if(control){ wrap.appendChild(control); rendered[k] = true; count++; }
+      }
+      card.appendChild(wrap);
+    }
+    if(count) form.appendChild(card);
+    else form.removeChild(form.lastChild); // 去掉空标题
+  }
+  // 兜底：schema 里出现但上面 4 组没列到的 key 一个都不许丢。
+  const rest = schemaKeys.filter(k => !rendered[k]);
+  if(rest.length){
+    form.appendChild(el("h2", "cfg-h2", "其他"));
+    const card = el("div", "card");
+    const wrap = el("div", "fields");
+    for(const k of rest){
+      const control = buildControl(k, schema[k], k, 0);
+      if(control){ wrap.appendChild(control); rendered[k] = true; }
+    }
+    card.appendChild(wrap);
+    form.appendChild(card);
+  }
+  updateCfgState();
+  markDirtyUI();
+  restoreDirty();
+}
+
+function restoreDirty(){
+  for(const pair of DIRTY){
+    const path = pair[0], value = pair[1];
+    const ctrl = CTRL.get(path);
+    if(ctrl && ctrl.set){
+      try{ ctrl.set(value); }catch(e){}
+    }
+  }
+  markDirtyUI();
+}
+
+function buildPayload(){
+  const values = {};
+  let count = 0;
+  for(const pair of DIRTY){
+    const path = pair[0];
+    const value = pair[1];
+    if(value === undefined || value === null) continue;
+    const leaf = String(path).split(".").pop();
+    // 双保险：敏感项绝不回传掩码/空值。
+    if(isSensitive(leaf)){
+      const text = String(value);
+      if(text === MASK || text.length === 0) continue;
+    }
+    setByPath(values, path, value);
+    count++;
+  }
+  return { values: values, count: count };
+}
+
+async function fetchConfig(keepDirty){
+  if(CFG.loading) return;
+  CFG.loading = true;
+  setMsg($("cfgMsg"), "正在读取插件配置…", "info");
+  try{
+    const d = unwrap(await apiGet("config")) || {};
+    CFG.values = (d.values && typeof d.values === "object") ? d.values : {};
+    CFG.schema = (d.schema && typeof d.schema === "object") ? d.schema : {};
+    CFG.meta = (d.meta && typeof d.meta === "object") ? d.meta : {};
+    CFG.revision = (CFG.meta.revision === undefined || CFG.meta.revision === null) ? "" : String(CFG.meta.revision);
+    CFG.loaded = true;
+    if(!keepDirty) DIRTY.clear();
+    renderConfig();
+    if(!keepDirty) setMsg($("cfgMsg"), "", "info");
+    clearFieldErrors();
+    pushLog("ok", "配置已读取（schema " + Object.keys(CFG.schema).length + " 个顶层项）");
+  }catch(e){
+    CFG.loaded = false;
+    setMsg($("cfgMsg"), "配置读取失败：" + e.message, "err");
+    pushLog("err", "配置读取失败：" + e.message);
+  }finally{
+    CFG.loading = false;
+    markDirtyUI();
+    renderDiag();
+  }
+}
+
+function ensureConfig(){
+  if(!CFG.loaded && !CFG.loading) fetchConfig(false);
+}
+
+function markFieldError(path, message){
+  const ctrl = CTRL.get(path);
+  if(ctrl && ctrl.markErr) ctrl.markErr(message);
+  const parts = String(path).split(".");
+  if(parts.length > 1){
+    const parent = CTRL.get(parts[0]);
+    if(parent && parent.markErr) parent.markErr(message);
+  }
+  const node = document.querySelector('.field[data-path="' + path + '"]');
+  if(node) node.scrollIntoView({ block: "center" });
+}
+
+function handleSaveError(err){
+  const message = (err && err.message) ? err.message : String(err);
+  const field = (err && err.field) ? String(err.field) : "";
+  const status = (err && err.httpStatus) ? Number(err.httpStatus) : 0;
+  const stale = (status === 409) || (field === "revision") || /已被其他页面修改|刷新后重试|revision/i.test(message);
+  pushLog("err", "保存配置失败：" + message + (field ? "（field=" + field + "）" : ""));
+  if(field && field !== "revision") markFieldError(field, message);
+  if(stale){
+    setMsg($("cfgMsg"), "配置已被其他页面修改，已自动重新读取最新值；请核对后再次保存。", "err");
+    toast("配置已被其他页面修改，已自动重新读取", "warn");
+    fetchConfig(true);
+    return;
+  }
+  setMsg($("cfgMsg"), "保存失败：" + message, "err");
+  toast("保存失败：" + message, "err");
+  renderDiag();
+}
+
+function applySaved(d){
+  const applied = Array.isArray(d.applied) ? d.applied : [];
+  const reloaded = Array.isArray(d.reloaded) ? d.reloaded : [];
+  const clamped = (d.clamped && typeof d.clamped === "object" && !Array.isArray(d.clamped)) ? d.clamped : {};
+  const values = (d.values && typeof d.values === "object") ? d.values : null;
+  const meta = (d.meta && typeof d.meta === "object") ? d.meta : null;
+  const rev = (d.revision !== undefined && d.revision !== null)
+    ? String(d.revision)
+    : (meta && meta.revision !== undefined && meta.revision !== null ? String(meta.revision) : "");
+
+  DIRTY.clear();
+  if(values){
+    CFG.values = values;
+    if(meta) CFG.meta = meta;
+    if(rev) CFG.revision = rev;
+    renderConfig();
+  }else{
+    // 响应没带回 values（精简/桥接裁剪），因此重新读一次，保证表单与磁盘一致。
+    fetchConfig(false);
+  }
+
+  const bits = [];
+  bits.push(applied.length ? "已生效 " + applied.length + " 项" : "没有变化项");
+  const clampKeys = Object.keys(clamped);
+  if(clampKeys.length){
+    bits.push("已按上下限调整：" + clampKeys.map(k => k + "=" + clamped[k]).join("、"));
+  }
+  if(reloaded.length) bits.push("需刷新：" + reloaded.join("、"));
+  const line = bits.join(" · ");
+  setMsg($("cfgMsg"), line, reloaded.length ? "err" : "ok");
+  if(d.message) pushLog("ok", "配置保存：" + d.message);
+  toast((d.message ? d.message + " · " : "") + line, reloaded.length ? "warn" : "ok");
+  loadStatus(true);
+  renderDiag();
+}
+
+async function saveConfig(){
+  if(!CFG.loaded){ toast("配置还没读取完成", "warn"); return; }
+  const payload = buildPayload();
+  if(!payload.count){ toast("没有需要保存的修改", "info"); return; }
+  clearFieldErrors();
+  const btn = $("btnCfgSave");
+  if(btn) btn.disabled = true;
+  setMsg($("cfgMsg"), "正在保存…", "info");
+  try{
+    const resp = await apiPost("config", { values: payload.values, revision: CFG.revision });
+    const topMsg = (resp && typeof resp === "object" && typeof resp.message === "string") ? resp.message : "";
+    const raw = unwrap(resp);
+    const d = (raw && typeof raw === "object") ? raw : {};
+    if(!d.message && topMsg) d.message = topMsg;
+    applySaved(d);
+  }catch(e){
+    handleSaveError(e);
+  }finally{
+    markDirtyUI();
+    renderDiag();
+  }
+}
+
+function abandonDirty(){
+  if(!DIRTY.size) return;
+  if(!confirm("确定放弃未保存的修改？")) return;
+  DIRTY.clear();
+  clearFieldErrors();
+  renderConfig();
+  setMsg($("cfgMsg"), "", "info");
+}
+
+/* ---------- 事件绑定 ---------- */
+function bindAll(){
+  $all(".tab").forEach(btn => {
+    btn.addEventListener("click", () => switchTab(btn.getAttribute("data-tab")));
+  });
+
   $("btnOverview").onclick = doOverview;
+  $("btnOverviewQuick").onclick = doOverview;
+  $("btnRefresh").onclick = doRefresh;
+  $("btnStatus").onclick = () => loadStatus(false);
   $("btnOvToggle").onclick = () => {
-    const cards = [...document.querySelectorAll("#overview .ovcard")];
+    const cards = $all("#overview .ovcard");
     if(!cards.length) return;
     const anyOpen = cards.some(c => !c.classList.contains("collapsed"));
-    cards.forEach(c => {
-      c.classList.toggle("collapsed", anyOpen);
-      const caret = c.querySelector(".caret");
-      if(caret) caret.textContent = anyOpen ? "▸" : "▾";
-    });
-    $("btnOvToggle").textContent = anyOpen ? "全部展开" : "全部收起";
+    cards.forEach(c => collapseCard(c, anyOpen));
+    syncOvToggle();
   };
-  $("btnRefresh").onclick = doRefresh;
-  $("btnStatus").onclick = loadStatus;
+
   $("btnLoginStart").onclick = doLoginStart;
   $("loginUseAuto").addEventListener("change", () => { loginAutoTouched = true; });
   $("btnLoginCancel").onclick = doLoginCancel;
   $("btnLoginStatus").onclick = () => loadLoginStatus(false);
   $("btnLoginSms").onclick = doLoginSms;
-  document.querySelectorAll("[data-login-trust]").forEach(btn => {
+  $all("[data-login-trust]").forEach(btn => {
     btn.onclick = () => doLoginTrust(btn.getAttribute("data-login-trust"));
   });
+
   $("btnCredentialSave").onclick = doCredentialSave;
   $("btnCredentialClear").onclick = doCredentialClear;
   $("btnCredentialStatus").onclick = () => loadCredentialsStatus(false);
+
   $("btnImport").onclick = doImport;
   $("btnClear").onclick = doClear;
+
+  $("btnCfgSave").onclick = saveConfig;
+  $("btnCfgReload").onclick = () => {
+    if(DIRTY.size && !confirm("重新读取会丢弃未保存的修改，继续？")) return;
+    DIRTY.clear();
+    CFG.loaded = false;
+    fetchConfig(false);
+  };
+  $("btnCfgReset").onclick = abandonDirty;
+
   $("btnDiag").onclick = () => {
     const box = $("diagBox");
-    box.style.display = box.style.display === "none" ? "block" : "none";
+    const open = box.style.display === "none";
+    box.style.display = open ? "block" : "none";
+    $("btnDiag").textContent = open ? "收起详情" : "展开详情";
     renderDiag();
   };
   $("btnReconnect").onclick = async () => {
     setMsg($("opMsg"), "重新检测通道…", "info");
-    const s = await selectMode(true);
+    const summary = await selectMode(true);
     await probeBridgeScript();
-    renderDiag(s);
-    loadStatus();
+    renderDiag(summary);
+    loadStatus(true);
+    toast("通道：" + DIAG.mode + "（" + summary + "）", "info");
   };
+}
+
+/* ---------- 启动 ---------- */
+(async function(){
+  bindAll();
+  initTheme();
 
   const summary = await selectMode(true);
   await probeBridgeScript();
   renderDiag(summary);
-  loadStatus();
+  pushLog("ok", "页面已加载，通道 " + DIAG.mode);
+  loadStatus(true);
   loadLoginStatus(true);
   loadCredentialsStatus(true);
 })();

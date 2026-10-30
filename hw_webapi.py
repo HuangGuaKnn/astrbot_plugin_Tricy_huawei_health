@@ -7,6 +7,8 @@ route 前缀：astrbot_plugin_Tricy_huawei_health/page/...
 """
 
 import asyncio
+import copy
+import json
 import os
 import time
 
@@ -34,6 +36,106 @@ except ImportError:
 
 KEY_COOKIES = tuple(name for name, _, _ in MIN_COOKIE_SPECS)
 
+# ==================== T8：配置同源（WebUI 直接读写 AstrBot 配置）====================
+#
+# 铁律：只读写 self.plugin.config 这一份配置，绝不另存第二份配置文件。
+# AstrBotConfig.__setattr__ 只做 self[key] = value（不落盘），所以保存必须显式调用
+# save_config_async()（异步 + 内部 revision 防旧快照覆盖）。
+
+#: 敏感配置项：cookie 相关 7 项。GET /config 一律返回掩码，任何响应体都不许回显真实值。
+SENSITIVE_KEYS = (
+    "cookie_json",
+    "cookie_CASTGC",
+    "cookie_sid",
+    "cookie_hwid_cas_sid",
+    "cookie_HuaweiID_CAS_ISCASLOGIN",
+    "cookie_CASLOGINSITE",
+    "cookie_LOGINACCSITE",
+)
+
+#: 掩码占位符。前端回传这个值表示「该项未修改」，服务端直接跳过——
+#: 绝不允许把掩码写进配置，否则会清空用户真正的 cookie。
+MASK = "***"
+
+#: 与 main.PERMISSION_SECTION 保持一致。这里不 import main，避免循环导入。
+PERMISSION_SECTION = "permission_settings"
+
+#: int 型配置的上下界，必须与 main.py 里 _int_cfg / login_daily_limit 的钳制语义一致。
+INT_BOUNDS = {
+    "page_timeout": (1, 600),
+    "token_ttl": (0, 86400),
+    "data_ttl": (0, 86400),
+    "login_daily_limit": (1, 10),
+}
+
+
+#: 区分「键不存在」与「键的值是 None」用的哨兵。
+_MISSING = object()
+
+
+class ConfigValueError(Exception):
+    """单个配置项校验失败。field 供前端定位到具体控件。"""
+
+    def __init__(self, field, message):
+        super().__init__(message)
+        self.field = field
+        self.message = message
+
+
+def _schema_path() -> str:
+    """_conf_schema.json 与本文件同目录（插件根目录）。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_conf_schema.json")
+
+
+def _load_schema() -> dict:
+    """读取 _conf_schema.json 并原样返回。读不到就当空 schema（接口仍可用，但不接受写入）。"""
+    try:
+        with open(_schema_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _schema_leaves(schema: dict) -> dict:
+    """把 schema 摊平成 {点号路径: 叶子定义}，供白名单校验与前端表单渲染使用。"""
+    leaves = {}
+    for key, spec in (schema or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("type") == "object":
+            for sub_key, sub_spec in (spec.get("items") or {}).items():
+                if isinstance(sub_spec, dict):
+                    leaves["%s.%s" % (key, sub_key)] = sub_spec
+        else:
+            leaves[key] = spec
+    return leaves
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    """宽容布尔取值，口径与 main._cfg_bool 一致。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _get_path(values: dict, path: str):
+    """按点号路径取值（只支持一层嵌套，与配置结构一致）。"""
+    if "." in path:
+        group_key, sub_key = path.split(".", 1)
+        group = values.get(group_key)
+        return group.get(sub_key) if isinstance(group, dict) else None
+    return values.get(path)
+
+
 
 class HuaweiHealthWebApi:
     def __init__(self, plugin):
@@ -55,6 +157,10 @@ class HuaweiHealthWebApi:
         reg(f"{PAGE_PREFIX}/login/cancel", self.login_cancel, ["POST"], "取消网页登录")
         reg(f"{PAGE_PREFIX}/credentials", self.credentials_write, ["POST"], "保存账号密码凭据")
         reg(f"{PAGE_PREFIX}/credentials/status", self.credentials_status, ["GET"], "账号密码凭据状态")
+        # T8：配置同源（WebUI 直接读写 AstrBot 配置）。只增不改：12 -> 14 条。
+        # 同一路径不同 method 是两条独立注册，框架按 method 精确匹配。
+        reg(f"{PAGE_PREFIX}/config", self.get_config, ["GET"], "读取插件配置（敏感项掩码）")
+        reg(f"{PAGE_PREFIX}/config", self.post_config, ["POST"], "保存插件配置（立即生效）")
         # v0.4.1：删掉 login/account —— 注册了但前端从不调用，且 handler 恒返回 409。
 
     # ---------- 工具 ----------
@@ -441,3 +547,492 @@ class HuaweiHealthWebApi:
     async def login_cancel(self):
         data = await asyncio.to_thread(self.plugin.login_manager.cancel)
         return json_response({"status": "ok", "data": data, "message": "登录已取消"})
+
+    # ================= 配置同源（T8）=================
+    #
+    # 目标：在 WebUI 里改 = 在 AstrBot 配置页里改，且 21 项全部立即生效、不用重启。
+    # 因此这里只有一条数据通路：plugin.config（AstrBotConfig）。
+    # 不写第二份文件、不缓存配置影子副本。
+
+    # ---------- 版本戳 / 快照 ----------
+
+    def _config_revision(self) -> str:
+        """并发覆盖防护用的版本戳。
+
+        方案：框架自增的 ``_save_revision`` + ``_save_committed_revision`` + 配置文件
+        ``mtime_ns``。前两者覆盖「任何走 save_config_async 的保存」（含 AstrBot 配置页
+        那条路径），后者兜住「绕过配置对象直接改文件」的情况。
+
+        注意 AstrBotConfig.__getattr__ 对缺失属性返回 None 而不是抛异常，
+        所以统一用 getattr(..., None)；测试桩没有这些属性时退化成常量子串。
+        """
+        cfg = self.plugin.config
+        revision = getattr(cfg, "_save_revision", None)
+        committed = getattr(cfg, "_save_committed_revision", None)
+        mtime = 0
+        path = getattr(cfg, "config_path", None)
+        if path:
+            try:
+                mtime = os.stat(path).st_mtime_ns
+            except OSError:
+                mtime = 0
+        return "%s-%s-%s" % (revision, committed, mtime)
+
+    def _config_mtime_text(self) -> str:
+        path = getattr(self.plugin.config, "config_path", None)
+        if not path:
+            return "-"
+        try:
+            return time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(os.stat(path).st_mtime))
+        except OSError:
+            return "-"
+
+    def _read_values(self) -> dict:
+        """当前配置的完整视图（21 个叶子，未掩码）。
+
+        缺失项按 schema 的 default 补齐，保证前端拿到的永远是完整表单数据。
+        """
+        schema = _load_schema()
+        cfg = self.plugin.config
+        values = {}
+        for key, spec in schema.items():
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("type") == "object":
+                raw = cfg.get(key)
+                group = raw if isinstance(raw, dict) else {}
+                children = {}
+                for sub_key, sub_spec in (spec.get("items") or {}).items():
+                    if not isinstance(sub_spec, dict):
+                        continue
+                    value = group.get(sub_key)
+                    children[sub_key] = sub_spec.get("default") if value is None else value
+                values[key] = children
+            else:
+                value = cfg.get(key)
+                values[key] = spec.get("default") if value is None else value
+        return values
+
+    @staticmethod
+    def _mask(values: dict) -> dict:
+        """深拷贝后把 7 个敏感项替换成掩码。任何响应体都只经过这一层。"""
+        masked = copy.deepcopy(values)
+        for key in SENSITIVE_KEYS:
+            if key in masked:
+                masked[key] = MASK
+        return masked
+
+    @staticmethod
+    def _has_value(values: dict) -> dict:
+        """敏感项是否已配置——只暴露布尔，不暴露内容。"""
+        return {key: bool(str(values.get(key) or "").strip()) for key in SENSITIVE_KEYS}
+
+    def _meta(self, values: dict = None) -> dict:
+        if values is None:
+            values = self._read_values()
+        return {
+            "revision": self._config_revision(),
+            "sensitive": list(SENSITIVE_KEYS),
+            "has_value": self._has_value(values),
+            "bounds": {key: list(pair) for key, pair in INT_BOUNDS.items()},
+            "updated_at": self._config_mtime_text(),
+            "source": "astrbot_config",
+        }
+
+    # ---------- 校验（纯计算，无副作用）----------
+
+    def _check_leaf(self, path: str, value, spec: dict):
+        """按 schema 校验单个叶子，返回 (写入值, 是否被钳制)。失败抛 ConfigValueError。"""
+        leaf_type = spec.get("type")
+        name = path.split(".")[-1]
+
+        if leaf_type == "bool":
+            # 严格：不接受 "true" / 1，避免把脏值写进配置。
+            if not isinstance(value, bool):
+                raise ConfigValueError(path, "%s 必须是布尔值（true / false）" % name)
+            return value, False
+
+        if leaf_type == "int":
+            # bool 是 int 的子类，必须显式排除，否则 true 会被当成 1 混进来。
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigValueError(path, "%s 必须是整数" % name)
+            result, clamped = value, False
+            bounds = INT_BOUNDS.get(name)
+            if bounds:
+                low, high = bounds
+                if result < low:
+                    result, clamped = low, True
+                elif result > high:
+                    result, clamped = high, True
+            return result, clamped
+
+        if leaf_type == "float":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigValueError(path, "%s 必须是数字" % name)
+            return float(value), False
+
+        if leaf_type in ("string", "text"):
+            if not isinstance(value, str):
+                raise ConfigValueError(path, "%s 必须是字符串" % name)
+            return value, False
+
+        if leaf_type == "list":
+            if not isinstance(value, list) or any(
+                    not isinstance(item, str) for item in value):
+                raise ConfigValueError(path, "%s 必须是字符串列表" % name)
+            return list(value), False
+
+        if leaf_type == "object":
+            if not isinstance(value, dict):
+                raise ConfigValueError(path, "%s 必须是对象" % name)
+            return value, False
+
+        # schema 里出现不支持的类型：拒绝而不是放行，避免写脏数据。
+        raise ConfigValueError(path, "%s 的配置类型 %r 不受支持" % (name, leaf_type))
+
+    def _check_umos(self, path: str, items) -> list:
+        """复用 main._parse_umos 的既有规则；非法条目整单拒绝，不写进配置。"""
+        if not isinstance(items, list) or any(
+                not isinstance(item, str) for item in items):
+            raise ConfigValueError(
+                path, "会话 UMO 格式不合法：必须是字符串列表，每条形如 "
+                      "platform:MessageType:session_id")
+        parser = getattr(self.plugin, "_parse_umos", None)
+        if not callable(parser):
+            return list(items)
+        try:
+            valid, invalid = parser(items)
+        except Exception as exc:
+            raise ConfigValueError(path, "会话 UMO 校验失败：%s" % redact_error(exc))
+        if invalid:
+            raise ConfigValueError(path, "会话 UMO 格式不合法：%s" % "、".join(invalid))
+        return list(valid)
+
+    @staticmethod
+    def _is_mask(value) -> bool:
+        """是不是掩码占位符。
+
+        容忍前后空白：``" *** "`` 也不许被当成真实值写进配置（否则会覆盖真实 cookie）。
+        """
+        return isinstance(value, str) and value.strip() == MASK
+
+    @staticmethod
+    def _expand_dotted(raw_values: dict) -> dict:
+        """把 ``"group.sub"`` 形式的顶层键展开成嵌套 dict。
+
+        schema 叶子是用点号路径表示的，如果直接拿点号键去查白名单，它会精确命中叶子表、
+        从而绕过「分组分支」里的 UMO 校验（``{"permission_settings.extra_umo_whitelist":
+        ["garbage"]}`` 就会 200 并把脏值落盘）。这里统一归一化，保证两种写法走
+        **完全相同**的校验路径。
+
+        同一分组既给 dict 又给点号键时按出现顺序合并（后者覆盖同名子键）；但如果同一分组
+        在同一请求里**既给了非对象值、又给了子键**，直接按契约要求报「必须是对象」——
+        否则结果会依赖 JSON 成员的书写顺序（这里绝不允许静默丢弃非法值）。
+        """
+        out = {}
+        for key, value in raw_values.items():
+            if isinstance(key, str) and "." in key:
+                group, sub = key.split(".", 1)
+                existing = out.get(group, _MISSING)
+                if existing is not _MISSING and not isinstance(existing, dict):
+                    raise ConfigValueError(group, "%s 必须是对象" % group)
+                merged = dict(existing) if isinstance(existing, dict) else {}
+                merged[sub] = value
+                out[group] = merged
+                continue
+            existing = out.get(key, _MISSING)
+            # _MISSING 是 object()，isinstance(_MISSING, dict) 恒 False，故无需再判它。
+            if isinstance(existing, dict) and not isinstance(value, dict):
+                # 先出现的是分组子键、后出现的是非对象：冲突。
+                raise ConfigValueError(key, "%s 必须是对象" % key)
+            if isinstance(existing, dict) and isinstance(value, dict):
+                merged = dict(existing)
+                merged.update(value)
+                out[key] = merged
+            else:
+                out[key] = value
+        return out
+
+    def _validate_patch(self, raw_values, leaves: dict):
+        """白名单 + 类型 + 钳制 + UMO 校验。
+
+        返回 ``(writes, clamped, accepted)``：
+          - writes：{点号路径: 新值}，只含通过校验的项；
+          - clamped：{点号路径: 钳制后的值}；
+          - accepted：通过校验的叶子路径（= 保存后会立即生效的项）。
+        """
+        if not isinstance(raw_values, dict):
+            raise ConfigValueError("values", "values 必须是 JSON 对象")
+
+        for key in raw_values:
+            if not isinstance(key, str):
+                raise ConfigValueError("values", "配置项名称必须是字符串")
+
+        # 先归一化点号键，再走统一校验，避免两条分支口径不一致。
+        values = self._expand_dotted(raw_values)
+
+        writes, clamped, accepted = {}, {}, []
+        group_prefix = PERMISSION_SECTION + "."
+
+        for key, value in values.items():
+            # 分组（object）：只接受 schema 里声明的子键。
+            if any(path.startswith(key + ".") for path in leaves):
+                if not isinstance(value, dict):
+                    raise ConfigValueError(key, "%s 必须是对象" % key)
+                for sub_key, sub_value in value.items():
+                    path = "%s.%s" % (key, sub_key)
+                    if path not in leaves:
+                        raise ConfigValueError(path, "未知配置项：%s" % path)
+                    if sub_key in SENSITIVE_KEYS and self._is_mask(sub_value):
+                        continue
+                    if path == group_prefix + "extra_umo_whitelist":
+                        # UMO 列表的类型守卫放在 _check_umos 里，这样「含非字符串条目」
+                        # 也能给出 UMO 格式相关的可读错误，而不是干巴巴的类型报错。
+                        new_value, was_clamped = self._check_umos(path, sub_value), False
+                    else:
+                        new_value, was_clamped = self._check_leaf(
+                            path, sub_value, leaves[path])
+                    writes[path] = new_value
+                    accepted.append(path)
+                    if was_clamped:
+                        clamped[path] = new_value
+                continue
+
+            if key not in leaves:
+                raise ConfigValueError(key, "未知配置项：%s" % key)
+
+            # 敏感项回传掩码 = 「没改」，直接跳过：绝不能把 "***" 写进配置。
+            if key in SENSITIVE_KEYS and self._is_mask(value):
+                continue
+
+            new_value, was_clamped = self._check_leaf(key, value, leaves[key])
+            writes[key] = new_value
+            accepted.append(key)
+            if was_clamped:
+                clamped[key] = new_value
+
+        return writes, clamped, accepted
+
+    @staticmethod
+    def _apply_writes(merged: dict, writes: dict, schema: dict = None) -> dict:
+        """把点号路径的写入合并进完整配置副本。
+
+        嵌套分组必须逐子键合并：直接塞 {group: {one_key: v}} 会因为
+        save_config_async 内部用 dict.update 浅合并而整组替换、丢掉兄弟键。
+        若原配置里压根没有这个分组（老版本配置升级上来），先用 schema 默认值补齐，
+        避免写出一个「只有半组子键」的残缺分组。
+        """
+        group_specs = {}
+        for key, spec in (schema or {}).items():
+            if isinstance(spec, dict) and spec.get("type") == "object":
+                items = spec.get("items")
+                if isinstance(items, dict):
+                    group_specs[key] = items
+
+        for path, value in writes.items():
+            if "." in path:
+                group_key, sub_key = path.split(".", 1)
+                group = merged.get(group_key)
+                group = dict(group) if isinstance(group, dict) else {}
+                for name, sub_spec in group_specs.get(group_key, {}).items():
+                    if name not in group and isinstance(sub_spec, dict) and "default" in sub_spec:
+                        group[name] = copy.deepcopy(sub_spec["default"])
+                group[sub_key] = value
+                merged[group_key] = group
+            else:
+                merged[path] = value
+        return merged
+
+    # ---------- 落盘与热生效 ----------
+
+    async def _persist(self, merged: dict) -> bool:
+        """把完整配置写回 AstrBot 的唯一配置对象（异步落盘，不阻塞事件循环）。"""
+        cfg = self.plugin.config
+        saver = getattr(cfg, "save_config_async", None)
+        if callable(saver):
+            try:
+                committed = await saver(replace_config=merged, indent=2)
+            except Exception as exc:
+                self.plugin.logger.warning(
+                    "[华为健康] 配置落盘失败：%s" % redact_error(exc))
+                return False
+            # 返回 False 表示有更新的快照已经提交（并发覆盖），本次不生效。
+            return committed is not False
+        # 测试桩 / 极简 dict 配置没有落盘能力：只更新内存。真实 AstrBot 不会走到这里。
+        try:
+            cfg.update(merged)
+        except Exception:
+            return False
+        self.plugin.logger.warning(
+            "[华为健康] 当前配置对象不支持 save_config_async，仅更新内存")
+        return True
+
+    async def _apply_hot_effects(self, merged: dict, changed) -> None:
+        """保存后需要额外处理的三组配置。其余 18 项本来就是实时读取，天然生效。"""
+        p = self.plugin
+        changed = set(changed)
+
+        # 1) login_daily_limit：__init__ 里缓存进了 login_manager，保存后必须重设。
+        if "login_daily_limit" in changed:
+            try:
+                limit = int(merged.get("login_daily_limit"))
+                # 保留原有钳制语义（1~10）。
+                p.login_manager.daily_limit = max(1, min(10, limit))
+            except Exception as exc:
+                p.logger.warning(
+                    "[华为健康] 重设每日登录额度失败：%s" % redact_error(exc))
+
+        # 2) 权限组：_umo_whitelist 是缓存，改完必须重建，否则判定还用旧白名单。
+        if any(path.startswith(PERMISSION_SECTION + ".") for path in changed):
+            try:
+                p._build_umo_whitelist()
+            except Exception as exc:
+                p.logger.warning(
+                    "[华为健康] 重建会话白名单失败：%s" % redact_error(exc))
+
+        # 3) warmup：initialize() 只起过一次任务，开关变化要手动起/停。
+        if "warmup" in changed:
+            wanted = _as_bool(merged.get("warmup"), True)
+            task = getattr(p, "_warmup_task", None)
+            running = task is not None and not task.done()
+            try:
+                if wanted and not running:
+                    p._warmup_task = asyncio.create_task(p._warmup())
+                    p.logger.info("[华为健康] 配置开启预热，已起后台任务")
+                elif not wanted and running:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                    p.logger.info("[华为健康] 配置关闭预热，已停止后台任务")
+            except Exception as exc:
+                p.logger.warning(
+                    "[华为健康] 应用预热开关失败：%s" % redact_error(exc))
+
+    def _config_payload(self, applied, changed, clamped, message: str) -> dict:
+        """成功响应：顶层给派活单要求的字面字段，data 里给前端 unwrap() 用的同一份。"""
+        values = self._read_values()
+        data = {
+            "applied": list(applied),
+            "reloaded": [],
+            "revision": self._config_revision(),
+            "changed": list(changed),
+            "clamped": dict(clamped),
+            "values": self._mask(values),
+            "meta": self._meta(values),
+        }
+        payload = dict(data)
+        payload["status"] = "ok"
+        payload["message"] = message
+        payload["data"] = data
+        return payload
+
+    # ---------- 接口 ----------
+
+    async def get_config(self):
+        """GET /page/config：当前值（敏感项掩码）+ 原样 schema + 版本戳。"""
+        values = self._read_values()
+        return json_response({"status": "ok", "data": {
+            "values": self._mask(values),
+            "schema": _load_schema(),
+            "meta": self._meta(values),
+        }})
+
+    async def post_config(self):
+        """POST /page/config：白名单 + 类型校验 + UMO 校验 + 并发防护 + 落盘 + 热生效。"""
+        p = self.plugin
+        try:
+            body = await request.json()
+        except Exception:
+            return json_response(
+                {"status": "error", "message": "请求体不是合法 JSON", "field": ""},
+                status_code=400)
+        if not isinstance(body, dict):
+            return json_response(
+                {"status": "error", "message": "请求体必须是 JSON 对象", "field": ""},
+                status_code=400)
+
+        leaves = _schema_leaves(_load_schema())
+
+        # 第 1 步：纯校验。非法值永远先于 revision 被拒，保证「填错就 400」的确定性。
+        try:
+            writes, clamped, accepted = self._validate_patch(body.get("values"), leaves)
+        except ConfigValueError as exc:
+            return json_response(
+                {"status": "error", "message": exc.message, "field": exc.field},
+                status_code=400)
+
+        # 第 2 步：并发覆盖防护。
+        current_revision = self._config_revision()
+        expected = body.get("revision")
+        if not isinstance(expected, str) or expected != current_revision:
+            return json_response({
+                "status": "error",
+                "message": "配置已被其他页面修改，请刷新后重试",
+                "field": "revision",
+            }, status_code=409)
+
+        # 第 3 步：算出真正的变更集（值没变的项不写盘、不触发副作用）。
+        cfg = p.config
+        before = copy.deepcopy(dict(cfg)) if isinstance(cfg, dict) else {}
+        merged = self._apply_writes(copy.deepcopy(before), writes, _load_schema())
+        changed = [
+            path for path in accepted
+            if _get_path(merged, path) != _get_path(before, path)
+        ]
+
+        if not changed:
+            # 值没变：不落盘、不触发副作用。applied 也不该报，否则前端会以为改了东西。
+            return json_response(self._config_payload(
+                [], [], clamped, "配置无变化，未写入"))
+
+        # 第 4 步：cookie 组先导入（失败整单 400，且配置文件此时还没被写过）。
+        cookie_touched = any(path in SENSITIVE_KEYS for path in changed)
+        if cookie_touched:
+            try:
+                raw_json = str(merged.get("cookie_json") or "")
+                fields = {
+                    name: merged.get("cookie_" + name, "")
+                    for name, _, _ in MIN_COOKIE_SPECS
+                }
+                await asyncio.to_thread(
+                    p.auth.import_cookie_sources, raw_json, fields, True)
+            except Exception as exc:
+                return json_response({
+                    "status": "error",
+                    "message": "cookie 导入失败：%s" % redact_error(exc),
+                    # 指到真正变更的那个 cookie 项，前端才能高亮对控件。
+                    "field": next(
+                        (path for path in changed if path in SENSITIVE_KEYS),
+                        "cookie_json",
+                    ),
+                }, status_code=400)
+
+        # 第 5 步：落盘（同源：写的就是 AstrBot 注入的那个 config）。
+        if not await self._persist(merged):
+            return json_response(
+                {"status": "error", "message": "配置保存失败", "field": ""},
+                status_code=500)
+
+        # 第 6 步：热生效。
+        await self._apply_hot_effects(merged, changed)
+        if cookie_touched:
+            # 换了 cookie 必须作废 token 与健康缓存，否则会用旧账号的 token 取新账号的数据。
+            try:
+                await p._invalidate_auth_cache()
+            except Exception as exc:
+                p.logger.warning(
+                    "[华为健康] cookie 变更后清缓存失败：%s" % redact_error(exc))
+
+        # 契约：applied 只统计「真的写下去并已生效」的项，值没变的不算（那属于 changed 为空）。
+        applied = changed
+        message = "已生效 %d 项" % len(applied)
+        if clamped:
+            message += "（其中 %d 项已按上下限调整）" % len(clamped)
+        p.logger.info("[华为健康] WebUI 保存配置：已生效 %s" % ", ".join(applied))
+        return json_response(self._config_payload(applied, changed, clamped, message))
+

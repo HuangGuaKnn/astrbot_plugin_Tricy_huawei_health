@@ -1344,7 +1344,7 @@ class TestWebApi(unittest.TestCase):
     def test_no_account_route(self):
         routes = [r["route"] for r in self.plugin.context.web_apis]
         self.assertFalse(any(r.endswith("/login/account") for r in routes))
-        self.assertEqual(len(routes), 12)
+        self.assertEqual(len(routes), 14)
 
     def test_key_cookies_match_specs(self):
         self.assertEqual(set(hw_webapi.KEY_COOKIES),
