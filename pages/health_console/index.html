@@ -1271,7 +1271,6 @@ function buildControl(path, node, key, depth){
       area.addEventListener("input", () => setDirty(path, area.value));
     }
     shell.mount(area);
-    if(sensitive) shell.note("只写导入：内容须包含 CASTGC 与 sid；不会回显已有值。留空不修改，导入成功后清空 Cookie 配置值并保留加密登录态。");
     adapter = {
       set(v){ area.value = (v === null || v === undefined) ? "" : String(v); },
       get(){ return area.value; },
@@ -1300,7 +1299,6 @@ function buildControl(path, node, key, depth){
       line.appendChild(input);
       line.appendChild(toggle);
       shell.mount(line);
-      shell.note("只写导入：修改任一 Cookie 时，须在本次同时提供 CASTGC 与 sid，或填写包含二者的完整 JSON。留空不修改，不会沿用旧值补齐本次输入。");
     }else{
       const cur = getValue(path);
       input.value = (cur === null || cur === undefined) ? "" : String(cur);
