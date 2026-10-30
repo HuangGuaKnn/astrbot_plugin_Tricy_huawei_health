@@ -912,7 +912,14 @@ function renderLoginStatus(d){
   if(typeof d.daily_limit === "number"){
     const used = Number(d.daily_used || 0), limit = Number(d.daily_limit || 0);
     $("loginQuota").textContent = limit > 0
-      ? "取数自动登录失败 " + used + "/" + limit + " 次（手动点登录不计入）" : "";
+      ? "今日自动登录失败 " + used + "/" + limit + " 次（手动点登录不计入）" : "";
+    // v0.5.2：额度按当地日历日 0 点重置。用满时必须把「什么时候恢复」说出来，
+    // 否则用户只看到「请稍后再试」，根本不知道要等到明天。
+    if(limit > 0 && used >= limit && Number(d.daily_reset_at || 0) > 0){
+      const at = new Date(Number(d.daily_reset_at) * 1000);
+      const pad = n => String(n).padStart(2, "0");
+      $("loginQuota").textContent += " ｜ 额度 " + pad(at.getHours()) + ":" + pad(at.getMinutes()) + " 重置";
+    }
   }
   // v0.4.1：把失败冷却显示出来，否则用户只看到「冷却中」却不知道还剩多久。
   if(Number(d.cooldown_left || 0) > 0){

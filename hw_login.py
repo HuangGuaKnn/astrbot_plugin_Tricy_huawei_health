@@ -21,6 +21,7 @@ P1-10 / P2-8 / P2-9 / P2-10 / P2-16）：
     - 调试端口由浏览器自己挑（``--remote-debugging-port=0``）。
 """
 
+import datetime
 import json
 import math
 import os
@@ -45,6 +46,7 @@ try:
         normalize_cookie,
         read_devtools_port,
     )
+    from .hw_client import parse_timezone
     from .hw_credentials import (
         CredentialsError,
         CredentialsCorruptError,
@@ -65,6 +67,7 @@ except ImportError:
         normalize_cookie,
         read_devtools_port,
     )
+    from hw_client import parse_timezone
     from hw_credentials import (
         CredentialsError,
         CredentialsCorruptError,
@@ -1164,9 +1167,38 @@ class HuaweiLoginManager:
 
     # ---------- 风控闸门 ----------
 
+    def _quota_tzinfo(self):
+        """额度「今日」用的时区：优先插件配置的 timezone，非法或缺失时退回本机时区。"""
+        config = getattr(self.plugin, "config", None)
+        raw = None
+        if config is not None:
+            try:
+                raw = config.get("timezone")
+            except Exception:  # AstrBotConfig 的表现随版本变化，读不到就退回本机时区
+                raw = None
+        if raw is not None:
+            try:
+                return parse_timezone(raw)
+            except (TypeError, ValueError):
+                pass
+        return datetime.datetime.now().astimezone().tzinfo
+
+    def _day_window(self):
+        """按配置时区算出 (今日 0 点, 明日 0 点) 的时间戳。
+
+        v0.5.2 之前这里用的是「滚动 24 小时」（``now - 24 * 60 * 60``），
+        于是前一天下午的三次失败会一直占到第二天同一时刻：凌晨重启就弹
+        「今日自动登录失败次数已达上限」，可当天一次都没试过。
+        """
+        tz = self._quota_tzinfo()
+        today = datetime.datetime.now(datetime.timezone.utc).astimezone(tz)
+        start = today.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = (start + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.timestamp(), end.timestamp()
+
     def _prune_attempts(self):
         now = time.time()
-        cutoff = now - 24 * 60 * 60
+        cutoff, _ = self._day_window()
         # 顺手丢掉未来时间戳：v0.4.0 只裁掉「太旧」的，未来值会永久占满额度。
         self._attempts = [v for v in self._attempts if cutoff <= v <= now + 60]
 
@@ -1234,9 +1266,14 @@ class HuaweiLoginManager:
             else:
                 data = self._session.snapshot()
             self._prune_attempts()
+            _, reset_at = self._day_window()
             data["prefer_auto"] = bool(self.prefer_auto)
             data["daily_used"] = len(self._attempts)
             data["daily_limit"] = int(self.daily_limit)
+            # v0.5.2：额度按本地日历日重置，把「什么时候恢复」也告诉前端，
+            # 用户不用再猜「请稍后再试」到底是多久。
+            data["daily_reset_at"] = int(reset_at)
+            data["daily_reset_in"] = max(0, int(reset_at - time.time()))
             data["cooldown_left"] = max(0, int(self.failure_cooldown_until - time.time()))
             data["login_mode"] = self.login_mode
             return data

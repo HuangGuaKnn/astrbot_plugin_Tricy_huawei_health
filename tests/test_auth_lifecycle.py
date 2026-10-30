@@ -4,12 +4,14 @@ All browser/CDP calls and cryptographic failure cases use local fakes. No Huawei
 requests or real user credentials are needed to exercise these races.
 """
 
+import datetime
 import json
 import os
 import sys
 from pathlib import Path
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -437,6 +439,110 @@ class DailyLimitSyncTests(unittest.TestCase):
             data_dir=self.temp.name, config={},
             logger=Mock(), _state_lock=threading.RLock(), _auth_epoch=1)
         self.assertEqual(hw_login.HuaweiLoginManager(plugin2).daily_limit, 6)
+
+
+class DailyQuotaWindowTests(unittest.TestCase):
+    """额度「今日」必须按当地日历日算，不能是滚动 24 小时。
+
+    背景（2026-10-31 03:50 线上）：主人在凌晨重启 AstrBot，日志弹
+    「今日自动登录失败次数已达上限，请稍后再试」。可 ``login_config.json``
+    里那三条 ``attempts`` 全是**前一天下午 16:41～16:51** 真机验证留下的失败，
+    按日历日算当天一次都没试过。根因是 ``_prune_attempts`` 用了
+    ``now - 24 * 60 * 60`` 的滑动窗口：前一天下午的失败会一直占到第二天
+    同一时刻，于是凌晨重启必然撞上限、当天整天都拿不到额度。
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.plugin = self._make_plugin({"timezone": "+0800"})
+        self.manager = hw_login.HuaweiLoginManager(self.plugin)
+        self.manager.daily_limit = 3
+
+    def _make_plugin(self, config):
+        return types.SimpleNamespace(
+            data_dir=self.temp.name, config=config, logger=Mock(),
+            _state_lock=threading.RLock(), _auth_epoch=1)
+
+    def _manager_with_tz(self, value):
+        return hw_login.HuaweiLoginManager(self._make_plugin({"timezone": value}))
+
+    def test_yesterday_afternoon_attempts_do_not_block_today(self):
+        """线上原样复现：三条昨天 16:41～16:51 的失败，今天必须不占额度。"""
+        start = self.manager._day_window()[0]
+        base = start - 86400  # 昨天 0 点
+        self.manager._attempts = [
+            base + 16 * 3600 + 41 * 60 + 23,
+            base + 16 * 3600 + 50 * 60 + 51,
+            base + 16 * 3600 + 51 * 60 + 51,
+        ]
+        self.manager._check_auto_gate()  # 不该抛 daily_limit
+        self.assertEqual(self.manager._attempts, [], "昨天的失败必须被裁掉")
+        self.assertEqual(self.manager.status()["daily_used"], 0)
+
+    def test_today_attempts_still_block(self):
+        start = self.manager._day_window()[0]
+        if time.time() <= start + 180:
+            self.skipTest("跨日 3 分钟内构造不出「今天已发生」的时间戳")
+        self.manager._attempts = [start + 60, start + 120, start + 180]
+        with self.assertRaises(hw_login.LoginFlowError) as ctx:
+            self.manager._check_auto_gate()
+        self.assertEqual(ctx.exception.code, "daily_limit")
+        self.assertEqual(self.manager.status()["daily_used"], 3)
+
+    def test_one_second_before_midnight_is_expired(self):
+        start = self.manager._day_window()[0]
+        self.manager._attempts = [start - 1]
+        self.manager._prune_attempts()
+        self.assertEqual(self.manager._attempts, [])
+
+    def test_day_window_is_local_midnight(self):
+        tz = hw_login.parse_timezone("+0800")
+        start, end = self.manager._day_window()
+        local = datetime.datetime.fromtimestamp(start, tz)
+        self.assertEqual((local.hour, local.minute, local.second), (0, 0, 0))
+        self.assertEqual(int(end - start), 86400)
+        self.assertEqual(datetime.datetime.fromtimestamp(end, tz).hour, 0)
+
+    def test_timezone_config_moves_the_boundary(self):
+        """日界跟着配置走：三个时区算出的日界各不相同，且各自在当地都是 0 点。"""
+        windows = {}
+        for name in ("+0800", "+0000", "-0500"):
+            tz = hw_login.parse_timezone(name)
+            start, end = self._manager_with_tz(name)._day_window()
+            windows[name] = (start, end)
+            local = datetime.datetime.fromtimestamp(start, tz)
+            self.assertEqual((local.hour, local.minute, local.second, local.microsecond),
+                             (0, 0, 0, 0), "%s 的日界必须落在当地 0 点" % name)
+            self.assertEqual(int(end - start), 86400, name)
+        self.assertEqual(len({round(v[0]) for v in windows.values()}), 3,
+                         "时区不同，日界必须不同")
+        # 东八区与 UTC 的日界之差只有两种可能：此刻 UTC 已跨日 → 8h，
+        # 未跨日（东八区先进入新的一天）→ 16h。
+        delta = round(windows["+0800"][0] - windows["+0000"][0])
+        self.assertIn(delta, (-8 * 3600, 16 * 3600))
+
+    def test_status_reports_when_quota_resets(self):
+        data = self.manager.status()
+        start, end = self.manager._day_window()
+        self.assertEqual(data["daily_reset_at"], int(end))
+        self.assertGreaterEqual(data["daily_reset_in"], 0)
+        self.assertLessEqual(data["daily_reset_in"], 86400)
+        self.assertEqual(int(end - start), 86400)
+
+    def test_bad_timezone_falls_back_instead_of_raising(self):
+        """配置写错不该让插件起不来，退回本机时区即可。"""
+        for bad in ("garbage", "", "+99:99", None, 123):
+            with self.subTest(value=bad):
+                manager = self._manager_with_tz(bad)
+                manager._check_auto_gate()  # 不抛
+                self.assertEqual(len(manager._day_window()), 2)
+
+    def test_future_timestamps_are_still_dropped(self):
+        now = time.time()
+        self.manager._attempts = [now + 3600, now - 10]
+        self.manager._prune_attempts()
+        self.assertEqual(self.manager._attempts, [now - 10])
 
 
 if __name__ == "__main__":
