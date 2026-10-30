@@ -187,6 +187,13 @@
     .tabs{margin-left:-12px;margin-right:-12px;padding:0 12px}
     .field-input{max-width:100%}
   }
+
+/* Cookie 导入方式互斥：另一组整体变灰，避免用户以为两组都要填。 */
+.field-disabled{opacity:.45;}
+.field-disabled input,.field-disabled textarea{background:#0000;cursor:not-allowed;}
+.cookie-mode{margin-bottom:16px;padding-bottom:12px;border-bottom:1px dashed var(--line,rgba(127,127,127,.25));}
+.cookie-mode .row{gap:18px;flex-wrap:wrap;}
+.cookie-mode label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;}
 </style>
 </head>
 <body>
@@ -1316,6 +1323,13 @@ function buildControl(path, node, key, depth){
     get: () => (adapter && adapter.get ? adapter.get() : undefined),
     markErr: msg => shell.markErr(msg),
     clearErr: () => shell.clearErr(),
+    setDisabled: disabled => {
+      const node = shell.field.querySelector("input,textarea,select");
+      if(node) node.disabled = !!disabled;
+      // 「显示」按钮也要一起锁，否则禁用状态下还能点开看值。
+      shell.field.querySelectorAll("button").forEach(btn => { btn.disabled = !!disabled; });
+      shell.field.classList.toggle("field-disabled", !!disabled);
+    },
   };
   CTRL.set(path, finalAdapter);
   return shell.field;
@@ -1427,6 +1441,78 @@ function buildListControl(path, node, key, depth){
   return shell.field;
 }
 
+// ==================== Cookie 导入方式（整段 / 分项，二选一）====================
+// 两组字段同时可填会让人以为都要加。这里做成互斥：选一组，另一组整体变灰。
+// 只是 UI 约束，不改后端语义——后端本来就是「有整段就优先用整段」。
+const COOKIE_JSON_PATH = "cookie_json";
+const COOKIE_PART_PATHS = [
+  "cookie_CASTGC", "cookie_sid", "cookie_hwid_cas_sid",
+  "cookie_HuaweiID_CAS_ISCASLOGIN", "cookie_CASLOGINSITE", "cookie_LOGINACCSITE",
+];
+
+function detectCookieMode(){
+  // 哪组已配置就用哪组；都没配置时默认「分项」（分项是推荐路径，不用整段复制）。
+  const partConfigured = COOKIE_PART_PATHS.some(key => hasValue(key));
+  const jsonConfigured = hasValue(COOKIE_JSON_PATH);
+  if(partConfigured) return "parts";
+  if(jsonConfigured) return "json";
+  return "parts";
+}
+
+function applyCookieMode(mode){
+  CFG.cookieMode = (mode === "json") ? "json" : "parts";
+  const jsonCtl = CTRL.get(COOKIE_JSON_PATH);
+  if(jsonCtl && jsonCtl.setDisabled) jsonCtl.setDisabled(CFG.cookieMode !== "json");
+  for(const path of COOKIE_PART_PATHS){
+    const ctl = CTRL.get(path);
+    if(ctl && ctl.setDisabled) ctl.setDisabled(CFG.cookieMode !== "parts");
+  }
+  // 切走的那一组不许带着脏值被提交：用户看不见的字段不该悄悄生效。
+  if(CFG.cookieMode === "json"){
+    for(const path of COOKIE_PART_PATHS) clearDirtyFor(path);
+  }else{
+    clearDirtyFor(COOKIE_JSON_PATH);
+  }
+  markDirtyUI();
+}
+
+function setupCookieMode(){
+  const anchor = document.querySelector('[data-path="' + COOKIE_JSON_PATH + '"]');
+  if(!anchor || !arrayHasAnyControl()) return;
+
+  const box = el("div", "field cookie-mode");
+  const head = el("div", "field-head");
+  head.appendChild(el("div", "field-label", "Cookie 导入方式"));
+  box.appendChild(head);
+  box.appendChild(el("div", "field-hint",
+    "二选一：整段 JSON 或分项填值。选中一组后，另一组会变灰不可编辑。"
+    + "切换不会清空另一侧已填的内容，但那一侧不会被提交。"));
+  const row = el("div", "row");
+  for(const pair of [["json", "整段 JSON"], ["parts", "分项填值"]]){
+    const label = document.createElement("label");
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "cookieMode";
+    radio.value = pair[0];
+    radio.addEventListener("change", () => { if(radio.checked) applyCookieMode(pair[0]); });
+    label.appendChild(radio);
+    label.appendChild(document.createTextNode(pair[1]));
+    row.appendChild(label);
+  }
+  box.appendChild(row);
+  anchor.parentNode.insertBefore(box, anchor);
+
+  const mode = detectCookieMode();
+  const picked = box.querySelector('input[value="' + mode + '"]');
+  if(picked) picked.checked = true;
+  applyCookieMode(mode);
+}
+
+function arrayHasAnyControl(){
+  if(CTRL.get(COOKIE_JSON_PATH)) return true;
+  return COOKIE_PART_PATHS.some(path => !!CTRL.get(path));
+}
+
 function renderConfig(){
   const form = $("cfgForm");
   form.replaceChildren();
@@ -1472,6 +1558,7 @@ function renderConfig(){
     card.appendChild(wrap);
     form.appendChild(card);
   }
+  setupCookieMode();
   updateCfgState();
   markDirtyUI();
   restoreDirty();
