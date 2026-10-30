@@ -14,10 +14,12 @@
 
 import datetime
 import json
+import re
 import threading
 import time
 
 import requests
+from urllib3.util import Timeout
 
 try:  # 插件作为包加载
     from .hw_privacy import redact_error
@@ -46,18 +48,48 @@ _LAST_REQUEST_AT = 0.0
 _MIN_REQUEST_INTERVAL = 0.2
 
 
-def _throttle_request():
+def _remaining(deadline):
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RequestDeadlineExceeded("取数已超过总时间预算，请稍后重试")
+    return remaining
+
+
+def _budget_sleep(delay, deadline=None):
+    remaining = _remaining(deadline)
+    if remaining is not None and delay >= remaining:
+        raise RequestDeadlineExceeded("剩余时间不足以完成重试，请稍后重试")
+    if delay > 0:
+        time.sleep(delay)
+    _remaining(deadline)
+
+
+def _throttle_request(deadline=None):
     global _LAST_REQUEST_AT
-    with _REQUEST_GATE:
+    remaining = _remaining(deadline)
+    acquired = (_REQUEST_GATE.acquire() if remaining is None
+                else _REQUEST_GATE.acquire(timeout=remaining))
+    if not acquired:
+        raise RequestDeadlineExceeded("请求排队超过总时间预算，请稍后重试")
+    try:
         now = time.monotonic()
         wait = _MIN_REQUEST_INTERVAL - (now - _LAST_REQUEST_AT)
         if wait > 0:
-            time.sleep(wait)
+            _budget_sleep(wait, deadline)
+        _remaining(deadline)
         _LAST_REQUEST_AT = time.monotonic()
+    finally:
+        _REQUEST_GATE.release()
 
 
 class HuaweiHealthError(Exception):
     """业务/网络错误。"""
+
+
+class RequestDeadlineExceeded(HuaweiHealthError):
+    """一次工具查询的时间预算已耗尽，不应继续排队或重试。"""
 
 
 class AuthExpired(HuaweiHealthError):
@@ -265,10 +297,26 @@ def _parse_stats(raw) -> dict:
     return {"overall": overall, "daily": [{"day": d, **v} for d, v in sorted(daily.items())]}
 
 
-def _day_window(days: int):
+def parse_timezone(value="+0800"):
+    """把配置中的 +0800 / +08:00 转为时区，避免依赖服务器本地时区。"""
+    if isinstance(value, datetime.tzinfo):
+        return value
+    text = str(value or "+0800").strip()
+    if text.upper() in ("UTC", "Z"):
+        return datetime.timezone.utc
+    match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", text)
+    if not match:
+        raise ValueError("时区格式应为 +0800 或 +08:00")
+    hours, minutes = int(match[2]), int(match[3])
+    if hours > 23 or minutes > 59:
+        raise ValueError("时区偏移超出有效范围")
+    offset = datetime.timedelta(hours=hours, minutes=minutes)
+    return datetime.timezone(offset if match[1] == "+" else -offset)
+
+
+def _day_window(days: int, timezone="+0800"):
     days = max(1, min(int(days), 1095))
-    # TODO(v0.3.2)：显式使用 Asia/Shanghai 日历，当前契约仍固定传 +0800。
-    today = datetime.date.today()
+    today = datetime.datetime.now(parse_timezone(timezone)).date()
     start = today - datetime.timedelta(days=days - 1)
     return start.strftime("%Y%m%d"), today.strftime("%Y%m%d")
 
@@ -277,14 +325,28 @@ class HuaweiHealthClient:
     """只读客户端。"""
 
     def __init__(self, token: str, client_id: str = "", version: str = "",
-                 timeout: int = 25, timezone: str = "+0800"):
+                 timeout: int = 25, timezone: str = "+0800", deadline=None):
         self.token = token
         self.client_id = client_id or DEFAULT_CLIENT_ID
         self.version = version or DEFAULT_VERSION
         self.timeout = timeout
-        self.timezone = timezone or "+0800"
+        self.tz = parse_timezone(timezone)
+        self.timezone = datetime.datetime.now(self.tz).strftime("%z")
+        self.deadline = deadline
+        self._closed = False
         # 复用 TCP/TLS 连接，降低总览接口连续请求的延迟和连接开销。
         self.session = requests.Session()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self.session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
 
     # ---------- 底层 ----------
 
@@ -318,29 +380,38 @@ class HuaweiHealthClient:
 
     def _request(self, method: str, path: str, *, params=None, body=None):
         """发起一次有限重试的请求；401 交给上层只做一次重认证。"""
+        if self._closed:
+            raise HuaweiHealthError("数据客户端已关闭")
         for attempt in range(MAX_RETRIES + 1):
             try:
-                _throttle_request()
+                _throttle_request(self.deadline)
+                remaining = _remaining(self.deadline)
+                # total 扣除连接耗时后再约束读取。同步 requests 无法强制中断
+                # 已开始的系统 I/O；上层仍应限制协程等待并拒绝超时结果。
+                timeout = self.timeout if remaining is None else Timeout(
+                    total=remaining, connect=min(self.timeout, remaining),
+                    read=min(self.timeout, remaining))
                 if method == "GET":
                     resp = self.session.get(
                         BASE + path,
                         headers=self._headers(),
                         params=params,
-                        timeout=self.timeout,
+                        timeout=timeout,
                     )
                 else:
                     resp = self.session.post(
                         BASE + path,
                         headers=self._headers(json_body=True),
                         json=body,
-                        timeout=self.timeout,
+                        timeout=timeout,
                     )
             except requests.RequestException:
                 if attempt >= MAX_RETRIES:
                     raise
-                time.sleep(0.5 * (2 ** attempt))
+                _budget_sleep(0.5 * (2 ** attempt), self.deadline)
                 continue
 
+            _remaining(self.deadline)
             # 401 必须立即交给 main._cached，不能在这里重放旧 token。
             if resp.status_code == 401:
                 return self._handle(resp)
@@ -351,7 +422,7 @@ class HuaweiHealthClient:
                         delay = max(0.5, min(float(retry_after), 10.0))
                     except (TypeError, ValueError):
                         delay = 0.5 * (2 ** attempt)
-                    time.sleep(delay)
+                    _budget_sleep(delay, self.deadline)
                     continue
             return self._handle(resp)
         raise HuaweiHealthError("华为接口重试次数耗尽")
@@ -384,14 +455,14 @@ class HuaweiHealthClient:
 
     def resting_heart_rate(self, days: int = 7) -> dict:
         """静息心率（sampleSet 端点，startDay/endDay 用数字，fieldName=restBpm）。"""
-        s, e = _day_window(days)
+        s, e = _day_window(days, self.tz)
         raw = self._post("/sampleSet/periodStatistics:calculate",
                          self._stats_body(RESTING_HR_TYPE, int(s), int(e)))
         return _parse_stats(raw)
 
     def hrv_stats(self, days: int = 7) -> dict:
         """睡眠 HRV（healthRecords 端点，startDay/endDay 用字符串）。"""
-        s, e = _day_window(days)
+        s, e = _day_window(days, self.tz)
         raw = self._post("/healthRecords/periodStatistics:calculate",
                          self._stats_body(SLEEP_TYPE, s, e, [HRV_FIELD]))
         return _parse_stats(raw)
@@ -399,7 +470,7 @@ class HuaweiHealthClient:
     def sleep_records(self, days: int = 7) -> list:
         """睡眠明细（GET /healthRecords，纳秒窗口）。"""
         days = max(1, min(int(days), 730))
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(self.tz)
         start = now - datetime.timedelta(days=days)
         raw = self._get("/healthRecords", params={
             "dataType": SLEEP_TYPE,
@@ -424,7 +495,7 @@ class HuaweiHealthClient:
     def activities(self, days: int = 30, limit: int = 20) -> list:
         """运动记录列表（毫秒窗口）。"""
         days = max(1, min(int(days), 730))
-        now_ms = int(datetime.datetime.now().timestamp() * 1000)
+        now_ms = int(datetime.datetime.now(self.tz).timestamp() * 1000)
         raw = self._post("/activityRecord:query", {
             "startTime": now_ms - days * 86400000,
             "endTime": now_ms,
@@ -454,14 +525,14 @@ class HuaweiHealthClient:
 
     def stress_stats(self, days: int = 7) -> dict:
         """压力（stressScore，sampleSet 端点）。"""
-        s, e = _day_window(days)
+        s, e = _day_window(days, self.tz)
         raw = self._post("/sampleSet/periodStatistics:calculate",
                          self._stats_body(STRESS_TYPE, int(s), int(e)))
         return _parse_stats(raw)
 
     def body_weight(self, days: int = 365) -> dict:
         """体重（bodyWeight，sampleSet 端点）。"""
-        s, e = _day_window(days)
+        s, e = _day_window(days, self.tz)
         raw = self._post("/sampleSet/periodStatistics:calculate",
                          self._stats_body(WEIGHT_TYPE, int(s), int(e)))
         return _parse_stats(raw)
@@ -521,3 +592,83 @@ class HuaweiHealthClient:
                     "心率区间字段全部缺失（mOtherHeartRateData 键=%s）" % list(hr)[:8])
             return zones
         return {}
+
+
+class ClientPool:
+    """有限的同步客户端池；一次借用独占 Session，允许跨查询复用连接。
+
+    run 应在工作线程里调用。invalidate 不打断正在执行的 requests，旧代
+    客户端归还时关闭；调用方必须另外校验账号代数，拒绝旧请求的结果。
+    """
+
+    def __init__(self, max_size=3):
+        self.max_size = max(1, int(max_size))
+        self._condition = threading.Condition()
+        self._entries = []
+        self._generation = 0
+        self._closed = False
+
+    def _checkout(self, key, deadline):
+        with self._condition:
+            while True:
+                if self._closed:
+                    raise HuaweiHealthError("数据连接池已关闭")
+                remaining = _remaining(deadline)
+                idle = [entry for entry in self._entries if not entry["busy"]]
+                for entry in idle:
+                    if entry["key"] == key:
+                        entry["busy"] = True
+                        entry["client"].deadline = deadline
+                        return entry
+                if len(self._entries) >= self.max_size and idle:
+                    evicted = idle[0]
+                    self._entries.remove(evicted)
+                    evicted["client"].close()
+                if len(self._entries) < self.max_size:
+                    token, client_id, version, timezone, timeout = key
+                    client = HuaweiHealthClient(
+                        token, client_id=client_id, version=version,
+                        timezone=timezone, timeout=timeout, deadline=deadline)
+                    entry = {"key": key, "client": client, "busy": True,
+                             "generation": self._generation}
+                    self._entries.append(entry)
+                    return entry
+                self._condition.wait(timeout=remaining)
+
+    def run(self, token, producer, *, client_id="", version="", timezone="+0800",
+            timeout=25, deadline=None):
+        tz = datetime.datetime.now(parse_timezone(timezone)).strftime("%z")
+        key = (token, client_id or DEFAULT_CLIENT_ID,
+               version or DEFAULT_VERSION, tz, timeout)
+        entry = self._checkout(key, deadline)
+        try:
+            _remaining(deadline)
+            result = producer(entry["client"])
+            _remaining(deadline)
+            return result
+        finally:
+            with self._condition:
+                if self._closed or entry["generation"] != self._generation:
+                    self._entries.remove(entry)
+                    entry["client"].close()
+                else:
+                    entry["busy"] = False
+                    entry["client"].deadline = None
+                    # 最后使用的排在末尾，换 token / 配置时优先淘汰最旧空闲项。
+                    self._entries.remove(entry)
+                    self._entries.append(entry)
+                self._condition.notify_all()
+
+    def invalidate(self):
+        with self._condition:
+            self._generation += 1
+            for entry in list(self._entries):
+                if not entry["busy"]:
+                    self._entries.remove(entry)
+                    entry["client"].close()
+            self._condition.notify_all()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self.invalidate()
