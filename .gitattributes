@@ -1,0 +1,23 @@
+# 分发包内容边界。
+#
+# 市场不读 GitHub Release 里的附件，而是直接拉 archive/<sha>.zip 构建
+# （2026-10-31 实测：市场包与 zipball 逐字节相同，均为 466,203 字节 / 70 条目）。
+# GitHub 的 zipball 基于 git archive，会遵循这里的 export-ignore。
+#
+# 因此凡是「开发 / CI / 内部工程记录」的文件一律标 export-ignore，
+# 保证用户拿到的安装包只含运行必需的东西。
+
+# ---- 内部工程文档 ----
+AUDIT_concurrency.md      export-ignore
+DELIVERY_ENGINEERING.md   export-ignore
+DELIVERY_WEBUI.md         export-ignore
+
+# ---- 开发与 CI 资产 ----
+tests/                    export-ignore
+scripts/                  export-ignore
+.github/                  export-ignore
+.gitignore                export-ignore
+
+# ---- 历史版本说明（只随包附当前版本的 CHANGELOG）----
+CHANGELOG_v0.4.1.md       export-ignore
+CHANGELOG_v0.4.2.md       export-ignore
