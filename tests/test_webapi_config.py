@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """T8 契约测试：WebUI 配置同源（``GET`` / ``POST`` ``<PAGE_PREFIX>/config``）。
 
-唯一真值：仓库根目录的 ``CONTRACT_webui_config.md``（下文用 §x.y 引用它的章节）。
+普通配置遵循 ``CONTRACT_webui_config.md``（下文用 §x.y 引用章节）。
+敏感 Cookie 的存储契约已加固：完整集合只写安全存储，普通配置清空对应字段；
+因此不再断言新 Cookie 明文出现在 AstrBot 配置中。21 项表单和掩码响应保持兼容。
 
 覆盖范围（对应契约 §6 的必测清单）：
 
@@ -292,23 +294,36 @@ class StubCookieImport:
 
     def __enter__(self):
         self._original = hw_auth.HuaweiAuth.import_cookie_sources
+        self._original_load = hw_auth.HuaweiAuth.load_cookies
         recorder = self
+        snapshots = {}
 
-        def fake_import(auth_self, json_text="", fields=None, only_if_changed=False):
+        def fake_import(auth_self, json_text="", fields=None, only_if_changed=False,
+                        replace_existing=False):
             recorder.calls.append({
                 "json_text": json_text,
                 "fields": dict(fields or {}),
                 "only_if_changed": only_if_changed,
+                "replace_existing": replace_existing,
             })
             if recorder.error is not None:
                 raise recorder.error
+            snapshots[auth_self.cookie_file] = (hw_auth.parse_cookie_input(json_text) +
+                                                 hw_auth.cookies_from_fields(fields))
             return recorder.result
 
+        def fake_load(auth_self):
+            if auth_self.cookie_file in snapshots:
+                return snapshots[auth_self.cookie_file]
+            return recorder._original_load(auth_self)
+
         hw_auth.HuaweiAuth.import_cookie_sources = fake_import
+        hw_auth.HuaweiAuth.load_cookies = fake_load
         return self
 
     def __exit__(self, *exc_info):
         hw_auth.HuaweiAuth.import_cookie_sources = self._original
+        hw_auth.HuaweiAuth.load_cookies = self._original_load
         return False
 
 
@@ -624,8 +639,15 @@ class TestPostEveryLeafApplies(_ApiCase):
                     plugin, api, cfg = make_api(make_config())
                     # warmup false→true 会 create_task(_warmup())；换成空实现，避免真去取 token
                     plugin._warmup = _noop_warmup
+                    inputs = leaf_body(path, new_value)
+                    if path in SENSITIVE_LEAVES and path != "cookie_json":
+                        # An identity update cannot borrow required Cookie values
+                        # from an old account. Each form field still applies when
+                        # the same submission supplies a complete valid set.
+                        inputs.setdefault("cookie_CASTGC", "CASTGC-COMPLETE")
+                        inputs.setdefault("cookie_sid", "SID-COMPLETE")
                     resp = post_config(api, {
-                        "values": leaf_body(path, new_value),
+                        "values": inputs,
                         "revision": revision_of(api),
                     })
                     payload = self.assert_ok(resp)
@@ -633,8 +655,13 @@ class TestPostEveryLeafApplies(_ApiCase):
                     self.assertEqual(payload["reloaded"], [], path)
                     self.assertIn(path, payload["changed"], path)
                     self.assertNotIn(path, payload.get("clamped") or {}, path)
-                    self.assertEqual(read_path(cfg, path), new_value, path)
-                    self.assertEqual(read_path(read_config_file(cfg), path), new_value, path)
+                    if path in SENSITIVE_LEAVES:
+                        self.assertTrue(all(cfg[key] == "" for key in SENSITIVE_LEAVES))
+                        saved = read_config_file(cfg)
+                        self.assertTrue(all(saved[key] == "" for key in SENSITIVE_LEAVES))
+                    else:
+                        self.assertEqual(read_path(cfg, path), new_value, path)
+                        self.assertEqual(read_path(read_config_file(cfg), path), new_value, path)
                     # 保存后的 values 是**掩码视图**（契约 §3.3「与 GET 的 values 同构」）：
                     # 7 个敏感项恒为 "***"，是否有值只体现在 meta.has_value。
                     masked = read_path(payload["data"]["values"], path)
@@ -1163,9 +1190,12 @@ class TestMaskWriteBack(_ApiCase):
         严格 ``== "***"`` 时 ``" *** "`` 会被当成真实值写进配置、覆盖真实 cookie；
         这里用**真实消费者**（cookie 文件里的 CASTGC）而不是回读配置来证明没被覆盖。
         """
-        # 先往 cookie 文件写一份真实值，作为「真实 cookie 有没有被动过」的观察点
-        self.plugin.auth.import_cookie_sources(
-            "", {"CASTGC": "REAL-CASTGC-9f1c", "sid": "REAL-SID-2a7b"})
+        # A pre-existing legacy snapshot isolates mask/no-op behavior from the
+        # host's DPAPI availability. Real secure writes are covered separately.
+        cookies = hw_auth.cookies_from_fields(
+            {"CASTGC": "REAL-CASTGC-9f1c", "sid": "REAL-SID-2a7b"})
+        with open(self.plugin.cookie_file, "w", encoding="utf-8") as stream:
+            json.dump(cookies, stream)
         self.assertEqual(self.cookie_file_value("CASTGC"), "REAL-CASTGC-9f1c")
         original = self.config["cookie_CASTGC"]
 
@@ -1193,22 +1223,24 @@ class TestMaskWriteBack(_ApiCase):
 # ============================ cookie 热生效 ============================
 
 class TestCookieHotApply(_ApiCase):
-    """契约 §4：cookie 组变更 → ``import_cookie_sources(..., only_if_changed=True)``。"""
+    """Secure Cookie updates replace the full set and remove plaintext config copies."""
 
     def test_cookie_field_triggers_import(self):
         with StubCookieImport(result=3) as stub:
-            payload = self.assert_ok(self.send({"cookie_CASTGC": "CASTGC-NEW-9f1c"}))
+            payload = self.assert_ok(self.send({"cookie_CASTGC": "CASTGC-NEW-9f1c",
+                                                "cookie_sid": "SID-NEW-9f1c"}))
         self.assertIn("cookie_CASTGC", payload["applied"])
         self.assertEqual(payload["reloaded"], [])
         self.assertEqual(len(stub.calls), 1)
         call = stub.calls[0]
-        self.assertTrue(call["only_if_changed"], "契约 §4：必须传 only_if_changed=True")
+        self.assertFalse(call["only_if_changed"], "不能用指纹快路径跳过旧明文文件的安全迁移")
+        self.assertTrue(call["replace_existing"], "不能继承旧账号的辅助 Cookie")
         self.assertEqual(call["fields"].get("CASTGC"), "CASTGC-NEW-9f1c")
-        # 其余 5 个分项来自配置里的现值（未改的键也要传齐，契约 §4 的 fields 构造）
-        for name in ("sid", "hwid_cas_sid", "HuaweiID_CAS_ISCASLOGIN",
+        self.assertEqual(call["fields"].get("sid"), "SID-NEW-9f1c")
+        for name in ("hwid_cas_sid", "HuaweiID_CAS_ISCASLOGIN",
                      "CASLOGINSITE", "LOGINACCSITE"):
-            self.assertEqual(call["fields"].get(name),
-                             self.config.get("cookie_" + name), name)
+            self.assertEqual(call["fields"].get(name), "", name)
+        self.assertTrue(all(self.config[key] == "" for key in SENSITIVE_LEAVES))
 
     def test_cookie_json_triggers_import_with_raw_json(self):
         raw = '[{"name":"CASTGC","value":"X"},{"name":"sid","value":"Y"}]'
@@ -1217,26 +1249,32 @@ class TestCookieHotApply(_ApiCase):
         self.assertIn("cookie_json", payload["applied"])
         self.assertEqual(len(stub.calls), 1)
         self.assertEqual(stub.calls[0]["json_text"], raw)
-        self.assertTrue(stub.calls[0]["only_if_changed"])
+        self.assertFalse(stub.calls[0]["only_if_changed"])
+        self.assertTrue(stub.calls[0]["replace_existing"])
 
     def test_non_cookie_change_does_not_import(self):
         with StubCookieImport() as stub:
             self.assert_ok(self.send({"token_ttl": 1300}))
         self.assertEqual(stub.calls, [])
 
-    def test_import_returning_zero_is_still_ok(self):
-        """``only_if_changed=True`` 时「没变化」返回 0，这不是错误。"""
-        with StubCookieImport(result=0):
-            payload = self.assert_ok(self.send({"cookie_CASTGC": "CASTGC-NEW-9f1c"}))
+    def test_same_legacy_values_still_migrate_and_clear_plaintext(self):
+        """An explicit re-submit must migrate even if its values equal old config."""
+        values = {"cookie_CASTGC": "CASTGC-NEW-9f1c", "cookie_sid": "SID-NEW-9f1c"}
+        self.config.update(values)
+        self.config._write_file()
+        with StubCookieImport() as stub:
+            payload = self.assert_ok(self.send(values))
         self.assertIn("cookie_CASTGC", payload["applied"])
-        self.assertEqual(self.config["cookie_CASTGC"], "CASTGC-NEW-9f1c")
+        self.assertEqual(len(stub.calls), 1)
+        self.assertFalse(stub.calls[0]["only_if_changed"])
+        self.assertTrue(all(self.saved()[key] == "" for key in SENSITIVE_LEAVES))
 
     def test_import_failure_is_400_and_nothing_is_saved(self):
         digest = sha256_file(self.config.config_path)
         memory = copy.deepcopy(dict(self.config))
         error = hw_auth.HuaweiAuthError("缺少必要的 cookie：sid")
         with StubCookieImport(error=error):
-            resp = self.send({"cookie_CASTGC": "CASTGC-NEW-9f1c"})
+            resp = self.send({"cookie_CASTGC": "CASTGC-NEW-9f1c", "cookie_sid": "SID-NEW"})
         payload = self.assert_error(resp, 400, "cookie_CASTGC")
         self.assertIn("cookie", payload["message"].lower())
         self.assertEqual(sha256_file(self.config.config_path), digest,

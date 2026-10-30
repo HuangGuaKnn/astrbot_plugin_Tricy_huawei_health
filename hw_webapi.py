@@ -16,11 +16,11 @@ from astrbot.api.web import json_response, request
 
 try:
     from .hw_login import LoginFlowError
-    from .hw_credentials import CredentialsError, DPAPIUnavailableError
+    from .hw_credentials import CredentialsError, CredentialsUnavailableError, CredentialsLockedError
     from .hw_privacy import redact_error
 except ImportError:
     from hw_login import LoginFlowError
-    from hw_credentials import CredentialsError, DPAPIUnavailableError
+    from hw_credentials import CredentialsError, CredentialsUnavailableError, CredentialsLockedError
     from hw_privacy import redact_error
 
 PAGE_PREFIX = "astrbot_plugin_Tricy_huawei_health/page"
@@ -30,15 +30,16 @@ PAGE_PREFIX = "astrbot_plugin_Tricy_huawei_health/page"
 #: （HUAWEI_ID_CAS_ISCASLOGIN / __uni__uid），而 CASLOGINSITE / LOGINACCSITE 配了却
 #: 永远显示不出来。
 try:
-    from .hw_auth import MIN_COOKIE_SPECS
+    from .hw_auth import MIN_COOKIE_SPECS, REQUIRED_COOKIES, cookies_from_fields, parse_cookie_input
 except ImportError:
-    from hw_auth import MIN_COOKIE_SPECS
+    from hw_auth import MIN_COOKIE_SPECS, REQUIRED_COOKIES, cookies_from_fields, parse_cookie_input
 
 KEY_COOKIES = tuple(name for name, _, _ in MIN_COOKIE_SPECS)
 
 # ==================== T8：配置同源（WebUI 直接读写 AstrBot 配置）====================
 #
-# 铁律：只读写 self.plugin.config 这一份配置，绝不另存第二份配置文件。
+# 普通设置只读写 self.plugin.config 这一份配置，不另建配置副本。
+# Cookie 表单是只写安全导入入口；导入成功后清空普通配置中的七个敏感字段。
 # AstrBotConfig.__setattr__ 只做 self[key] = value（不落盘），所以保存必须显式调用
 # save_config_async()（异步 + 内部 revision 防旧快照覆盖）。
 
@@ -80,6 +81,14 @@ class ConfigValueError(Exception):
         super().__init__(message)
         self.field = field
         self.message = message
+
+
+class ConfigPersistError(Exception):
+    """A validated update could not be committed to the AstrBot config."""
+
+
+class ConfigRevisionError(Exception):
+    """The account/config changed while this request waited for its transaction."""
 
 
 def _schema_path() -> str:
@@ -140,6 +149,7 @@ def _get_path(values: dict, path: str):
 class HuaweiHealthWebApi:
     def __init__(self, plugin):
         self.plugin = plugin
+        self._config_lock = asyncio.Lock()
 
     # ---------- 注册 ----------
 
@@ -189,6 +199,13 @@ class HuaweiHealthWebApi:
         except Exception:
             path = ""
         return {"path": path, "found": bool(path)}
+
+    def _cookie_storage_data(self) -> dict:
+        """只返回存储保护方式，不把 Cookie 内容或文件路径交给页面。"""
+        try:
+            return self.plugin.auth.cookie_storage_status()
+        except Exception:
+            return {"mode": "error", "encrypted": False, "message": "Cookie 存储状态暂时不可用"}
 
     # ---------- 接口 ----------
 
@@ -249,9 +266,10 @@ class HuaweiHealthWebApi:
         # cookie
         cf = p.cookie_file
         cinfo = {"exists": os.path.exists(cf), "count": 0, "mtime": "-", "keys": [], "error": ""}
+        cinfo["storage"] = await asyncio.to_thread(self._cookie_storage_data)
         if cinfo["exists"]:
             try:
-                cookies = p.auth.load_cookies()
+                cookies = await asyncio.to_thread(p.auth.load_cookies)
                 cinfo["count"] = len(cookies)
                 cinfo["mtime"] = time.strftime(
                     "%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(cf)))
@@ -271,19 +289,29 @@ class HuaweiHealthWebApi:
         data["cookie"] = cinfo
 
         # token
-        tok = p.store.get("token") or {}
-        left = 0
-        if tok.get("expire_at"):
-            left = int(tok["expire_at"] - time.time())
-        data["token"] = {
-            "cached": bool(tok.get("token")),
-            "left": max(0, left),
-            "obtained_at": tok.get("obtained_at") or "-",
-        }
+        tinfo = {"cached": False, "left": 0, "obtained_at": "-",
+                 "state": "absent", "error": ""}
+        try:
+            # Secret providers may access Keychain or files. Keep that work off
+            # the event loop, and never treat a locked store as a cache miss.
+            tok = await asyncio.to_thread(p.store.get, "token") or {}
+            left = int(float(tok["expire_at"]) - time.time()) if tok.get("expire_at") else 0
+            cached = bool(tok.get("token"))
+            tinfo.update({"cached": cached, "left": max(0, left),
+                          "obtained_at": tok.get("obtained_at") or "-",
+                          "state": ("ready" if left > 0 else "expired") if cached else "absent"})
+        except CredentialsError:
+            tinfo.update({"state": "locked", "error":
+                          "token 缓存已锁定，请检查原主密钥、系统加密服务或文件完整性；原记录未被覆盖"})
+        except Exception:
+            # Database exceptions can include paths or raw values. The status
+            # endpoint should remain usable for recovery without echoing them.
+            tinfo.update({"state": "error", "error": "token 缓存读取失败，请检查数据库访问权限或文件状态"})
+        data["token"] = tinfo
 
         # 缓存
         try:
-            keys = p.store.keys()
+            keys = await asyncio.to_thread(p.store.keys)
         except Exception:
             keys = []
         data["cache"] = {"count": len(keys), "keys": keys[:20]}
@@ -297,7 +325,10 @@ class HuaweiHealthWebApi:
         同样的并发上限、同样的整体超时兜底（v0.4.0 这里是复制粘贴的一份实现）。
         """
         p = self.plugin
-        items = await p._overview_items()
+        try:
+            items = await p._overview_items()
+        except Exception as exc:
+            return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         return json_response({"status": "ok", "data": {
             "items": items,
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -313,56 +344,58 @@ class HuaweiHealthWebApi:
         if not isinstance(body, dict):
             return json_response({"status": "error", "message": "请求体必须是 JSON 对象"},
                                  status_code=400)
-        text = (body.get("json") or "").strip()
-        fields = body.get("fields") if isinstance(body.get("fields"), dict) else {}
-        if not text and not any(str(v or "").strip() for v in fields.values()):
+        text = body.get("json", "")
+        if not isinstance(text, str):
+            return json_response({"status": "error", "message": "json 字段必须是字符串"}, status_code=400)
+        text = text.strip()
+        fields = body.get("fields", {})
+        if not isinstance(fields, dict) or any(not isinstance(v, str) for v in fields.values()):
+            return json_response({"status": "error", "message": "fields 必须是 Cookie 名称与字符串值组成的对象"},
+                                 status_code=400)
+        if not text and not any(v.strip() for v in fields.values()):
             return json_response({"status": "error", "message": "cookie 内容为空"},
                                  status_code=400)
         try:
-            # v0.4.1：与磁盘上已有的 cookie 合并 + 补齐 CASTGC 两条路径 + 缺关键项直接报错。
-            n = p.auth.import_cookie_sources(text, fields)
+            # 显式导入替换整个 Cookie 集合；不混入上一账号的辅助会话 Cookie。
+            n = await p._change_auth_state(lambda: p.auth.import_cookie_sources(text, fields, replace_existing=True))
         except Exception as exc:
             return json_response(
                 {"status": "error", "message": redact_error(exc)}, status_code=400)
-        # 换 cookie 时清除 token 及全部健康缓存，避免跨账号泄露旧数据。
-        await p._invalidate_auth_cache()
         p.logger.info("[华为健康] WebUI 导入了 %d 条 cookie" % n)
         return json_response({
             "status": "ok",
-            "message": "已导入 %d 条 cookie（已与现有 cookie 合并），token 缓存已作废，下次查询会重新认证" % n,
+            "message": "已导入 %d 条 cookie（已替换旧会话），token 缓存已作废，下次查询会重新认证" % n,
             "count": n,
         })
 
     async def clear_cookie(self):
         p = self.plugin
         try:
-            # 通过认证层的共享锁清除，避免与浏览器回写并发时旧 cookie 被恢复。
-            p.auth.clear_cookies()
+            await p._change_auth_state(clear_cookies=True)
         except Exception as exc:
             return json_response(
                 {"status": "error", "message": redact_error(exc)}, status_code=500)
-        await p._invalidate_auth_cache()
         p.logger.warning("[华为健康] WebUI 清除了 cookie 文件")
         return json_response({"status": "ok", "message": "cookie 已清除，token 缓存已作废"})
 
     async def refresh(self):
         p = self.plugin
         try:
-            # 统一推进缓存 generation，防止并发旧请求在刷新后写回。
-            await p._invalidate_auth_cache()
-        except Exception:
-            pass
-        try:
-            await p._token(force=True)
+            # 清理失败必须中止，不可继续认证后把失败误报为成功。
+            await p._change_auth_state()
+            await asyncio.wait_for(p._token(force=True), timeout=getattr(p, "QUERY_TIMEOUT", 90))
         except Exception as exc:
             return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         return json_response({"status": "ok", "message": "缓存已清空，并已重新拿到最新 token"})
 
-    # ---------- 账号凭据（v0.4.0 第 3 阶段：DPAPI，只写接口） ----------
+    # ---------- 账号凭据（只写接口，状态只包含保护方式与掩码） ----------
 
     def _credentials_status_data(self):
         store = getattr(self.plugin, "credentials", None)
         raw = store.status() if store is not None else {}
+        storage = raw.get("storage") if isinstance(raw.get("storage"), dict) else {}
+        available = (bool(storage["available"]) if "available" in storage else
+                     bool(getattr(store, "available", False)))
         password_set = bool(raw.get("password_set"))
         login_manager = getattr(self.plugin, "login_manager", None)
         configured_mode = getattr(login_manager, "login_mode", "cookie")
@@ -382,15 +415,23 @@ class HuaweiHealthWebApi:
             "password_set": password_set,
             "account_masked": str(raw.get("account_masked") or ""),
             "updated_at": updated_at,
-            # v0.4.1：区分「没保存 / 已保存 / 损坏 / 被占用 / 不支持 DPAPI」，
+            # 区分「没保存 / 已保存 / 损坏 / 已锁定 / 加密存储未配置」，
             # 不再把损坏的文件谎报成「未保存」。
             "state": str(raw.get("state") or "absent"),
             "error": str(raw.get("error") or ""),
-            "available": bool(getattr(store, "available", False)) if store is not None else False,
+            "available": available,
+            "storage": {
+                "available": available,
+                "method": str(storage.get("method") or "unknown"),
+                "key_source": str(storage.get("key_source") or "none"),
+                "error": redact_error(storage["error"]) if storage.get("error") else "",
+            },
+            "cookie_storage": self._cookie_storage_data(),
         }
 
     async def credentials_status(self):
-        return json_response({"status": "ok", "data": self._credentials_status_data()})
+        data = await asyncio.to_thread(self._credentials_status_data)
+        return json_response({"status": "ok", "data": data})
 
     async def credentials_write(self):
         try:
@@ -406,17 +447,20 @@ class HuaweiHealthWebApi:
         mode = str(body.get("mode") or "").strip().lower()
         clear = body.get("clear") is True or mode == "cookie"
         if clear:
-            try:
+            def clear_credentials():
                 store.clear()
                 self.plugin.login_manager.set_login_mode("cookie")
                 try:
                     self.plugin.login_manager.clear_cooldown()
                 except Exception:
                     pass
-            except (CredentialsError, LoginFlowError):
+            try:
+                await self.plugin._change_auth_state(clear_credentials)
+            except Exception:
                 return json_response({"status": "error", "message": "凭据清除失败，请稍后重试"}, status_code=500)
             return json_response({
-                "status": "ok", "data": self._credentials_status_data(), "message": "账号密码凭据已清除",
+                "status": "ok", "data": await asyncio.to_thread(self._credentials_status_data),
+                "message": "账号密码凭据已清除，已切换到 Cookie 模式并清空缓存",
             })
 
         account = body.get("account")
@@ -425,11 +469,13 @@ class HuaweiHealthWebApi:
             return json_response({"status": "error", "message": "请输入账号和密码"}, status_code=400)
         if not account.strip() or not password or len(account) > 150 or len(password) > 512:
             return json_response({"status": "error", "message": "请输入有效的账号和密码"}, status_code=400)
-        if not store.available:
+        storage_status = await asyncio.to_thread(self._credentials_status_data)
+        if not storage_status["available"]:
             return json_response({
-                "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
+                "status": "error", "message": storage_status["storage"]["error"] or
+                "加密存储尚未就绪，请先按 README 配置主密钥，再保存账号密码",
             }, status_code=409)
-        try:
+        def save_credentials():
             store.save(account, password)
             self.plugin.login_manager.set_login_mode("password")
             # 用户刚把密码改对：把 6 小时失败冷却立刻清掉，否则提示会自相矛盾
@@ -438,18 +484,27 @@ class HuaweiHealthWebApi:
                 self.plugin.login_manager.clear_cooldown()
             except Exception:
                 pass
-        except DPAPIUnavailableError:
+
+        try:
+            # 保存新账号时撤销旧登录态，避免新账号认证失败后回退到旧账号 Cookie。
+            await self.plugin._change_auth_state(save_credentials, clear_cookies=True)
+        except CredentialsUnavailableError as exc:
             return json_response({
-                "status": "error", "message": "当前系统不支持 DPAPI，账号密码登录未启用",
+                "status": "error", "message": redact_error(exc) or "加密存储不可用，请检查主密钥配置",
             }, status_code=409)
-        except CredentialsError:
+        except CredentialsLockedError:
+            return json_response({
+                "status": "error", "message": "凭据已锁定，请检查主密钥或文件权限；原文件已保留",
+            }, status_code=409)
+        except Exception:
             return json_response({"status": "error", "message": "凭据保存失败，请稍后重试"}, status_code=500)
         finally:
             # Do not retain request fields after the write path returns.
             account = None
             password = None
         return json_response({
-            "status": "ok", "data": self._credentials_status_data(), "message": "账号密码已加密保存",
+            "status": "ok", "data": await asyncio.to_thread(self._credentials_status_data),
+            "message": "账号密码已加密保存，旧登录态已清除，下次查询会重新登录",
         })
 
     # ---------- 登录会话（v0.4.0 第 4 阶段：自动登录与降级） ----------
@@ -470,26 +525,29 @@ class HuaweiHealthWebApi:
         )
         prefer_auto = body.get("prefer_auto") if isinstance(body.get("prefer_auto"), bool) else None
         try:
+            session = p.login_manager.current_session()
+            if (session is not None and session.is_running()
+                    and session.snapshot().get("state") not in ("DONE", "FAILED")):
+                return json_response({"status": "ok", "data": p.login_manager.status()})
             # 用户在 WebUI 主动点「开始登录」不占用每日自动登录额度，
             # 只有取数路径触发的自动登录才计入额度与失败冷却。
-            # manager.start() 里有文件 fsync + DPAPI 解密，别在事件循环线程上跑。
-            await asyncio.to_thread(
-                p.login_manager.start,
+            # 清理与启动共用状态锁、同一个线程任务，避免中间查询用旧 Cookie 认证。
+            await p._change_auth_state(lambda: p.login_manager.start(
                 mode,
                 auto_trust=auto_trust,
                 allow_visible_fallback=allow_visible_fallback,
                 manual=True,
                 prefer_auto=prefer_auto,
-            )
+            ))
         except LoginFlowError as exc:
             message = {
                 "trust_invalid": "自动信任选项无效",
                 "fallback_invalid": "可见窗口兜底选项无效",
                 "prefer_invalid": "无头自动登录选项无效",
                 "credentials_missing": "尚未保存账号密码，请先在凭据区保存",
-                "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式",
+                "credentials_unavailable": "加密存储尚未就绪，请检查系统凭据或主密钥配置",
                 "credentials_corrupt": "账号密码凭据已损坏，请在凭据区重新保存",
-                "credentials_locked": "账号密码凭据被占用或无权读取，请稍后重试",
+                "credentials_locked": "账号密码凭据已锁定，请检查主密钥或文件权限",
                 "daily_limit": "今日自动登录失败次数已达上限，请稍后再试",
                 "cooldown": "自动登录失败冷却中，请稍后再试",
                 "unsupported": "登录模式无效",
@@ -499,6 +557,8 @@ class HuaweiHealthWebApi:
                 "status": "error",
                 "message": message,
             }, status_code=status)
+        except Exception as exc:
+            return json_response({"status": "error", "message": p._err(exc)}, status_code=500)
         # v0.4.1：返回体与 /login/status 统一（原来用 session.snapshot()，
         # 少 daily_used / daily_limit / prefer_auto，点完登录那一次额度行不刷新）。
         return json_response({"status": "ok", "data": p.login_manager.status()})
@@ -576,7 +636,11 @@ class HuaweiHealthWebApi:
                 mtime = os.stat(path).st_mtime_ns
             except OSError:
                 mtime = 0
-        return "%s-%s-%s" % (revision, committed, mtime)
+        # A dedicated Cookie/credentials update also invalidates a form opened
+        # before that account change, even when the AstrBot config was untouched.
+        return "%s-%s-%s-%s-%s" % (
+            revision, committed, mtime,
+            getattr(self.plugin, "_auth_epoch", 0), getattr(self.plugin, "_data_epoch", 0))
 
     def _config_mtime_text(self) -> str:
         path = getattr(self.plugin.config, "config_path", None)
@@ -589,7 +653,7 @@ class HuaweiHealthWebApi:
             return "-"
 
     def _read_values(self) -> dict:
-        """当前配置的完整视图（21 个叶子，未掩码）。
+        """当前配置的完整视图（21 个叶子，敏感项始终为掩码）。
 
         缺失项按 schema 的 default 补齐，保证前端拿到的永远是完整表单数据。
         """
@@ -599,7 +663,9 @@ class HuaweiHealthWebApi:
         for key, spec in schema.items():
             if not isinstance(spec, dict):
                 continue
-            if spec.get("type") == "object":
+            if key in SENSITIVE_KEYS:
+                values[key] = MASK
+            elif spec.get("type") == "object":
                 raw = cfg.get(key)
                 group = raw if isinstance(raw, dict) else {}
                 children = {}
@@ -623,10 +689,21 @@ class HuaweiHealthWebApi:
                 masked[key] = MASK
         return masked
 
-    @staticmethod
-    def _has_value(values: dict) -> dict:
-        """敏感项是否已配置——只暴露布尔，不暴露内容。"""
-        return {key: bool(str(values.get(key) or "").strip()) for key in SENSITIVE_KEYS}
+    def _has_value(self) -> dict:
+        """Expose presence only, from secure storage or an unmigrated legacy config."""
+        values = self.plugin.config
+        present = {key: bool(str(values.get(key) or "").strip()) for key in SENSITIVE_KEYS}
+        try:
+            cookies = self.plugin.auth.load_cookies()
+        except Exception:
+            cookies = []
+        if cookies:
+            present["cookie_json"] = True
+            for cookie in cookies:
+                name = "cookie_" + str(cookie.get("name") or "")
+                if name in present and str(cookie.get("value") or "").strip():
+                    present[name] = True
+        return present
 
     def _meta(self, values: dict = None) -> dict:
         if values is None:
@@ -634,7 +711,7 @@ class HuaweiHealthWebApi:
         return {
             "revision": self._config_revision(),
             "sensitive": list(SENSITIVE_KEYS),
-            "has_value": self._has_value(values),
+            "has_value": self._has_value(),
             "bounds": {key: list(pair) for key, pair in INT_BOUNDS.items()},
             "updated_at": self._config_mtime_text(),
             "source": "astrbot_config",
@@ -869,7 +946,7 @@ class HuaweiHealthWebApi:
         return True
 
     async def _apply_hot_effects(self, merged: dict, changed) -> None:
-        """保存后需要额外处理的三组配置。其余 18 项本来就是实时读取，天然生效。"""
+        """Apply local consumers after persistence; query epochs are handled by the transaction."""
         p = self.plugin
         changed = set(changed)
 
@@ -935,16 +1012,18 @@ class HuaweiHealthWebApi:
 
     async def get_config(self):
         """GET /page/config：当前值（敏感项掩码）+ 原样 schema + 版本戳。"""
-        values = self._read_values()
-        return json_response({"status": "ok", "data": {
-            "values": self._mask(values),
-            "schema": _load_schema(),
-            "meta": self._meta(values),
-        }})
+        def snapshot():
+            values = self._read_values()
+            return {"status": "ok", "data": {
+                "values": self._mask(values),
+                "schema": _load_schema(),
+                "meta": self._meta(values),
+            }}
+        async with self._config_lock:
+            return json_response(await asyncio.to_thread(snapshot))
 
     async def post_config(self):
         """POST /page/config：白名单 + 类型校验 + UMO 校验 + 并发防护 + 落盘 + 热生效。"""
-        p = self.plugin
         try:
             body = await request.json()
         except Exception:
@@ -966,6 +1045,13 @@ class HuaweiHealthWebApi:
                 {"status": "error", "message": exc.message, "field": exc.field},
                 status_code=400)
 
+        # The revision check and the complete write must share one async lock.
+        # A framework save revision alone cannot undo prior Cookie side effects.
+        async with self._config_lock:
+            return await self._post_config_locked(body, writes, clamped, accepted)
+
+    async def _post_config_locked(self, body, writes, clamped, accepted):
+        p = self.plugin
         # 第 2 步：并发覆盖防护。
         current_revision = self._config_revision()
         expected = body.get("revision")
@@ -982,51 +1068,93 @@ class HuaweiHealthWebApi:
         merged = self._apply_writes(copy.deepcopy(before), writes, _load_schema())
         changed = [
             path for path in accepted
-            if _get_path(merged, path) != _get_path(before, path)
+            if (_get_path(merged, path) != _get_path(before, path) or
+                (path in SENSITIVE_KEYS and bool(str(writes[path]).strip())))
         ]
 
         if not changed:
             # 值没变：不落盘、不触发副作用。applied 也不该报，否则前端会以为改了东西。
-            return json_response(self._config_payload(
-                [], [], clamped, "配置无变化，未写入"))
+            return json_response(await asyncio.to_thread(
+                self._config_payload, [], [], clamped, "配置无变化，未写入"))
 
-        # 第 4 步：cookie 组先导入（失败整单 400，且配置文件此时还没被写过）。
+        # Sensitive fields are a write-only secure-import form. Never merge an
+        # old account's Cookie/config into this request, or persist new secrets
+        # in AstrBot's ordinary JSON config.
         cookie_touched = any(path in SENSITIVE_KEYS for path in changed)
+        cookie_field = next((path for path in changed if path in SENSITIVE_KEYS), "cookie_json")
+        raw_json, fields = "", {}
         if cookie_touched:
             try:
-                raw_json = str(merged.get("cookie_json") or "")
+                raw_json = writes.get("cookie_json", "")
                 fields = {
-                    name: merged.get("cookie_" + name, "")
+                    name: writes.get("cookie_" + name, "")
                     for name, _, _ in MIN_COOKIE_SPECS
                 }
-                await asyncio.to_thread(
-                    p.auth.import_cookie_sources, raw_json, fields, True)
+                incoming = parse_cookie_input(raw_json) + cookies_from_fields(fields)
+                names = {cookie.get("name") for cookie in incoming
+                         if str(cookie.get("value") or "").strip()}
+                if any(name not in names for name in REQUIRED_COOKIES):
+                    raise ConfigValueError(cookie_field,
+                        "Cookie 修改需本次同时提供 CASTGC 和 sid，或包含二者的完整 JSON；"
+                        "不会沿用旧账号字段。清除请使用 Cookie 清除入口")
             except Exception as exc:
                 return json_response({
                     "status": "error",
                     "message": "cookie 导入失败：%s" % redact_error(exc),
-                    # 指到真正变更的那个 cookie 项，前端才能高亮对控件。
-                    "field": next(
-                        (path for path in changed if path in SENSITIVE_KEYS),
-                        "cookie_json",
-                    ),
+                    "field": cookie_field,
                 }, status_code=400)
+            for key in SENSITIVE_KEYS:
+                merged[key] = ""
 
-        # 第 5 步：落盘（同源：写的就是 AstrBot 注入的那个 config）。
-        if not await self._persist(merged):
-            return json_response(
-                {"status": "error", "message": "配置保存失败", "field": ""},
-                status_code=500)
+        imported = False
 
-        # 第 6 步：热生效。
-        await self._apply_hot_effects(merged, changed)
-        if cookie_touched:
-            # 换了 cookie 必须作废 token 与健康缓存，否则会用旧账号的 token 取新账号的数据。
-            try:
-                await p._invalidate_auth_cache()
-            except Exception as exc:
-                p.logger.warning(
-                    "[华为健康] cookie 变更后清缓存失败：%s" % redact_error(exc))
+        def import_cookies():
+            nonlocal imported
+            # No fingerprint shortcut: an unchanged legacy JSON file must still
+            # be encrypted before its config copy is removed.
+            result = p.auth.import_cookie_sources(raw_json, fields, replace_existing=True)
+            imported = True
+            return result
+
+        async def finalize(_result=None):
+            if not await self._persist(merged):
+                raise ConfigPersistError("配置保存失败")
+            await self._apply_hot_effects(merged, changed)
+
+        query_settings = {
+            "client_id", "api_version", "timezone", "token_ttl", "data_ttl",
+            "browser_path", "headless", "page_timeout",
+        }
+
+        def check_current():
+            if self._config_revision() != expected:
+                raise ConfigRevisionError()
+
+        try:
+            if cookie_touched or query_settings.intersection(changed):
+                # The plugin keeps its fail-closed state across async persistence,
+                # without holding a thread lock across await. This also invalidates
+                # inflight work produced with an old timezone/client/TTL setting.
+                await p._change_auth_state_async(
+                    import_cookies if cookie_touched else None, finalize,
+                    check_current=check_current)
+            else:
+                await finalize()
+        except ConfigRevisionError:
+            return json_response({"status": "error",
+                                  "message": "登录状态或配置已变化，请刷新后重试",
+                                  "field": "revision"}, status_code=409)
+        except ConfigPersistError:
+            message = ("Cookie 已安全更新，但配置副本清理保存失败；查询已暂停，"
+                       "请重新提交完整 Cookie 后重试" if imported else "配置保存失败")
+            return json_response({"status": "error", "message": message, "field": ""},
+                                 status_code=500)
+        except Exception as exc:
+            message = ("Cookie 已安全更新，但配置更新未完成；查询已暂停，请重试"
+                       if imported else "配置更新失败：%s" % redact_error(exc))
+            return json_response({"status": "error", "message": message,
+                                  "field": cookie_field if cookie_touched else ""},
+                                 status_code=400 if cookie_touched and not imported else 500)
 
         # 契约：applied 只统计「真的写下去并已生效」的项，值没变的不算（那属于 changed 为空）。
         applied = changed
@@ -1034,5 +1162,6 @@ class HuaweiHealthWebApi:
         if clamped:
             message += "（其中 %d 项已按上下限调整）" % len(clamped)
         p.logger.info("[华为健康] WebUI 保存配置：已生效 %s" % ", ".join(applied))
-        return json_response(self._config_payload(applied, changed, clamped, message))
+        return json_response(await asyncio.to_thread(
+            self._config_payload, applied, changed, clamped, message))
 

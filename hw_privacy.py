@@ -61,7 +61,7 @@ _HEADER_NAMES = (
 _SENSITIVE_KEYS = (
     "access_token", "refresh_token", "id_token", "auth_token", "token",
     "password", "passwd", "pwd", "passphrase",
-    "client_secret", "secret", "secret_key", "access_key", "ssecurity",
+    "client_secret", "secret", "secret_key", "master_key", "access_key", "ssecurity",
     "authorization", "api_key", "api-key", "apikey", "x-api-key",
     "private_key", "privatekey",
     "cookie", "cookies", "set-cookie",

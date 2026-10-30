@@ -21,6 +21,7 @@ import asyncio
 import datetime
 import json
 import os
+import threading
 import time
 
 from astrbot.api import AstrBotConfig, logger
@@ -30,7 +31,7 @@ from astrbot.api.star import Context, Star, register
 try:  # 插件作为包加载
     from .hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS, compute_expire_at
     from .hw_client import (
-        AuthExpired, HuaweiHealthClient, HuaweiHealthError, SchemaDrift,
+        AuthExpired, ClientPool, HuaweiHealthClient, HuaweiHealthError, SchemaDrift, parse_timezone,
         format_distance_m, format_duration_ms, format_duration_s,
     )
     from .hw_store import HealthStore
@@ -40,7 +41,7 @@ try:  # 插件作为包加载
 except ImportError:  # 插件目录在 sys.path 里
     from hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS, compute_expire_at
     from hw_client import (
-        AuthExpired, HuaweiHealthClient, HuaweiHealthError, SchemaDrift,
+        AuthExpired, ClientPool, HuaweiHealthClient, HuaweiHealthError, SchemaDrift, parse_timezone,
         format_distance_m, format_duration_ms, format_duration_s,
     )
     from hw_store import HealthStore
@@ -82,7 +83,7 @@ def _int_cfg(value, default: int, lo: int = None, hi: int = None) -> int:
     """配置/参数取值守卫：非数字不要变成裸 TypeError 抛给用户。"""
     try:
         out = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         out = default
     if lo is not None and out < lo:
         out = lo
@@ -97,6 +98,18 @@ class LoginNeedsHuman(HuaweiAuthError):
     单独一个类型，是因为这种「失败」**不该**被 cookie 回退盖掉——用户需要的是
     「去 WebUI 输验证码」，而不是「重新导出 cookie」。
     """
+
+
+class StateChanged(HuaweiAuthError):
+    """A result belongs to a session which the user has already replaced."""
+
+
+class _PooledClient:
+    def __init__(self, pool, token, **options):
+        self.pool, self.token, self.options = pool, token, options
+
+    def run(self, producer, deadline):
+        return self.pool.run(self.token, producer, deadline=deadline, **self.options)
 
 
 # 版本号与 metadata、WebUI 状态和 README 保持一致，便于升级后核对。
@@ -116,6 +129,13 @@ class HuaweiHealthPlugin(Star):
         self.store = HealthStore(self.db_path)
         self.credentials = HuaweiCredentialsStore(self.data_dir)
         self._lock = asyncio.Lock()
+        self._auth_change_lock = asyncio.Lock()
+        self._state_lock = threading.RLock()
+        self._auth_epoch = 0
+        self._data_epoch = 0
+        self._state_error = False
+        self._closed = False
+        self._client_pool = ClientPool(max_size=3)
         # 记录每个缓存键的进行中任务，避免并发请求重复打华为接口。
         self._cache_inflight = {}
         # generation 用于阻止刷新后旧请求把结果写回缓存。
@@ -159,7 +179,7 @@ class HuaweiHealthPlugin(Star):
                 # 几天前的配置快照整份覆盖 hw_cookies.json，把认证回写的滚续结果
                 # （含 OAuth 期间下发的 __uni__uid / JSESSIONID）冲掉。
                 n = await asyncio.to_thread(
-                    self.auth.import_cookie_sources, raw, fields, True)
+                    self._import_config_cookies, raw, fields)
                 if n:
                     self.logger.info("[华为健康] 已从配置导入 %d 条 cookie（配置有变更）" % n)
                 else:
@@ -205,10 +225,26 @@ class HuaweiHealthPlugin(Star):
             headless=bool(self.config.get("headless", True)),
             page_timeout=_int_cfg(self.config.get("page_timeout"), 90, 1, 600),
             logger=self.logger,
+            commit_lock=self._state_lock,
+            is_current=lambda epoch=self._auth_epoch: (
+                not self._closed and not self._state_error and epoch == self._auth_epoch),
         )
 
     async def _password_token(self) -> str:
-        """跑（或加入）唯一的 DPAPI 自动登录会话，拿到 token。
+        holder = {}
+        cancelled = threading.Event()
+        try:
+            return await self._password_token_impl(holder, cancelled, self._auth_epoch)
+        except asyncio.CancelledError:
+            # start() may still be running in a worker. Its completion checks this flag.
+            cancelled.set()
+            session = holder.get("session")
+            if session is not None:
+                await asyncio.to_thread(session.cancel)
+            raise
+
+    async def _password_token_impl(self, holder, cancelled, epoch) -> str:
+        """跑（或加入）唯一的加密凭据自动登录会话，拿到 token。
 
         v0.4.1 的两个关键变化：
           1. 需要人工介入（验证码 / 账号密码 / 信任选择）时**立刻返回**可行动的
@@ -224,14 +260,24 @@ class HuaweiHealthPlugin(Star):
             exc.code = code
             return exc
 
+        def start_session():
+            with self._state_lock:
+                self._assert_current(epoch)
+                if cancelled.is_set():
+                    return
+                manager.start("auto", manual=False)
+                current = getattr(manager, "current_session", None)
+                holder["session"] = current() if callable(current) else None
+                if cancelled.is_set() and holder["session"] is not None:
+                    holder["session"].cancel()
         try:
-            await asyncio.to_thread(lambda: manager.start("auto", manual=False))
+            await asyncio.to_thread(start_session)
         except LoginFlowError as exc:
             messages = {
                 "credentials_missing": "尚未保存账号密码，请先在 WebUI 凭据区保存。",
                 "credentials_corrupt": "账号密码凭据已损坏，请在 WebUI 重新保存。",
-                "credentials_locked": "账号密码凭据被占用或无权读取，请稍后重试。",
-                "credentials_unavailable": "当前系统不支持安全凭据登录，请使用 Cookie 模式。",
+                "credentials_locked": "账号密码凭据已锁定，请检查文件权限和原主密钥。",
+                "credentials_unavailable": "安全凭据存储不可用，请配置外部主密钥或检查系统加密服务。",
                 "daily_limit": "今日自动登录失败次数已达上限，请稍后再试。",
                 "cooldown": "自动登录失败冷却中，请稍后再试。",
             }
@@ -243,7 +289,9 @@ class HuaweiHealthPlugin(Star):
         deadline = time.monotonic() + min(100, max(60, timeout))
         state = "IDLE"
         while time.monotonic() < deadline:
-            status = manager.status()
+            self._assert_current(epoch)
+            session = holder.get("session")
+            status = session.snapshot() if session is not None else manager.status()
             state = status.get("state") or "IDLE"
             if state == "DONE":
                 cached = self.store.get("token") or {}
@@ -261,7 +309,8 @@ class HuaweiHealthPlugin(Star):
         else:
             # 等满也没结果：真正超时，把会话收掉，别让它继续占着浏览器和额度。
             try:
-                await asyncio.to_thread(manager.cancel)
+                session = holder.get("session")
+                await asyncio.to_thread(session.cancel if session is not None else manager.cancel)
             except Exception:
                 pass
             raise fail("自动登录等待超时，已取消本次会话，请重新开始。", "timeout")
@@ -275,154 +324,294 @@ class HuaweiHealthPlugin(Star):
             "自动登录需要你输入%s。请打开 WebUI 控制台的「账号登录」区完成，"
             "完成后再问一次即可（会话会保留 5 分钟）。" % hint)
 
+    def _assert_current(self, epoch, data_epoch=None):
+        if self._closed:
+            raise StateChanged("插件已停用，请重新启用后查询。")
+        if self._state_error:
+            raise StateChanged("登录状态更新未完成，请在控制台重新刷新或导入凭据。")
+        if epoch != self._auth_epoch or (data_epoch is not None and data_epoch != self._data_epoch):
+            raise StateChanged("登录状态或缓存已更新，旧查询已作废，请重新查询。")
+
+    def _load_token(self, epoch):
+        with self._state_lock:
+            self._assert_current(epoch)
+            return self.store.get("token") or {}
+
+    async def _fetch_auth(self, auth):
+        try:
+            return await asyncio.to_thread(auth.fetch_token)
+        except asyncio.CancelledError:
+            # to_thread cannot stop its worker; prevent that instance committing later.
+            cancel = getattr(auth, "cancel", None)
+            if callable(cancel):
+                cancel()
+            raise
+
     async def _token(self, force: bool = False, stale_token: str = "") -> str:
-        """取 accessToken：SQLite → 起浏览器自动登录（v0.4.1 起没有内存级缓存）。"""
+        epoch = self._auth_epoch
         if not force:
-            cached = self.store.get("token")
-            if cached and cached.get("token") and cached.get("expire_at", 0) > time.time():
+            cached = await asyncio.to_thread(self._load_token, epoch)
+            self._assert_current(epoch)
+            if cached.get("token") and cached.get("expire_at", 0) > time.time():
                 return cached["token"]
-
         async with self._lock:
-            cached = self.store.get("token")
-            if cached and cached.get("token") and cached.get("expire_at", 0) > time.time():
-                # 401 重认证只在缓存仍是同一个失效 token 时启动浏览器；
-                # 并发请求若已经被前一个请求刷新，则复用新 token，避免重复启动浏览器。
-                if not force or (stale_token and cached.get("token") != stale_token):
+            cached = await asyncio.to_thread(self._load_token, epoch)
+            self._assert_current(epoch)
+            if cached.get("token") and cached.get("expire_at", 0) > time.time():
+                if not force or (stale_token and cached["token"] != stale_token):
                     return cached["token"]
-
             ttl = _int_cfg(self.config.get("token_ttl"), 3000, 0, 86400)
-            login_manager = getattr(self, "login_manager", None)
-            mode = getattr(login_manager, "login_mode", "cookie")
+            mode = getattr(getattr(self, "login_manager", None), "login_mode", "cookie")
             auth = self.auth
+            manager = getattr(self, "login_manager", None)
+            session = manager.current_session() if manager and callable(getattr(manager, "current_session", None)) else None
+            if mode != "password" and session and session.is_running() and session.snapshot()["state"] not in ("DONE", "FAILED"):
+                raise LoginNeedsHuman("网页登录正在进行，请在控制台完成或取消后再查询。")
             if mode == "password":
                 try:
                     token = await self._password_token()
-                except LoginNeedsHuman:
-                    # 需要用户去 WebUI 输验证码：这是可行动提示，不能被 cookie 回退盖掉。
+                except (LoginNeedsHuman, StateChanged):
                     raise
                 except HuaweiAuthError as exc:
-                    # v0.4.0 是二选一：password 失败就整体失败，即使 cookie 完好可用。
+                    self._assert_current(epoch)
                     if not os.path.exists(self.cookie_file):
                         raise
-                    self.logger.warning("[华为健康] 账号密码登录不可用（%s），退回 cookie 路线"
-                                        % redact_error(exc))
+                    self.logger.warning("[华为健康] 账号密码登录不可用（%s），退回 cookie 路线" % redact_error(exc))
                     auth = self.auth
                     try:
-                        token = await asyncio.to_thread(auth.fetch_token)
+                        token = await self._fetch_auth(auth)
                     except Exception as fallback_exc:
-                        # 两条路线都失败时**合并**两条原因：只报 cookie 那句会把用户
-                        # 引去「重新导出 cookie」，而他其实是在用账号密码模式。
-                        raise HuaweiAuthError(
-                            "%s；另外 cookie 路线也不可用：%s"
-                            % (exc, fallback_exc)) from fallback_exc
+                        raise HuaweiAuthError("%s；另外 cookie 路线也不可用：%s" % (exc, fallback_exc)) from fallback_exc
             else:
-                token = await asyncio.to_thread(auth.fetch_token)
+                token = await self._fetch_auth(auth)
 
-            now = time.time()
-            stored = self.store.get("token") or {}
-            if mode == "password" and stored.get("token") == token and stored.get("expire_at"):
-                # _finish 已经用页面真实 expireTime 写过一次，别用 now+ttl 覆盖它。
-                expire_at = float(stored["expire_at"])
-            else:
-                expire_at = compute_expire_at(getattr(auth, "token_expire_at", 0.0), ttl, now)
-            self.store.set("token", {
-                "token": token,
-                "expire_at": expire_at,
-                "obtained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            })
+            def commit():
+                with self._state_lock:
+                    self._assert_current(epoch)
+                    stored = self.store.get("token") or {}
+                    if mode == "password" and stored.get("token") == token and stored.get("expire_at"):
+                        expire_at = float(stored["expire_at"])
+                    else:
+                        expire_at = compute_expire_at(getattr(auth, "token_expire_at", 0.0), ttl)
+                    self.store.set("token", {"token": token, "expire_at": expire_at,
+                                             "obtained_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+            await asyncio.to_thread(commit)
+            self._assert_current(epoch)
             return token
 
-    async def _client(self, force: bool = False, stale_token: str = "") -> HuaweiHealthClient:
+    async def _client(self, force: bool = False, stale_token: str = ""):
         token = await self._token(force=force, stale_token=stale_token)
-        return HuaweiHealthClient(
-            token,
+        return _PooledClient(
+            self._client_pool, token,
             client_id=(self.config.get("client_id") or DEFAULT_CLIENT_ID).strip(),
             version=(self.config.get("api_version") or DEFAULT_VERSION).strip(),
             timezone=(self.config.get("timezone") or DEFAULT_TIMEZONE).strip(),
         )
 
-    async def _cached(self, key: str, producer, ttl: int = None, force: bool = False):
-        """带缓存地跑 producer(client)。401 时自动重认证重试一次。"""
-        if not force:
-            hit = self.store.get(key)
-            # producer 可能合法地返回 None，用 has() 区分「缓存了 None」和「没缓存」。
-            if hit is not None or self.store.has(key):
-                return hit
-        ttl = _int_cfg(self.config.get("data_ttl"), 600, 0, 86400) if ttl is None else ttl
-        # data_ttl=0 表示「彻底关掉数据缓存」：连总览/perf 那种显式 TTL 也要让路，
-        # 否则用户以为关掉了、实际还在读 10 分钟前的数据。
-        if _int_cfg(self.config.get("data_ttl"), 600, 0, 86400) <= 0:
-            ttl = 0
-        # 同一 key 共用一个任务；刷新通过 generation 使旧任务结果失效。
-        task = self._cache_inflight.get(key)
-        if task is None or task.done():
-            generation = self._cache_generation.get(key, 0)
+    QUERY_TIMEOUT = 90
 
+    async def _cached(self, key: str, producer, ttl: int = None, force: bool = False, deadline=None):
+        """Share work only within the current account/cache generation."""
+        epoch, data_epoch = self._auth_epoch, self._data_epoch
+        self._assert_current(epoch, data_epoch)
+        enabled = _int_cfg(self.config.get("data_ttl"), 600, 0, 86400) > 0
+        ttl = _int_cfg(self.config.get("data_ttl"), 600, 0, 86400) if ttl is None else ttl
+        if not enabled:
+            ttl = 0
+        deadline = time.monotonic() + self.QUERY_TIMEOUT if deadline is None else deadline
+
+        def lookup():
+            with self._state_lock:
+                self._assert_current(epoch, data_epoch)
+                missing = object()
+                value = self.store.get(key, missing)
+                return value is not missing, value
+
+        if enabled and not force:
+            async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                found, hit = await asyncio.to_thread(lookup)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("取数超时，请稍后重试")
+            self._assert_current(epoch, data_epoch)
+            if found:
+                return hit
+        flight_key = (epoch, data_epoch, key)
+        task = self._cache_inflight.get(flight_key)
+        if task is None or task.done():
             async def produce():
                 used_token = ""
-
-                async def run(force_auth: bool, stale_token: str = ""):
+                async def run(force_auth=False):
                     nonlocal used_token
-                    client = await self._client(force=force_auth, stale_token=stale_token)
+                    self._assert_current(epoch, data_epoch)
+                    client = await self._client(force=force_auth, stale_token=used_token if force_auth else "")
+                    self._assert_current(epoch, data_epoch)
                     used_token = client.token
+                    if isinstance(client, _PooledClient):
+                        return await asyncio.to_thread(client.run, producer, deadline)
+                    # Also supports injected clients used by offline contract tests.
                     return await asyncio.to_thread(producer, client)
                 try:
-                    try:
-                        result = await run(False)
-                    except AuthExpired:
-                        self.logger.warning("[华为健康] token 失效，重新认证…")
-                        result = await run(True, stale_token=used_token)
-                    if self._cache_generation.get(key, 0) == generation and ttl > 0:
-                        # ttl <= 0 表示「不缓存」：v0.4.0 会把 data_ttl=0 写成
-                        # expire_at=0，反而变成**永不过期**。
-                        self.store.set(key, result, ttl=ttl)
-                    return result
+                    async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                        try:
+                            result = await run()
+                        except AuthExpired:
+                            self.logger.warning("[华为健康] token 失效，重新认证…")
+                            result = await run(True)
+                        def publish():
+                            with self._state_lock:
+                                self._assert_current(epoch, data_epoch)
+                                if time.monotonic() >= deadline:
+                                    raise TimeoutError("取数超时，请稍后重试")
+                                if ttl > 0:
+                                    self.store.set(key, result, ttl=ttl)
+                        await asyncio.to_thread(publish)
+                        self._assert_current(epoch, data_epoch)
+                        return result
                 finally:
-                    if self._cache_inflight.get(key) is asyncio.current_task():
-                        self._cache_inflight.pop(key, None)
-
+                    if self._cache_inflight.get(flight_key) is asyncio.current_task():
+                        self._cache_inflight.pop(flight_key, None)
             task = asyncio.create_task(produce())
-            self._cache_inflight[key] = task
-        return await asyncio.shield(task)
+            self._cache_inflight[flight_key] = task
+            # A timed-out caller may leave the shared task running for another caller.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        async with asyncio.timeout(max(0, deadline - time.monotonic())):
+            result = await asyncio.shield(task)
+        self._assert_current(epoch, data_epoch)
+        return result
 
     def _clear_health_cache(self, strict: bool = False):
-        """清 cookie 时同步废弃全部健康缓存，防止新账号读到旧账号数据。
-
-        ``strict=True`` 时把清理失败上抛：静默 fail-open 会让「导入 cookie」看起来
-        成功，实际还在命中上一个账号的数据（数据库被占用时就会发生）。
-        """
-        # 同时推进所有正在运行的 key；这些任务即使完成，也不能把旧账号结果写回。
-        keys = set(self._cache_generation) | set(self._cache_inflight)
-        for key in keys:
-            self._cache_generation[key] = self._cache_generation.get(key, 0) + 1
-        try:
-            # 一条 SQL 清完（v0.4.0 是 keys() + 逐 key delete()，N+1 条连接，
-            # 300 个 key 会在事件循环线程上卡 5.6 秒）。
-            self.store.clear_except("token")
-        except Exception as exc:
-            self.logger.warning("[华为健康] 清理健康缓存失败：%s" % redact_error(exc))
-            if strict:
-                raise HuaweiHealthError(
-                    "健康缓存清理失败（%s），请重试" % redact_error(exc)) from exc
+        with self._state_lock:
+            self._data_epoch += 1
+            for key in set(self._cache_generation):
+                self._cache_generation[key] += 1
+            try:
+                self.store.clear_except("token")
+            except Exception as exc:
+                self.logger.warning("[华为健康] 清理健康缓存失败：%s" % redact_error(exc))
+                if strict:
+                    raise HuaweiHealthError("健康缓存清理失败（%s），请重试" % redact_error(exc)) from exc
 
     def _clear_auth_cache_blocking(self):
-        """一个线程任务里按顺序做两件事：先删 token，再清缓存。
+        with self._state_lock:
+            self._auth_epoch += 1
+            self._state_error = True
+            manager = getattr(self, "login_manager", None)
+            if manager and callable(getattr(manager, "invalidate", None)):
+                manager.invalidate()
+            self._client_pool.invalidate()
+            self.store.delete("token")
+            self._clear_health_cache(strict=True)
+            self._state_error = False
 
-        v0.4.1 第二版是两次 ``to_thread``，中间新开了调度窗口（另一个协程可能在
-        这中间把旧 token 读回来）；合并成一次调用也顺带让清理失败能上抛。
+    def _change_auth_state_blocking(self, mutator=None, clear_cookies=False,
+                                    keep_blocked=False):
+        with self._state_lock:
+            if self._closed:
+                raise StateChanged("插件已停用，请重新启用后修改登录状态。")
+            self._clear_auth_cache_blocking()
+            self._state_error = True
+            try:
+                # Validate and persist new credentials before discarding the old
+                # cookie file. Wrong/missing keys must preserve recoverable data.
+                result = mutator() if mutator else None
+                if clear_cookies:
+                    self.auth.clear_cookies()
+            except Exception:
+                # No query may use partially updated credentials after a failed change.
+                raise
+            else:
+                self._state_error = keep_blocked
+                return result
+
+    async def _change_auth_state(self, mutator=None, clear_cookies=False):
+        return await self._change_auth_state_async(mutator, clear_cookies=clear_cookies)
+
+    async def _change_auth_state_async(self, mutator=None, finalize=None,
+                                       clear_cookies=False, check_current=None):
+        """Serialize credential changes through asynchronous configuration persistence.
+
+        Queries remain blocked until both the encrypted write and the optional
+        async finalizer succeed. Never hold the thread lock across an await.
         """
-        self.store.delete("token")
-        self._clear_health_cache(strict=True)
+        async with self._auth_change_lock:
+            def begin():
+                with self._state_lock:
+                    if check_current is not None:
+                        check_current()
+                    result = self._change_auth_state_blocking(
+                        mutator, clear_cookies, keep_blocked=finalize is not None)
+                    return result, self._auth_epoch
+
+            worker = asyncio.create_task(asyncio.to_thread(begin))
+            try:
+                result, epoch = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # to_thread keeps running after request cancellation. Keep the
+                # mutation lock until it exits, and leave the state blocked.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not worker.cancelled():
+                    worker.exception()
+                with self._state_lock:
+                    self._state_error = True
+                raise
+            if finalize is not None:
+                await finalize(result)
+            with self._state_lock:
+                if self._closed or epoch != self._auth_epoch:
+                    raise StateChanged("登录状态已更新，本次修改未完成，请刷新后重试。")
+                self._state_error = False
+            return result
 
     async def _invalidate_auth_cache(self):
-        """在认证锁内清理凭证和健康缓存，避免并发认证完成后把旧 token 写回来。"""
-        async with self._lock:
-            await asyncio.to_thread(self._clear_auth_cache_blocking)
+        await self._change_auth_state()
+
+    def _import_config_cookies(self, raw, fields):
+        with self._state_lock:
+            auth = self.auth
+            n = auth.import_cookie_sources(raw, fields, True, replace_existing=True)
+            if n:
+                try:
+                    self._clear_auth_cache_blocking()
+                except Exception:
+                    # Retry invalidation on the next startup even if import already succeeded.
+                    try:
+                        os.unlink(auth._marker_path())
+                    except OSError:
+                        pass
+                    raise
+            return n
+
+    def _commit_login_result(self, session, cookies, token, expire_at):
+        with self._state_lock:
+            manager = self.login_manager
+            if manager.current_session() is not session:
+                return False
+            with session._lock:
+                if (self._closed or self._state_error or session._cancel.is_set()
+                        or session._auth_epoch != self._auth_epoch):
+                    return False
+                # Cookie, token and health snapshots share the same account transition lock.
+                self.store.delete("token")
+                self.store.clear_except("token")
+                self._client_pool.invalidate()
+                if not session._auth.save_cookies(cookies):
+                    return False
+                self.store.set("token", {"token": token, "expire_at": expire_at,
+                                         "obtained_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+                return True
 
     @staticmethod
     def _err(exc: Exception) -> str:
         # 异常原文可能带 cookie / accessToken / 本机路径（浏览器启动失败时
         # OSError 里就有 profile 的绝对路径），统一洗过再交给用户和 LLM。
+        if isinstance(exc, TimeoutError):
+            return "取数超时，请稍后重试；已经完成的数据不受影响。"
         reason = redact_error(exc)
         if isinstance(exc, HuaweiAuthError):
             return "拿不到登录态：%s" % reason
@@ -461,7 +650,6 @@ class HuaweiHealthPlugin(Star):
 
     def _metric_text(self, parsed: dict, unit: str, days: int, name: str,
                      count_label: str = "条") -> str:
-        # TODO(v0.3.2)：逐日输出补充 min/count，当前仅保留既有 avg/max 口径。
         overall = parsed.get("overall") or {}
         daily = parsed.get("daily") or []
         if not overall and not daily:
@@ -471,7 +659,7 @@ class HuaweiHealthPlugin(Star):
             lines.append("%s %s：%s" % (name, field, self._stat_line(stats, count_label)))
         if daily and self._daily_has_value(daily):
             lines.append("按天：")
-            for item in daily[-7:]:
+            for item in daily:
                 day = item.get("day")
                 vals = []
                 for field, stats in item.items():
@@ -503,13 +691,24 @@ class HuaweiHealthPlugin(Star):
         return total is not None and total < 180
 
     @classmethod
-    def _sleep_text(cls, records: list, days: int, night_only: bool = False) -> str:
+    def _sleep_text(cls, records: list, days: int, night_only: bool = False,
+                    timezone: str = DEFAULT_TIMEZONE, limit: int = None) -> str:
         if night_only:
             records = [r for r in records if not cls._is_nap(r)]
         if not records:
             return "最近 %d 天没有睡眠记录（可能没戴表）。" % days
+        def record_time(rec):
+            try:
+                return int(rec.get("startTime") or 0)
+            except (TypeError, ValueError):
+                return 0
+        records = sorted(records, key=record_time)
+        total_records = len(records)
+        if limit is not None:
+            records = records[-max(1, limit):]
+        tz = parse_timezone(timezone)
         lines = []
-        for rec in records[-7:]:
+        for rec in records:
             def val(*keys):
                 for item in (rec.get("value") or []):
                     if item.get("fieldName") in keys:
@@ -521,14 +720,14 @@ class HuaweiHealthPlugin(Star):
             start = rec.get("startTime")
             end = rec.get("endTime")
             try:
-                day = datetime.datetime.fromtimestamp(int(start) / 1e9).strftime("%m-%d")
+                day = datetime.datetime.fromtimestamp(int(start) / 1e9, tz).strftime("%m-%d")
             except Exception:
                 day = "?"
             span = ""
             try:
                 if start and end:
-                    t0 = datetime.datetime.fromtimestamp(int(start) / 1e9)
-                    t1 = datetime.datetime.fromtimestamp(int(end) / 1e9)
+                    t0 = datetime.datetime.fromtimestamp(int(start) / 1e9, tz)
+                    t1 = datetime.datetime.fromtimestamp(int(end) / 1e9, tz)
                     span = " %s→%s" % (t0.strftime("%H:%M"), t1.strftime("%H:%M"))
             except Exception:
                 span = ""
@@ -559,7 +758,8 @@ class HuaweiHealthPlugin(Star):
             tag = "（小睡）" if cls._is_nap(rec) else ""
             lines.append("  %s%s%s  %s" % (
                 day, tag, span, "，".join(bits) if bits else "有记录但字段未识别"))
-        return "最近睡眠：\n" + "\n".join(lines)
+        notice = "（共 %d 条，显示最近 %d 条）" % (total_records, len(records)) if total_records > len(records) else ""
+        return "最近睡眠%s：\n" % notice + "\n".join(lines)
 
     # ---------- 其它数据项的格式化 ----------
 
@@ -683,7 +883,7 @@ class HuaweiHealthPlugin(Star):
         return "\n".join(lines)
 
     @classmethod
-    def _fmt_acts(cls, acts: list, days: int = 30, limit: int = 5) -> str:
+    def _fmt_acts(cls, acts: list, days: int = 30, limit: int = 5, timezone: str = DEFAULT_TIMEZONE) -> str:
         """运动记录列表（距离按米、时长按毫秒换算后带单位输出）。"""
         if not acts:
             return "最近 %d 天没有运动记录" % days
@@ -699,7 +899,7 @@ class HuaweiHealthPlugin(Star):
             try:
                 ms = int(ts)
                 ms = ms / 1e6 if ms > 1e13 else ms
-                when = time.strftime("%m-%d %H:%M", time.localtime(ms / 1000))
+                when = datetime.datetime.fromtimestamp(ms / 1000, parse_timezone(timezone)).strftime("%m-%d %H:%M")
             except Exception:
                 when = str(ts)
             bits = [when]
@@ -732,52 +932,84 @@ class HuaweiHealthPlugin(Star):
     #: 远超 AstrBot 的 120 秒工具超时，所以这里必须自己兜一个上限。
     OVERVIEW_TIMEOUT = 90
 
-    def _overview_producers(self) -> dict:
+    def _timezone(self):
+        return (self.config.get("timezone") or DEFAULT_TIMEZONE).strip()
+
+    def _query_key(self, key):
+        # Changing timezone, API interpretation or calendar day must not reuse an old window.
+        tz = parse_timezone(self._timezone())
+        now = datetime.datetime.now(tz)
+        return json.dumps([key, now.strftime("%z"), now.strftime("%Y-%m-%d"),
+                           self.config.get("client_id") or DEFAULT_CLIENT_ID,
+                           self.config.get("api_version") or DEFAULT_VERSION], separators=(",", ":"))
+
+    async def _query(self, key, producer, ttl=None, deadline=None):
+        return await self._cached(self._query_key(key), producer, ttl=ttl, deadline=deadline)
+
+    def _overview_specs(self):
+        tz = self._timezone()
         return {
-            "heart": lambda c: self._metric_text(
-                c.resting_heart_rate(7), "bpm", 7, "静息心率", count_label="天"),
-            "sleep": lambda c: self._sleep_text(c.sleep_records(7), 7),
-            "hrv": lambda c: self._metric_text(c.hrv_stats(7), "", 7, "HRV"),
-            "stress": lambda c: self._metric_text(c.stress_stats(7), "", 7, "压力"),
-            "weight": lambda c: self._fmt_weight(c.body_weight(1095)),
-            "zones": lambda c: self._fmt_zones(c.heart_rate_zones()),
-            "perf": lambda c: self._fmt_perf(c.athletic_performance()),
-            "pb": lambda c: self._fmt_pb(c.personal_bests("running")),
-            "acts": lambda c: self._fmt_acts(c.activities(30, 5), 30, 5),
+            "heart": ("hr:7", lambda c: c.resting_heart_rate(7),
+                      lambda d: self._metric_text(d, "bpm", 7, "静息心率", count_label="天")),
+            "sleep": ("sleep:7", lambda c: c.sleep_records(7),
+                      lambda d: self._sleep_text(d, 7, timezone=tz)),
+            "hrv": ("hrv:7", lambda c: c.hrv_stats(7), lambda d: self._metric_text(d, "", 7, "HRV")),
+            "stress": ("stress:7", lambda c: c.stress_stats(7), lambda d: self._metric_text(d, "", 7, "压力")),
+            "weight": ("weight:1095", lambda c: c.body_weight(1095), self._fmt_weight),
+            "zones": ("zones", lambda c: c.heart_rate_zones(), self._fmt_zones),
+            "perf": ("perf", lambda c: c.athletic_performance(), self._fmt_perf),
+            "pb": ("pb", lambda c: c.personal_bests("running"), self._fmt_pb),
+            "acts": ("act:30:5", lambda c: c.activities(30, 5),
+                     lambda d: self._fmt_acts(d, 30, 5, timezone=tz)),
         }
 
-    async def _overview_items(self, timeout: int = None):
-        """并发拉齐总览，返回 [{key,title,ok,text}]；单项失败/超时不影响其它项。"""
-        timeout = self.OVERVIEW_TIMEOUT if timeout is None else timeout
-        producers = self._overview_producers()
-        # 最多同时请求 3 项，缩短总耗时并控制华为接口压力。
+    async def _run_items(self, specs, timeout=None):
+        """All composite tools share one deadline and retain successful sections."""
+        timeout = self.QUERY_TIMEOUT if timeout is None else timeout
+        deadline = time.monotonic() + timeout
+        epoch, data_epoch = self._auth_epoch, self._data_epoch
         sem = asyncio.Semaphore(3)
 
-        async def one(key, title, ttl):
+        async def one(key, title, producer, formatter, ttl):
             async with sem:
                 try:
-                    text = await self._cached("ov:%s" % key, producers[key], ttl=ttl)
-                    return {"key": key, "title": title, "ok": True, "text": text}
+                    raw = await self._query(key, producer, ttl=ttl, deadline=deadline)
+                    return {"key": key, "title": title, "ok": True, "text": formatter(raw)}
                 except Exception as exc:
                     return {"key": key, "title": title, "ok": False, "text": self._err(exc)}
 
-        tasks = [asyncio.create_task(one(key, title, ttl))
-                 for key, title, ttl in self.OVERVIEW_ITEMS]
-        done, pending = await asyncio.wait(tasks, timeout=timeout)
-        for task in pending:
-            task.cancel()
-        results = []
-        for (key, title, _ttl), task in zip(self.OVERVIEW_ITEMS, tasks):
-            if task not in done:
-                results.append({"key": key, "title": title, "ok": False,
-                                "text": "取数超时（超过 %d 秒），请稍后重试" % timeout})
-                continue
-            exc = task.exception()
-            if exc is not None:
-                results.append({"key": key, "title": title, "ok": False, "text": self._err(exc)})
-            else:
-                results.append(task.result())
-        return results
+        tasks = [asyncio.create_task(one(*spec)) for spec in specs]
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=max(0, deadline - time.monotonic()))
+            results = []
+            for spec, task in zip(specs, tasks):
+                if task in done:
+                    results.append(task.result())
+                else:
+                    results.append({"key": spec[0], "title": spec[1], "ok": False,
+                                    "text": "取数超时（超过 %s 秒），请稍后重试" % timeout})
+            self._assert_current(epoch, data_epoch)
+            return results
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _overview_items(self, timeout=None):
+        producers = self._overview_specs()
+        specs = []
+        for key, title, ttl in self.OVERVIEW_ITEMS:
+            cache_key, producer, formatter = producers[key]
+            specs.append((cache_key, title, producer, formatter, ttl))
+        items = await self._run_items(specs, self.OVERVIEW_TIMEOUT if timeout is None else timeout)
+        for item, (key, _, _) in zip(items, self.OVERVIEW_ITEMS):
+            item["key"] = key
+        return items
+
+    @staticmethod
+    def _items_text(items):
+        return "\n\n".join("【%s】\n%s" % (i["title"], i["text"]) for i in items)
 
     # ================= 权限（会话准入 + 成员准入）=================
     #
@@ -938,19 +1170,23 @@ class HuaweiHealthPlugin(Star):
         manager = self.login_manager
         mode = getattr(manager, "login_mode", "cookie")
         has_cookie = os.path.exists(self.cookie_file)
-        cached = self.store.get("token") or {}
+        epoch = self._auth_epoch
+        try:
+            cached = await asyncio.to_thread(self._load_token, epoch)
+        except Exception as exc:
+            return self._err(exc)
         left = int(cached.get("expire_at", 0) - time.time()) if cached.get("expire_at") else 0
         lines = []
         if mode == "password":
             # v0.4.0 在 password 模式下也只看 cookie 文件，恒定输出「没有，需要导入」。
-            lines.append("登录方式：账号密码（DPAPI 加密保存）")
+            lines.append("登录方式：账号密码（加密保存）")
             try:
-                st = self.credentials.status() if self.credentials else {}
+                st = await asyncio.to_thread(self.credentials.status) if self.credentials else {}
             except Exception:
                 st = {}
             state_label = {
                 "ok": "已保存", "absent": "未保存", "corrupt": "文件损坏，需重新保存",
-                "locked": "被占用或无权读取", "unavailable": "当前系统不支持 DPAPI",
+                "locked": "已锁定，检查权限和原主密钥", "unavailable": "加密服务或主密钥不可用",
             }.get(st.get("state") or "", "未知")
             lines.append("凭据：%s%s" % (
                 state_label,
@@ -964,7 +1200,7 @@ class HuaweiHealthPlugin(Star):
         else:
             lines.append("登录方式：Cookie")
             lines.append("cookie 文件：%s" % (
-                "有（%s）" % self.cookie_file if has_cookie else "没有，需要导入"))
+                "有" if has_cookie else "没有，需要导入"))
         lines.append("token 缓存：%s" % ("有效，剩 %d 秒" % left if left > 0 else "无 / 已过期"))
 
         # 实测连通性：有缓存 token 就用一个**实测可用**的取数端点验一次
@@ -973,13 +1209,21 @@ class HuaweiHealthPlugin(Star):
         token = cached.get("token")
         if token and left > 0:
             try:
-                client = HuaweiHealthClient(
-                    token,
-                    client_id=(self.config.get("client_id") or DEFAULT_CLIENT_ID).strip(),
-                    version=(self.config.get("api_version") or DEFAULT_VERSION).strip(),
-                    timezone=(self.config.get("timezone") or DEFAULT_TIMEZONE).strip(),
-                )
-                await asyncio.to_thread(client.resting_heart_rate, 1)
+                deadline = time.monotonic() + self.QUERY_TIMEOUT
+                def probe():
+                    client = HuaweiHealthClient(
+                        token,
+                        client_id=(self.config.get("client_id") or DEFAULT_CLIENT_ID).strip(),
+                        version=(self.config.get("api_version") or DEFAULT_VERSION).strip(),
+                        timezone=self._timezone(), deadline=deadline,
+                    )
+                    try:
+                        return client.resting_heart_rate(1)
+                    finally:
+                        close = getattr(client, "close", None)
+                        if callable(close):
+                            close()
+                await asyncio.wait_for(asyncio.to_thread(probe), timeout=self.QUERY_TIMEOUT)
                 lines.append("实测：token 可用 ✓")
             except AuthExpired:
                 lines.append("实测：token 已失效（下次查询会自动续）")
@@ -988,6 +1232,10 @@ class HuaweiHealthPlugin(Star):
                 lines.append("实测：无法验证（探针接口异常：%s），不代表取数不可用" % self._err(exc))
         else:
             lines.append("实测：跳过（没有有效缓存 token，下次查询会自动认证）")
+        try:
+            self._assert_current(epoch)
+        except Exception as exc:
+            return self._err(exc)
         return "\n".join(lines)
 
     @filter.llm_tool(name="health_today")
@@ -998,26 +1246,19 @@ class HuaweiHealthPlugin(Star):
         """
         if not self._is_allowed(event):
             return self._deny_text(event)
-        parts = []
+        tz = self._timezone()
+        specs = [
+            ("hr:1", "静息心率", lambda c: c.resting_heart_rate(1),
+             lambda d: self._metric_text(d, "bpm", 1, "静息心率", count_label="天"), None),
+            ("sleep:3", "睡眠", lambda c: c.sleep_records(3),
+             lambda d: self._sleep_text(d, 3, night_only=True, timezone=tz, limit=1), None),
+            ("act:7:10", "近期运动", lambda c: c.activities(7, 10),
+             lambda d: self._fmt_acts(d, 7, 10, timezone=tz), None),
+        ]
         try:
-            hr = await self._cached("hr:2", lambda c: c.resting_heart_rate(2))
-            parts.append("【静息心率】\n" + self._metric_text(hr, "bpm", 2, "静息心率", count_label="天"))
+            return self._items_text(await self._run_items(specs))
         except Exception as exc:
-            parts.append("【静息心率】取数失败：%s" % self._err(exc))
-        try:
-            sl = await self._cached("sleep:3", lambda c: c.sleep_records(3))
-            parts.append("【睡眠】\n" + self._sleep_text(sl, 3, night_only=True))
-        except Exception as exc:
-            parts.append("【睡眠】取数失败：%s" % self._err(exc))
-        try:
-            acts = await self._cached("act:7:10", lambda c: c.activities(7, 10))
-            if acts:
-                parts.append("【近期运动】共 %d 条" % len(acts))
-            else:
-                parts.append("【近期运动】最近 7 天没有运动记录")
-        except Exception as exc:
-            parts.append("【近期运动】取数失败：%s" % self._err(exc))
-        return "\n\n".join(parts)
+            return self._err(exc)
 
     @filter.llm_tool(name="health_overview")
     async def health_overview(self, event: AstrMessageEvent):
@@ -1027,8 +1268,10 @@ class HuaweiHealthPlugin(Star):
         """
         if not self._is_allowed(event):
             return self._deny_text(event)
-        items = await self._overview_items()
-        return "\n\n".join("【%s】\n%s" % (i["title"], i["text"]) for i in items)
+        try:
+            return self._items_text(await self._overview_items())
+        except Exception as exc:
+            return self._err(exc)
 
     @filter.llm_tool(name="health_sleep")
     async def health_sleep(self, event: AstrMessageEvent, days: int = 7):
@@ -1041,8 +1284,8 @@ class HuaweiHealthPlugin(Star):
             return self._deny_text(event)
         days = _int_cfg(days, 7, 1, 30)
         try:
-            sl = await self._cached("sleep:%d" % days, lambda c: c.sleep_records(days))
-            return self._sleep_text(sl, days)
+            sl = await self._query("sleep:%d" % days, lambda c: c.sleep_records(days))
+            return self._sleep_text(sl, days, timezone=self._timezone())
         except Exception as exc:
             return self._err(exc)
 
@@ -1056,18 +1299,16 @@ class HuaweiHealthPlugin(Star):
         if not self._is_allowed(event):
             return self._deny_text(event)
         days = _int_cfg(days, 7, 1, 90)
-        out = []
+        specs = [
+            ("hr:%d" % days, "静息心率 bpm", lambda c: c.resting_heart_rate(days),
+             lambda d: self._metric_text(d, "bpm", days, "静息心率", count_label="天"), None),
+            ("hrv:%d" % days, "睡眠 HRV", lambda c: c.hrv_stats(days),
+             lambda d: self._metric_text(d, "", days, "HRV"), None),
+        ]
         try:
-            hr = await self._cached("hr:%d" % days, lambda c: c.resting_heart_rate(days))
-            out.append("【静息心率 bpm】\n" + self._metric_text(hr, "bpm", days, "静息心率", count_label="天"))
+            return self._items_text(await self._run_items(specs))
         except Exception as exc:
-            out.append("【静息心率】%s" % self._err(exc))
-        try:
-            hrv = await self._cached("hrv:%d" % days, lambda c: c.hrv_stats(days))
-            out.append("【睡眠 HRV】\n" + self._metric_text(hrv, "", days, "HRV"))
-        except Exception as exc:
-            out.append("【睡眠 HRV】%s" % self._err(exc))
-        return "\n\n".join(out)
+            return self._err(exc)
 
     @filter.llm_tool(name="health_activities")
     async def health_activities(self, event: AstrMessageEvent, days: int = 30, limit: int = 10):
@@ -1082,13 +1323,13 @@ class HuaweiHealthPlugin(Star):
         days = _int_cfg(days, 30, 1, 365)
         limit = _int_cfg(limit, 10, 1, 50)
         try:
-            acts = await self._cached("act:%d:%d" % (days, limit),
+            acts = await self._query("act:%d:%d" % (days, limit),
                                       lambda c: c.activities(days, limit))
         except Exception as exc:
             return self._err(exc)
         if not acts:
             return "最近 %d 天没有运动记录。" % days
-        return self._fmt_acts(acts, days, limit)
+        return self._fmt_acts(acts, days, limit, timezone=self._timezone())
 
     @filter.llm_tool(name="health_performance")
     async def health_performance(self, event: AstrMessageEvent):
@@ -1098,19 +1339,14 @@ class HuaweiHealthPlugin(Star):
         """
         if not self._is_allowed(event):
             return self._deny_text(event)
-        out = []
+        specs = [
+            ("perf", "运动能力评估", lambda c: c.athletic_performance(), self._fmt_perf, 3600),
+            ("pb", "跑步个人纪录", lambda c: c.personal_bests("running"), self._fmt_pb, 3600),
+        ]
         try:
-            perf = await self._cached("perf", lambda c: c.athletic_performance(), ttl=3600)
-            # 统一走可读格式，避免把截断 JSON 直接交给 LLM。
-            out.append("【运动能力评估】\n" + self._fmt_perf(perf))
+            return self._items_text(await self._run_items(specs))
         except Exception as exc:
-            out.append("【运动能力评估】%s" % self._err(exc))
-        try:
-            pb = await self._cached("pb", lambda c: c.personal_bests("running"), ttl=3600)
-            out.append("【跑步个人纪录】\n" + self._fmt_pb(pb))
-        except Exception as exc:
-            out.append("【跑步个人纪录】%s" % self._err(exc))
-        return "\n\n".join(out)
+            return self._err(exc)
 
     @filter.llm_tool(name="health_refresh")
     async def health_refresh(self, event: AstrMessageEvent):
@@ -1121,20 +1357,28 @@ class HuaweiHealthPlugin(Star):
         if not self._is_allowed(event):
             return self._deny_text(event)
         # 刷新时推进 generation，避免尚未结束的旧请求覆盖刷新后的缓存。
-        await self._invalidate_auth_cache()
         try:
-            await self._token(force=True)
+            await self._invalidate_auth_cache()
+            await asyncio.wait_for(self._token(force=True), timeout=self.QUERY_TIMEOUT)
             return "缓存已清空，并已重新拿到最新 token。可以继续查询了。"
         except Exception as exc:
-            return "缓存已清空，但重新认证失败：%s" % self._err(exc)
+            return "刷新未完成：%s" % self._err(exc)
 
     async def terminate(self):
-        if self._warmup_task and not self._warmup_task.done():
-            self._warmup_task.cancel()
-            try:
-                await self._warmup_task
-            except asyncio.CancelledError:
-                pass
+        def stop_state():
+            with self._state_lock:
+                self._closed = True
+                self._auth_epoch += 1
+                self.login_manager.invalidate()
+                self._client_pool.close()
+        await asyncio.to_thread(stop_state)
+        tasks = list(self._cache_inflight.values())
+        if self._warmup_task:
+            tasks.append(self._warmup_task)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._cache_inflight.clear()
         if self.login_manager:
             await asyncio.to_thread(self.login_manager.stop)
         self.logger.info("[华为健康] 插件已卸载/停用。")
