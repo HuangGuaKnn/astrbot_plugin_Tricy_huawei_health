@@ -66,7 +66,7 @@ WebUI 的 `/status` 也会在 `permission.invalid_umos` 里回显，便于当场
 
 插件配置页里能填的：
 
-非 Windows 平台请先完成下方「跨平台加密存储」配置，再导入 Cookie 或保存账号密码。主密钥不属于插件配置项，也不要放进聊天消息或 WebUI 表单。插件 WebUI 的「设置」与「Cookie 导入」均使用加密保存；在「设置」成功提交完整 Cookie 后，七个旧配置字段会清空，页面只显示是否已有值。直接编辑 AstrBot 原始插件配置仍可能留下明文兼容副本；请优先使用插件控制台。
+非 Windows 平台请先完成下方「跨平台加密存储」配置，再导入 Cookie 或保存账号密码。主密钥不属于插件配置项，也不要放进聊天消息或 WebUI 表单。插件 WebUI 的「设置」（Cookie 导入也在这里）使用加密保存；在「设置」成功提交完整 Cookie 后，七个旧配置字段会清空，页面只显示是否已有值。直接编辑 AstrBot 原始插件配置仍可能留下明文兼容副本；请优先使用插件控制台。
 
 | 配置项 | 说明 |
 |---|---|
@@ -104,7 +104,7 @@ Cookie 文件由插件维护：`data/plugin_data/astrbot_plugin_Tricy_huawei_hea
    - `CASTGC`：`.id1.cloud.huawei.com`，插件自动生成 `/CAS` 与 `/UnifiedIDMPortal` 两个路径；
    - `sid`、`hwid_cas_sid`：`.id1.cloud.huawei.com`；
    - `HuaweiID_CAS_ISCASLOGIN`、`CASLOGINSITE`、`LOGINACCSITE`：`.huawei.com`；
-3. 在插件 WebUI 的设置页或 Cookie 导入页填写完整集合，至少同时提供 CASTGC 和 sid；也可粘贴包含这两项的完整 JSON。可选项需要随完整集合一起提交，留空表示不修改；
+3. 在插件 WebUI 的设置页填写完整集合（整段 JSON 或六项分项值，二选一），至少同时提供 CASTGC 和 sid；也可粘贴包含这两项的完整 JSON。可选项需要随完整集合一起提交，留空表示不修改；
 4. 旧版也可继续导出整段 JSON，粘贴到 `cookie_json` 或 WebUI 的 JSON 框。
 
 `CASTGC` 是 session cookie，关闭原浏览器后会失效；重新登录后需重新复制有效值。
@@ -128,7 +128,7 @@ Cookie 文件由插件维护：`data/plugin_data/astrbot_plugin_Tricy_huawei_hea
 | 存储保护 | 显示 Windows DPAPI / AES-256-GCM、主密钥来源及未配置或已锁定状态；不显示密钥或密钥路径 |
 | 操作 | 清缓存并重新认证 · 刷新状态 |
 | 数据概览 | 9 项数据的取数结果 + 取数时间 |
-| 重新导入 Cookie | 六条分项值或 Cookie-Editor JSON 导入（自动作废 token 缓存）；也可一键清除 cookie |
+| 清除 Cookie | 一键清除登录态（Cookie 导入已统一到设置页，登录页只保留明细） |
 
 技术：走 AstrBot 的 bridge SDK（`window.AstrBotPluginPage`），iframe 内用 bridge、
 独立窗口降级直连 `/api/v1/plugins/extensions/<plugin>/page/...`；主题跟随系统并支持手动切换。

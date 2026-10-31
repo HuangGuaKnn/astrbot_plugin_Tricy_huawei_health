@@ -79,19 +79,19 @@ header{display:flex;align-items:baseline;gap:10px;margin-bottom:4px;position:sti
   button.act.danger:hover{border-color:var(--err);color:var(--err)}
   button.act.sm{padding:4px 10px;font-size:12px}
 
-  textarea,input.field-input,.cookie-field input,.credential-field input,#loginSmsCode{
+  textarea,input.field-input,.credential-field input,#loginSmsCode{
     background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;
     padding:8px 9px;font-size:13px;font-family:inherit;
   }
   textarea{width:100%;min-height:110px;font-size:12px;
     font-family:ui-monospace,SFMono-Regular,Consolas,monospace;resize:vertical}
-  textarea:focus,input.field-input:focus,.cookie-field input:focus,
+  textarea:focus,input.field-input:focus,
   .credential-field input:focus,#loginSmsCode:focus{outline:none;border-color:var(--accent)}
 
-  .cookie-fields,.credential-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+  .credential-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
     gap:8px;margin:10px 0}
-  .cookie-field,.credential-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11.5px}
-  .cookie-field input,.credential-field input{width:100%;font-size:12px;
+  .credential-field{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:11.5px}
+  .credential-field input{width:100%;font-size:12px;
     font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
 
   pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:12px;
@@ -310,23 +310,13 @@ header{display:flex;align-items:baseline;gap:10px;margin-bottom:4px;position:sti
       <div class="msg" id="credentialMsg"></div>
     </div>
 
-    <h2>Cookie（导入 · 清除 · 明细）</h2>
+    <h2>Cookie（登录态 · 明细）</h2>
     <div class="card">
       <div class="hint" style="margin-top:0">
-        推荐按下面六项填写 cookie 值；CASTGC、sid、hwid_cas_sid 从 <code>id1.cloud.huawei.com</code> 域查看，
-        其余三项从健康页面查看。也可继续把 Cookie-Editor 导出的整段 JSON 粘到下方。
+        Cookie 导入已统一到「设置」页（整段 JSON 或六项分项值，二选一）。这里只显示当前登录态、
+        存储保护方式和关键明细；需要换上一份新 cookie 时请到设置页导入，清除登录态用下面的按钮。
       </div>
-      <div class="cookie-fields">
-        <label class="cookie-field">CASTGC（自动生成两个路径）<input id="cookie_CASTGC" autocomplete="off"></label>
-        <label class="cookie-field">sid<input id="cookie_sid" autocomplete="off"></label>
-        <label class="cookie-field">hwid_cas_sid<input id="cookie_hwid_cas_sid" autocomplete="off"></label>
-        <label class="cookie-field">HuaweiID_CAS_ISCASLOGIN<input id="cookie_HuaweiID_CAS_ISCASLOGIN" autocomplete="off"></label>
-        <label class="cookie-field">CASLOGINSITE<input id="cookie_CASLOGINSITE" autocomplete="off"></label>
-        <label class="cookie-field">LOGINACCSITE<input id="cookie_LOGINACCSITE" autocomplete="off"></label>
-      </div>
-      <textarea id="cookieBox" placeholder='[{"domain":".huawei.com","name":"sid","value":"...","path":"/","secure":true,"httpOnly":true,"sameSite":"no_restriction","expirationDate":1792669201}]'></textarea>
       <div class="row" style="margin-top:10px">
-        <button class="act primary" type="button" id="btnImport">导入</button>
         <button class="act danger" type="button" id="btnClear">清除 cookie</button>
       </div>
       <div class="msg" id="ckMsg"></div>
@@ -1065,30 +1055,7 @@ async function doCredentialClear(){
   finally{ b.disabled = false; loadCredentialsStatus(true); renderDiag(); }
 }
 
-/* ---------- Cookie 导入 / 清除 ---------- */
-async function doImport(){
-  const text = $("cookieBox").value.trim();
-  const fieldIds = ["CASTGC", "sid", "hwid_cas_sid", "HuaweiID_CAS_ISCASLOGIN", "CASLOGINSITE", "LOGINACCSITE"];
-  const fields = {};
-  let hasField = false;
-  for(const name of fieldIds){
-    const value = ($("cookie_" + name).value || "").trim();
-    fields[name] = value;
-    if(value) hasField = true;
-  }
-  if(!text && !hasField){ setMsg($("ckMsg"), "请填写六条分项值或粘贴 cookie JSON", "err"); return; }
-  const b = $("btnImport"); b.disabled = true;
-  setMsg($("ckMsg"), "导入中…", "info");
-  try{
-    const d = unwrap(await apiPost("cookie/import", { json: text, fields })) || {};
-    setMsg($("ckMsg"), d.message || ("已导入 " + (d.count || "?") + " 条 cookie"), "ok");
-    $("cookieBox").value = "";
-    for(const name of fieldIds) $("cookie_" + name).value = "";
-    loadStatus(true);
-  }catch(e){ setMsg($("ckMsg"), "导入失败：" + e.message, "err"); }
-  finally{ b.disabled = false; renderDiag(); }
-}
-
+/* ---------- Cookie 清除（导入已统一到设置页） ---------- */
 async function doClear(){
   if(!confirm("确定清除 cookie 文件？清除后需要重新导入才能取数。")) return;
   const b = $("btnClear"); b.disabled = true;
@@ -1815,7 +1782,6 @@ function bindAll(){
   $("btnCredentialClear").onclick = doCredentialClear;
   $("btnCredentialStatus").onclick = () => loadCredentialsStatus(false);
 
-  $("btnImport").onclick = doImport;
   $("btnClear").onclick = doClear;
 
   $("btnCfgSave").onclick = saveConfig;
