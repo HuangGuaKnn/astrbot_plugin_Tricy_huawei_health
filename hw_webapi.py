@@ -1080,6 +1080,34 @@ class HuaweiHealthWebApi:
         async with self._config_lock:
             return await self._post_config_locked(body, writes, clamped, accepted)
 
+    def _clear_redundant_cookie_config(self, merged, before):
+        """加密登录态已经可用时，清掉配置里的明文 Cookie 副本。
+
+        调用方只在「本次请求没动过 Cookie 字段」时进来。清空的前提是
+        ``hw_cookies.json`` 里已经同时有 CASTGC 与 sid——否则配置里那份可能
+        是用户唯一的凭据（直接编辑原始配置、还没走过导入流程），擦掉就等于
+        把人锁在门外。宁可留一份明文，也不能把登录态清没了。
+
+        返回被清空的键名列表；条件不满足时返回空列表，且不改 ``merged``。
+        """
+        stale = [key for key in SENSITIVE_KEYS if str(before.get(key) or "").strip()]
+        if not stale:
+            return []
+        try:
+            cookies = self.plugin.auth.load_cookies()
+        except Exception:
+            return []
+        names = {
+            str(cookie.get("name") or "")
+            for cookie in cookies
+            if str(cookie.get("value") or "").strip()
+        }
+        if any(name not in names for name in REQUIRED_COOKIES):
+            return []
+        for key in SENSITIVE_KEYS:
+            merged[key] = ""
+        return stale
+
     async def _post_config_locked(self, body, writes, clamped, accepted):
         p = self.plugin
         # 第 2 步：并发覆盖防护。
@@ -1113,6 +1141,7 @@ class HuaweiHealthWebApi:
         cookie_touched = any(path in SENSITIVE_KEYS for path in changed)
         cookie_field = next((path for path in changed if path in SENSITIVE_KEYS), "cookie_json")
         raw_json, fields = "", {}
+        legacy_cleared = []
         if cookie_touched:
             try:
                 raw_json = writes.get("cookie_json", "")
@@ -1135,6 +1164,10 @@ class HuaweiHealthWebApi:
                 }, status_code=400)
             for key in SENSITIVE_KEYS:
                 merged[key] = ""
+        else:
+            # v0.5.3（审查建议）：保存时主动清掉配置里的明文 Cookie 副本。
+            # 条件写在 _clear_redundant_cookie_config 里——只有加密文件已可用才清。
+            legacy_cleared = self._clear_redundant_cookie_config(merged, before)
 
         imported = False
 
@@ -1191,6 +1224,8 @@ class HuaweiHealthWebApi:
         message = "已生效 %d 项" % len(applied)
         if clamped:
             message += "（其中 %d 项已按上下限调整）" % len(clamped)
+        if legacy_cleared:
+            message += "；已清空 %d 项冗余 Cookie 配置副本（登录态保存在加密文件中）" % len(legacy_cleared)
         p.logger.info("[华为健康] WebUI 保存配置：已生效 %s" % ", ".join(applied))
         return json_response(await asyncio.to_thread(
             self._config_payload, applied, changed, clamped, message))

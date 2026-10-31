@@ -1567,5 +1567,110 @@ class TestDegradedConfig(_ResponseAssertions, unittest.TestCase):
         })
 
 
+# ==================== 冗余 Cookie 配置副本的主动清空（v0.5.3）====================
+
+class TestRedundantCookieCleanup(unittest.TestCase):
+    """审查建议：保存时主动清空配置里的明文 Cookie 副本。
+
+    但不能无脑清——配置里的 cookie 可能是用户唯一的一份（直接编辑原始配置、
+    还没走过导入流程）。只有加密文件里已经同时有 CASTGC 与 sid 时，配置副本
+    才是冗余的。
+    """
+
+    JSON_COPY = ('[{"domain":".huawei.com","name":"sid","value":"cfg-sid",'
+                 '"path":"/","secure":true}]')
+
+    def _make(self, config_cookies=True, file_cookies=("CASTGC", "sid")):
+        data = full_config()
+        if config_cookies:
+            data["cookie_json"] = self.JSON_COPY
+            data["cookie_CASTGC"] = "cfg-cast"
+            data["cookie_sid"] = "cfg-sid"
+        plugin, api, config = make_api(make_config(data))
+        if file_cookies:
+            plugin.auth.import_cookie_sources(
+                "", {name: "enc-" + name for name in file_cookies},
+                replace_existing=True)
+        return plugin, api, config
+
+    def _save_token_ttl(self, api, value=1234):
+        """提交一个与 Cookie 无关的设置项。"""
+        body = {"values": {"token_ttl": value}, "revision": revision_of(api)}
+        return post_config(api, body)
+
+    def _config_cookies(self, config):
+        return {key: config.get(key) for key in hw_webapi.SENSITIVE_KEYS}
+
+    def _message(self, resp):
+        return resp["payload"].get("message", "")
+
+    def test_clears_config_copy_when_encrypted_cookie_is_complete(self):
+        plugin, api, config = self._make()
+        before_file = open(plugin.cookie_file, "rb").read()
+
+        resp = self._save_token_ttl(api)
+        self.assertEqual(resp["status_code"], 200, resp)
+        self.assertEqual(
+            {k for k, v in self._config_cookies(config).items() if str(v or "").strip()},
+            set(), "加密登录态已可用，配置里的明文副本应被清空")
+        self.assertIn("已清空", self._message(resp))
+        self.assertEqual(open(plugin.cookie_file, "rb").read(), before_file,
+                         "清理配置副本不该动加密 cookie 文件")
+
+    def test_copy_is_cleared_on_disk_not_only_in_memory(self):
+        plugin, api, config = self._make()
+        self._save_token_ttl(api)
+        on_disk = json.load(open(config.config_path, encoding="utf-8-sig"))
+        for key in hw_webapi.SENSITIVE_KEYS:
+            self.assertFalse(str(on_disk.get(key) or "").strip(),
+                             "%s 仍然明文留在落盘配置里" % key)
+
+    def test_keeps_config_copy_when_cookie_file_missing(self):
+        """没有加密文件时，配置里那份就是唯一凭据，绝不能清。"""
+        plugin, api, config = self._make(file_cookies=None)
+        resp = self._save_token_ttl(api)
+        self.assertEqual(resp["status_code"], 200, resp)
+        self.assertEqual(config.get("cookie_CASTGC"), "cfg-cast")
+        self.assertEqual(config.get("cookie_json"), self.JSON_COPY)
+        self.assertNotIn("已清空", self._message(resp))
+
+    def test_keeps_config_copy_when_cookie_file_lacks_required(self):
+        """只有 sid、缺 CASTGC —— 登录态还不完整，不能清。"""
+        data = full_config()
+        data["cookie_json"] = self.JSON_COPY
+        data["cookie_CASTGC"] = "cfg-cast"
+        data["cookie_sid"] = "cfg-sid"
+        plugin, api, config = make_api(make_config(data))
+        # 直接写文件（import_cookie_sources 的 replace 模式本身会拒绝缺项）
+        plugin.auth.save_cookies([{"name": "sid", "value": "enc-sid",
+                                   "domain": ".huawei.com", "path": "/"}])
+        resp = self._save_token_ttl(api)
+        self.assertEqual(resp["status_code"], 200, resp)
+        self.assertEqual(config.get("cookie_CASTGC"), "cfg-cast")
+        self.assertNotIn("已清空", self._message(resp))
+
+    def test_noop_when_config_has_no_cookie_copy(self):
+        plugin, api, config = self._make(config_cookies=False)
+        resp = self._save_token_ttl(api)
+        self.assertEqual(resp["status_code"], 200, resp)
+        self.assertNotIn("已清空", self._message(resp))
+
+    def test_explicit_import_still_clears_all_seven(self):
+        """原有行为不能退化：显式导入仍清空七项。"""
+        plugin, api, config = self._make(config_cookies=False, file_cookies=None)
+        body = {"values": {"cookie_CASTGC": "new-cast", "cookie_sid": "new-sid"},
+                "revision": revision_of(api)}
+        resp = post_config(api, body)
+        self.assertEqual(resp["status_code"], 200, resp)
+        self.assertEqual(
+            {k for k, v in self._config_cookies(config).items() if str(v or "").strip()},
+            set())
+
+    def test_cleanup_does_not_break_unrelated_values(self):
+        plugin, api, config = self._make()
+        self._save_token_ttl(api, 4321)
+        self.assertEqual(config.get("token_ttl"), 4321, "清理 Cookie 副本不该影响其它设置")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
