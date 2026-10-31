@@ -317,6 +317,7 @@ header{display:flex;align-items:baseline;gap:10px;margin-bottom:4px;position:sti
         存储保护方式和关键明细；需要换上一份新 cookie 时请到设置页导入，清除登录态用下面的按钮。
       </div>
       <div class="row" style="margin-top:10px">
+        <button class="act primary" type="button" id="btnGotoImport">去设置页导入 cookie →</button>
         <button class="act danger" type="button" id="btnClear">清除 cookie</button>
       </div>
       <div class="msg" id="ckMsg"></div>
@@ -1056,6 +1057,20 @@ async function doCredentialClear(){
 }
 
 /* ---------- Cookie 清除（导入已统一到设置页） ---------- */
+/* v0.5.2：导入入口只剩设置页，这里只负责把用户送过去。 */
+function gotoCookieImport(){
+  switchTab("config");
+  // 设置页是按 schema 异步渲染的，cookie 区块的 DOM 要过几百毫秒才出现。
+  // 找不到就安静放弃——滚动失败不该影响切 tab 本身。
+  let tries = 0;
+  const tick = () => {
+    const target = document.querySelector('[data-path="cookie_json"]');
+    if(target){ target.scrollIntoView({block:"center", behavior:"smooth"}); return; }
+    if(++tries < 12) setTimeout(tick, 100);
+  };
+  setTimeout(tick, 100);
+}
+
 async function doClear(){
   if(!confirm("确定清除 cookie 文件？清除后需要重新导入才能取数。")) return;
   const b = $("btnClear"); b.disabled = true;
@@ -1782,6 +1797,7 @@ function bindAll(){
   $("btnCredentialClear").onclick = doCredentialClear;
   $("btnCredentialStatus").onclick = () => loadCredentialsStatus(false);
 
+  $("btnGotoImport").onclick = gotoCookieImport;
   $("btnClear").onclick = doClear;
 
   $("btnCfgSave").onclick = saveConfig;
