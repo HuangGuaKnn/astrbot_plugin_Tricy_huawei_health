@@ -1,6 +1,6 @@
 # 华为运动健康 · AstrBot 插件
 
-版本：v0.5.1
+版本：v0.5.2
 
 > 各版本变更见 [Releases](https://github.com/HuangGuaKnn/astrbot_plugin_Tricy_huawei_health/releases) 与 [CHANGELOG_v0.4.1.md](CHANGELOG_v0.4.1.md)、[CHANGELOG_v0.4.2.md](CHANGELOG_v0.4.2.md)、[CHANGELOG_v0.5.0.md](CHANGELOG_v0.5.0.md)。
 
