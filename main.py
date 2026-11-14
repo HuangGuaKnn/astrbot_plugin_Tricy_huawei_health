@@ -308,7 +308,8 @@ class HuaweiHealthPlugin(Star):
             if state == "FAILED":
                 raise fail(
                     "自动登录失败：%s" % (status.get("message") or "请查看 WebUI 登录状态"),
-                    "session_failed")
+                    "wronghost" if getattr(session, "failure_code", "") == "wronghost"
+                    else "session_failed")
             if state in ("NEED_SMS", "NEED_CRED", "NEED_TRUST"):
                 break
             await asyncio.sleep(0.5)
@@ -380,6 +381,8 @@ class HuaweiHealthPlugin(Star):
                     raise
                 except HuaweiAuthError as exc:
                     self._assert_current(epoch)
+                    if getattr(exc, "code", "") == "wronghost":
+                        raise
                     if not os.path.exists(self.cookie_file):
                         raise
                     self.logger.warning("[华为健康] 账号密码登录不可用（%s），退回 cookie 路线" % redact_error(exc))

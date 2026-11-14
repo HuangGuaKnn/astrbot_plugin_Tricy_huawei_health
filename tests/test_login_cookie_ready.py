@@ -72,6 +72,9 @@ class FakeCDP:
         self.fill_calls = 0
         self.sms_calls = 0
         self.token = ""
+        self.host = lambda: "health.cloud.huawei.com"
+        self.host_probes = []
+        self.navigate = lambda deadline: None
         self.read_token = lambda: self.token
         self.ready = "notfound"
         self.fill = "missing"
@@ -88,11 +91,20 @@ class FakeCDP:
 
     def _call(self, ws, method, params=None, **kwargs):
         self.calls.append((method, params))
+        if method == "Page.navigate":
+            self.navigate(kwargs.get("deadline"))
         if method == "Network.getAllCookies":
             return {"result": {"cookies": self.cookies}}
         return {}
 
-    def _js(self, ws, script):
+    def _js(self, ws, script, *, deadline=None):
+        if "return {host,value:(" in script:
+            host = self.host()
+            self.host_probes.append((host, deadline))
+            if host in ("about:blank", "external"):
+                return {"host": host}
+            expr = script.split("return {host,value:(", 1)[1][:-7]
+            return {"host": host, "value": self._js(ws, expr) if expr != "null" else None}
         if script == "sessionStorage.getItem('accessToken')":
             self.token_reads += 1
             return self.read_token()
@@ -107,7 +119,7 @@ class FakeCDP:
             return "submitted"
         if "pwd_error" in script:
             return json.dumps(self.page)
-        if "button.login-button" in script:
+        if "return 'credentials';" in script:
             self.login_probes += 1
             return self.ready() if callable(self.ready) else self.ready
         raise AssertionError("unexpected CDP script in login flow")
@@ -327,9 +339,230 @@ class CookieReadyFlowTests(unittest.TestCase):
         self.run_session()
         self.assert_no_commit()
 
+    def cold_log(self):
+        logs = [call.args[0] for call in self.plugin.logger.info.call_args_list
+                if "cold_navigation " in call.args[0]]
+        self.assertEqual(len(logs), 1)
+        return dict(part.split("=", 1) for part in logs[0].split("cold_navigation ")[1].split())
+
+    def assert_wronghost(self):
+        self.assertEqual(self.session.failure_code, "wronghost")
+        self.assertEqual(self.session.snapshot()["state"], "FAILED")
+        self.manager.record_auto_failure.assert_not_called()
+        self.assertFalse(self.session._fallback_used)
+        self.assert_no_commit()
+
+    def test_cold_start_direct_huawei_navigation_records_no_added_wait(self):
+        self.session._cold_start = True
+        self.auth.navigate = lambda deadline: self.clock.advance(0.4)
+        self.auth.token = "fixture-existing-token"
+        self.run_session()
+        self.assert_success(self.auth.token)
+        self.assertEqual(self.cold_log(), {
+            "startup_ms": "400", "first_host": "health.cloud.huawei.com",
+            "recheck_ms": "0", "renavigated": "no", "renavigate_ms": "0",
+            "final_host": "health.cloud.huawei.com", "total_extra_ms": "0", "outcome": "ready",
+        })
+
+    def test_cold_start_rechecks_blank_after_login_click_and_recovers_at_200ms(self):
+        def clicked():
+            self.auth.host = lambda: "about:blank" if self.clock.now < 0.2 else "id1.cloud.huawei.com"
+            return "clicked"
+
+        self.auth.ready = clicked
+        self.session._cold_start = True
+        self.auth.read_token = lambda: "fixture-late-token" if self.clock.now >= 0.2 else ""
+        self.run_session()
+        self.assert_success("fixture-late-token")
+        self.credentials.load.assert_not_called()
+        self.assertEqual(self.cold_log(), {
+            "startup_ms": "0", "first_host": "health.cloud.huawei.com",
+            "recheck_ms": "200", "renavigated": "no", "renavigate_ms": "0",
+            "final_host": "id1.cloud.huawei.com", "total_extra_ms": "200", "outcome": "ready",
+        })
+
+    def test_cold_start_renavigates_once_within_remaining_budget(self):
+        def navigate(deadline):
+            if deadline is not None:
+                self.assertAlmostEqual(self.clock.now, 2.0)
+                self.assertAlmostEqual(deadline, 5.0)
+                self.clock.advance(0.3)
+                self.auth.token = "fixture-recovered-token"
+                self.auth.host = lambda: "id1.cloud.huawei.com"
+
+        self.auth.navigate = Mock(side_effect=navigate)
+        self.auth.host = lambda: "about:blank"
+        self.session._cold_start = True
+        self.run_session()
+        self.assert_success(self.auth.token)
+        self.assertEqual(self.auth.navigate.call_count, 2)
+        self.assertEqual(self.cold_log(), {
+            "startup_ms": "0", "first_host": "about:blank",
+            "recheck_ms": "2000", "renavigated": "yes", "renavigate_ms": "300",
+            "final_host": "id1.cloud.huawei.com", "total_extra_ms": "2300", "outcome": "ready",
+        })
+
+    def test_persistent_blank_ends_after_one_retry_within_five_seconds(self):
+        self.auth.navigate = Mock()
+        self.auth.host = lambda: "about:blank"
+        self.session._cold_start = True
+        self.manager.allow_visible_fallback = True
+        self.run_session()
+        self.assert_wronghost()
+        self.assertEqual(self.auth.navigate.call_count, 2)
+        self.assertAlmostEqual(self.clock.now, 5.0)
+        self.assertEqual(self.cold_log()["total_extra_ms"], "5000")
+        self.credentials.load.assert_not_called()
+
+    def test_slow_renavigation_consumes_the_remaining_three_seconds(self):
+        def navigate(deadline):
+            if deadline is not None:
+                self.clock.advance(deadline - self.clock.now)
+                raise hw_login.HuaweiAuthDeadline("fixture CDP navigation deadline")
+
+        self.auth.navigate = Mock(side_effect=navigate)
+        self.auth.host = lambda: "about:blank"
+        self.session._cold_start = True
+        self.manager.allow_visible_fallback = True
+        self.run_session()
+        self.assert_wronghost()
+        self.assertEqual(self.auth.navigate.call_count, 2)
+        self.assertEqual(self.cold_log()["renavigate_ms"], "3000")
+
+    def test_renavigation_stays_bounded_through_the_post_click_gap(self):
+        def navigate(deadline):
+            if deadline is not None:
+                self.auth.host = lambda: "health.cloud.huawei.com"
+
+        def clicked():
+            self.auth.host = lambda: "about:blank"
+            return "clicked"
+
+        self.auth.navigate = Mock(side_effect=navigate)
+        self.auth.ready = clicked
+        self.auth.page_timeout = 90.0
+        self.auth.host = lambda: "about:blank"
+        self.session._cold_start = True
+        self.manager.allow_visible_fallback = True
+        self.run_session()
+        self.assert_wronghost()
+        self.assertEqual(self.auth.login_probes, 1)
+        self.assertEqual(self.auth.navigate.call_count, 2)
+        self.assertAlmostEqual(self.clock.now, 5.0)
+        self.credentials.load.assert_not_called()
+
+    def test_renavigation_stops_timing_when_account_form_is_ready(self):
+        def navigate(deadline):
+            if deadline is not None:
+                self.auth.host = lambda: "health.cloud.huawei.com"
+
+        def clicked():
+            self.auth.ready = "credentials"
+            self.auth.host = lambda: "id1.cloud.huawei.com" if self.clock.now >= 2.7 else "about:blank"
+            return "clicked"
+
+        def load_credentials():
+            self.clock.advance(10.0)
+            return {"account": "fixture-account", "password": "fixture-password"}
+
+        self.auth.navigate = Mock(side_effect=navigate)
+        self.auth.ready = clicked
+        self.auth.fill = "submitted"
+        self.auth.read_token = lambda: "fixture-password-token" if self.session._credentials_submitted else ""
+        self.auth.page_timeout = 90.0
+        self.auth.host = lambda: "about:blank"
+        self.credentials.load.side_effect = load_credentials
+        self.session._cold_start = True
+        self.run_session()
+        self.assert_success("fixture-password-token")
+        self.assertEqual(self.auth.navigate.call_count, 2)
+        self.assertEqual(self.cold_log()["renavigate_ms"], "700")
+
+    def test_confirmed_external_host_never_waits_or_renavigates(self):
+        self.auth.navigate = Mock()
+        self.auth.host = lambda: "external"
+        self.auth.token = "fixture-untrusted-token"
+        self.session._cold_start = True
+        self.manager.allow_visible_fallback = True
+        self.run_session()
+        self.assert_wronghost()
+        self.auth.navigate.assert_called_once_with(None)
+        self.assertEqual(self.auth.token_reads, 0)
+        self.credentials.load.assert_not_called()
+        self.assertEqual(self.cold_log()["final_host"], "external")
+        self.assertEqual(self.cold_log()["total_extra_ms"], "0")
+
+    def test_cancellation_during_recheck_prevents_renavigation(self):
+        self.auth.navigate = Mock()
+        self.auth.host = lambda: "about:blank"
+        self.session._cold_start = True
+        self.session._cancel.on_wait = self.session.cancel
+        self.manager.allow_visible_fallback = True
+        self.run_session()
+        self.auth.navigate.assert_called_once_with(None)
+        self.assert_no_commit()
+        self.assertEqual(self.cold_log()["outcome"], "cancelled")
+
+    def test_later_automatic_session_has_no_cold_start_grace(self):
+        self.auth.navigate = Mock()
+        self.auth.host = lambda: "about:blank"
+        self.manager.allow_visible_fallback = True
+        self.run_session()
+        self.assert_wronghost()
+        self.auth.navigate.assert_called_once_with(None)
+        self.assertEqual(self.clock.now, 0)
+        self.assertFalse(any("cold_navigation " in call.args[0]
+                             for call in self.plugin.logger.info.call_args_list))
+
+    def test_manager_assigns_cold_start_only_to_first_background_auto_session(self):
+        manager = hw_login.HuaweiLoginManager(self.plugin)
+        with patch.object(hw_login.HuaweiLoginSession, "start"):
+            manager.start("manual", manual=True)
+            self.assertFalse(manager.current_session()._cold_start)
+            manager.start("auto", manual=True)
+            self.assertFalse(manager.current_session()._cold_start)
+            manager.start("auto", manual=False)
+            self.assertTrue(manager.current_session()._cold_start)
+            manager.start("auto", manual=False)
+            self.assertFalse(manager.current_session()._cold_start)
+
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for actual page-script checks")
 class LoginReadyScriptTests(unittest.TestCase):
+    def test_guarded_scripts_never_interact_with_foreign_or_blank_page(self):
+        session = hw_login.HuaweiLoginSession
+        scripts = [session._guarded_page_script(expr) for expr in (
+            "sessionStorage.getItem('accessToken')", session._login_click_script(),
+            session._credential_fill_script("fixture-account", "fixture-password"),
+        )]
+        runner = r"""
+const vm = require('vm'), assert = require('assert');
+const scripts = JSON.parse(process.argv[1]);
+for (const [href, hostname, expected] of [
+  ['about:blank', '', 'about:blank'],
+  ['https://huawei.com.example.invalid/path?ticket=fixture', 'huawei.com.example.invalid', 'external'],
+  ['https://evilhuawei.com/', 'evilhuawei.com', 'external'],
+]) {
+  const context = {
+    location: {href, hostname},
+    get sessionStorage() { throw Error('cannot read token from this page'); },
+    get document() { throw Error('cannot interact with this page'); },
+  };
+  vm.createContext(context);
+  vm.runInContext('RegExp.prototype.test = () => true; String.prototype.endsWith = () => true;', context);
+  for (const script of scripts) {
+    const result = vm.runInContext(script, context);
+    assert.equal(result.host, expected);
+    assert.equal(result.value, undefined);
+  }
+}
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", runner, json.dumps(scripts)],
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_real_scripts_do_not_fill_or_click_after_cookie_authentication(self):
         scripts = {
             "fill": hw_login.HuaweiLoginSession._credential_fill_script("fixture-account", "fixture-password"),

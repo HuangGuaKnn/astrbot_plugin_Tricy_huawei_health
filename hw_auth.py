@@ -418,6 +418,10 @@ class HuaweiAuthInvalidated(HuaweiAuthError):
     """The account configuration changed while authentication was running."""
 
 
+class HuaweiAuthDeadline(HuaweiAuthError):
+    """An explicitly bounded CDP operation ran out of time."""
+
+
 class HuaweiAuth:
     """负责「拿 token」这一件事。"""
 
@@ -986,39 +990,62 @@ class HuaweiAuth:
         ws.settimeout(min(3, self.page_timeout))
         return ws
 
-    def _call(self, ws, method: str, params=None, timeout: int = None):
+    def _call(self, ws, method: str, params=None, timeout: int = None, *, deadline=None):
         # 所有 CDP 请求统一受 page_timeout 约束，超时抛明确异常供上层记录。
         timeout = min(timeout or self.page_timeout, max(1, self.page_timeout))
+        bounded = deadline is not None
+        if bounded:
+            deadline = min(deadline, time.monotonic() + timeout)
+            previous_timeout = ws.gettimeout()
+
+        def apply_remaining_timeout():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HuaweiAuthDeadline("CDP 导航等待超时")
+            ws.settimeout(remaining if previous_timeout is None else min(previous_timeout, remaining))
+
         self._seq = getattr(self, "_seq", 0) + 1
         mid = self._seq
         try:
-            ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        except Exception as exc:
-            # 对端已关时 send() 也会立刻抛。这里不分类的话，调用方拿到的是裸
-            # WebSocketConnectionClosedException，"浏览器已关闭"分支永远不可达。
-            raise HuaweiAuthError("CDP 连接已断开：%s: %s"
-                                  % (type(exc).__name__, redact_error(exc))) from exc
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+            if bounded:
+                apply_remaining_timeout()
             try:
-                raw = ws.recv()
+                ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
             except Exception as exc:
-                # v0.4.0 这里裸 continue：连接已断时 recv() 立刻抛，形成纯忙等，
-                # 实测 426 万次/秒、单核 100% 直到 page_timeout（默认 90 秒）。
-                name = type(exc).__name__
-                if "Timeout" in name:
-                    continue
+                if bounded and time.monotonic() >= deadline:
+                    raise HuaweiAuthDeadline("CDP 导航等待超时") from exc
                 raise HuaweiAuthError("CDP 连接已断开：%s: %s"
-                                      % (name, redact_error(exc))) from exc
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            if msg.get("id") == mid:
-                if msg.get("error"):
-                    raise HuaweiAuthError("CDP 调用失败：%s" % redact_error(msg["error"]))
-                return msg
-        raise HuaweiAuthError("CDP 调用超时：%s（%.1f 秒）" % (method, timeout))
+                                      % (type(exc).__name__, redact_error(exc))) from exc
+            if not bounded:
+                deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if bounded:
+                    apply_remaining_timeout()
+                try:
+                    raw = ws.recv()
+                except Exception as exc:
+                    # 仅接收超时可以继续等待，断开的连接必须即时退出。
+                    name = type(exc).__name__
+                    if "Timeout" in name:
+                        continue
+                    raise HuaweiAuthError("CDP 连接已断开：%s: %s"
+                                          % (name, redact_error(exc))) from exc
+                try:
+                    msg = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(msg, dict) and msg.get("id") == mid:
+                    if bounded and time.monotonic() >= deadline:
+                        break
+                    if msg.get("error"):
+                        raise HuaweiAuthError("CDP 调用失败：%s" % redact_error(msg["error"]))
+                    return msg
+            if bounded:
+                raise HuaweiAuthDeadline("CDP 导航等待超时")
+            raise HuaweiAuthError("CDP 调用超时：%s（%.1f 秒）" % (method, timeout))
+        finally:
+            if bounded:
+                ws.settimeout(previous_timeout)
 
     def _stop_process(self, proc, sweep_profile: bool = True):
         """先优雅退出并等待，失败时杀掉整个进程组，避免孤儿浏览器。
@@ -1115,10 +1142,12 @@ class HuaweiAuth:
         except Exception:
             return False
 
-    def _js(self, ws, expr: str):
-        r = self._call(ws, "Runtime.evaluate", {
+    def _js(self, ws, expr: str, *, deadline=None):
+        params = {
             "expression": expr, "returnByValue": True, "awaitPromise": True,
-        })
+        }
+        options = {"deadline": deadline} if deadline is not None else {}
+        r = self._call(ws, "Runtime.evaluate", params, **options)
         return r.get("result", {}).get("result", {}).get("value")
 
     def _wait_token(self, ws, timeout: int = 30) -> str:
