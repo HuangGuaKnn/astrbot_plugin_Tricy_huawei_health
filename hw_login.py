@@ -203,6 +203,8 @@ class HuaweiLoginSession:
         self._trust_retries = 0
         self._trust_last_choice = ""
         self._credentials_submitted = False
+        self._submitted_account = ""
+        self._injected_cookie_identity = None
         #: 本次会话是否真的在闸门里记过一笔（manual=True 不记账，成功时也就不能归还）。
         self._attempt_recorded = False
         self._state = "IDLE"
@@ -557,6 +559,9 @@ class HuaweiLoginSession:
             self._ensure_active()
             self._auth._call(self._ws, "Network.setCookies", {"cookies": cookies})
             self._ensure_active()
+            source = getattr(self.plugin, "_cookie_owner_source", None)
+            if callable(source):
+                self._injected_cookie_identity = source(cookies)
 
     @staticmethod
     def _guarded_page_script(expr):
@@ -751,6 +756,7 @@ class HuaweiLoginSession:
                         return ""
                 if result == "submitted":
                     self._credentials_submitted = True
+                    self._submitted_account = account.strip()
                     return ""
                 if result == "wronghost":
                     raise LoginFlowError("wronghost")
@@ -777,6 +783,8 @@ class HuaweiLoginSession:
             self._close_browser(sweep_profile=self._sweep_allowed())
             self.mode = "manual"
             self._headless = False
+            self._submitted_account = ""
+            self._injected_cookie_identity = None
             # 兜底是「重新开始一次登录」，别让自动阶段耗掉的时间吃掉可见窗口的预算。
             self._started_at = time.time()
             with self._lock:
@@ -1317,7 +1325,7 @@ class HuaweiLoginManager:
             self._save_login_config()
             return new_value
 
-    def _save_login_config(self):
+    def _save_login_config(self, *, strict=False):
         data = {
             "mode": self.login_mode,
             "auto_trust": bool(self.auto_trust),
@@ -1340,6 +1348,8 @@ class HuaweiLoginManager:
             os.replace(tmp, self.login_config_path)
             harden_file_permissions(self.login_config_path)
         except OSError as exc:
+            if strict:
+                raise
             # 只读目录 / 文件被占用：闸门状态丢了比抛裸 OSError 一路穿到 WebUI 好。
             # v0.4.1 第一版这里会把 PermissionError 抛到 manager.start() 的调用方。
             self._log_warning("写入 login_config.json 失败（%s），本次状态未持久化"
@@ -1363,13 +1373,16 @@ class HuaweiLoginManager:
         except Exception:
             pass
 
-    def set_login_mode(self, mode: str):
+    def set_login_mode(self, mode: str, *, strict=False):
         mode = str(mode or "").strip().lower()
         if mode not in ("cookie", "password"):
             raise LoginFlowError("mode_invalid")
         with self._lock:
             self.login_mode = mode
-            self._save_login_config()
+            if strict:
+                self._save_login_config(strict=True)
+            else:
+                self._save_login_config()
 
     # ---------- 风控闸门 ----------
 

@@ -49,8 +49,10 @@ class FakeCredentials:
 class TestWebApiRevision(unittest.TestCase):
     def setUp(self):
         self.plugin = boot.make_plugin(boot.load_main())
+        self.real_credentials = self.plugin.credentials
         self.plugin.credentials = FakeCredentials()
         self.api = hw_webapi.HuaweiHealthWebApi(self.plugin)
+        self.addCleanup(setattr, request, "body", {})
 
     def seed_old_account(self):
         self.plugin.store.set("token", {"token": "old-example-token", "expire_at": time.time() + 600})
@@ -62,14 +64,24 @@ class TestWebApiRevision(unittest.TestCase):
         self.assertIsNone(self.plugin.store.get("sleep:7"))
 
     def test_saving_credentials_invalidates_old_account_and_runs_off_loop(self):
+        self.plugin.credentials = self.real_credentials
+        original_save = self.real_credentials.save
+        save_threads = []
+
+        def record_save(*args, **kwargs):
+            save_threads.append(threading.current_thread())
+            return original_save(*args, **kwargs)
+
         self.seed_old_account()
         request.body = {"account": "new-example-account", "password": "example-password"}
-        response = asyncio.run(self.api.credentials_write())
+        with patch.object(self.real_credentials, "save", side_effect=record_save):
+            response = asyncio.run(self.api.credentials_write())
         self.assertEqual(response["status_code"], 200)
         self.assert_cache_cleared()
         self.assertFalse(os.path.exists(self.plugin.cookie_file))
         self.assertEqual(self.plugin.login_manager.login_mode, "password")
-        self.assertIsNot(self.plugin.credentials.saved_thread, threading.current_thread())
+        self.assertEqual(len(save_threads), 1)
+        self.assertIsNot(save_threads[0], threading.current_thread())
 
     def test_clearing_credentials_keeps_cookie_but_clears_cache(self):
         self.seed_old_account()
@@ -82,6 +94,70 @@ class TestWebApiRevision(unittest.TestCase):
         self.assertTrue(os.path.exists(self.plugin.cookie_file))
         self.assertIsNone(self.plugin.credentials.saved)
         self.assertEqual(self.plugin.login_manager.login_mode, "cookie")
+
+    def test_webui_same_account_resave_keeps_health_cache_after_restart(self):
+        p = self.plugin
+        p.credentials = self.real_credentials
+        request.body = {"account": "example-account", "password": "initial-example-password"}
+        self.assertEqual(asyncio.run(self.api.credentials_write())["status_code"], 200)
+        ciphertext = pathlib.Path(p.credentials.path).read_bytes()
+        cookies = [
+            {"name": "CASTGC", "value": "example-cookie-a", "domain": ".huawei.com", "path": "/CAS"},
+            {"name": "sid", "value": "example-cookie-b", "domain": ".huawei.com", "path": "/"},
+        ]
+        session = SimpleNamespace(
+            _auth=p.auth,
+            _auth_epoch=p._auth_epoch,
+            _lock=threading.RLock(),
+            _cancel=threading.Event(),
+            _submitted_account="example-account",
+        )
+        with patch.object(p.login_manager, "current_session", return_value=session):
+            self.assertTrue(p._commit_login_result(session, cookies, "example-old-token", time.time() + 120))
+        p.store.set("sleep:7", {"minutes": 420}, ttl=120)
+        request.body = {"account": "example-account", "password": "changed-example-password"}
+        self.assertEqual(asyncio.run(self.api.credentials_write())["status_code"], 200)
+        self.assertNotEqual(pathlib.Path(p.credentials.path).read_bytes(), ciphertext)
+        self.assertIsNone(p.store.get("token"))
+        self.assertFalse(pathlib.Path(p.cookie_file).exists())
+
+        restarted = boot.make_plugin(boot.load_main(data_dir=p.data_dir))
+
+        async def check_cache():
+            await p.terminate()
+            try:
+                await restarted.initialize()
+                with patch.object(restarted, "_client", new_callable=AsyncMock) as client:
+                    self.assertEqual(await restarted._cached("sleep:7", None), {"minutes": 420})
+                    client.assert_not_awaited()
+            finally:
+                await restarted.terminate()
+
+        asyncio.run(check_cache())
+
+    def test_visible_login_does_not_inherit_injected_cookie_owner(self):
+        p = self.plugin
+        p.credentials = self.real_credentials
+        request.body = {"account": "example-account", "password": "example-password"}
+        self.assertEqual(asyncio.run(self.api.credentials_write())["status_code"], 200)
+        current_cookies = [
+            {"name": "CASTGC", "value": "example-account-a-cookie", "domain": ".huawei.com", "path": "/CAS"},
+        ]
+        session = SimpleNamespace(
+            _auth=p.auth, _auth_epoch=p._auth_epoch,
+            _lock=threading.RLock(), _cancel=threading.Event(),
+            _submitted_account="example-account", _headless=True,
+        )
+        with patch.object(p.login_manager, "current_session", return_value=session):
+            self.assertTrue(p._commit_login_result(session, current_cookies, "example-token-a", time.time() + 120))
+            p.store.set("sleep:7", {"minutes": 420}, ttl=120)
+            session._injected_cookie_identity = p._cookie_owner_source(current_cookies)
+            session._headless = False
+            session._submitted_account = ""
+            other_cookies = [dict(current_cookies[0], value="example-account-b-cookie")]
+            self.assertTrue(p._commit_login_result(session, other_cookies, "example-token-b", time.time() + 120))
+        self.assertEqual(p.store.current_auth_binding()[0], "cookie")
+        self.assertIsNone(p.store.get("sleep:7"))
 
     def test_cookie_clear_removes_file_and_old_account_cache(self):
         self.seed_old_account()
@@ -148,6 +224,36 @@ class TestWebApiRevision(unittest.TestCase):
             credentials = asyncio.run(self.api.credentials_status())["payload"]["data"]
         self.assertEqual(status["cookie"]["storage"], protection)
         self.assertEqual(credentials["cookie_storage"], protection)
+
+    def test_corrupt_switch_marker_keeps_webui_available_with_manual_repair_path(self):
+        marker = pathlib.Path(self.plugin.data_dir, "account_switch.pending.json")
+        marker.write_text("invalid marker", encoding="utf-8")
+        self.plugin._token = AsyncMock(side_effect=AssertionError("browser auth must not run"))
+        asyncio.run(self.plugin.initialize())
+        self.assertTrue(any(api["route"].endswith("/status") for api in self.plugin.context.web_apis))
+        status = asyncio.run(self.api.get_status())
+        self.assertEqual(status["status_code"], 200)
+        switch = status["payload"]["data"]["account_switch"]
+        self.assertEqual(switch, {
+            "pending": True,
+            "marker_path": str(marker.absolute()),
+            "cookie_path": os.path.abspath(self.plugin.cookie_file),
+        })
+        request.body = {"repair_account_switch": True}
+        result = asyncio.run(self.api.refresh())
+        self.assertEqual(result["status_code"], 409)
+        self.assertTrue(marker.exists())
+        self.assertEqual(asyncio.run(self.api.login_start())["status_code"], 409)
+        self.plugin._token.assert_not_awaited()
+
+    def test_switch_repair_mode_recovers_without_authentication(self):
+        self.plugin._recover_account_transition = AsyncMock()
+        self.plugin._token = AsyncMock()
+        request.body = {"repair_account_switch": True}
+        result = asyncio.run(self.api.refresh())
+        self.assertEqual(result["status_code"], 200)
+        self.plugin._recover_account_transition.assert_awaited_once()
+        self.plugin._token.assert_not_awaited()
 
     def test_new_manual_login_invalidates_old_cache(self):
         self.seed_old_account()
@@ -222,6 +328,44 @@ class TestWebApiRevision(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for browser JavaScript checks")
 class TestBrowserRevision(unittest.TestCase):
+    def test_switch_repair_displays_absolute_path_and_uses_local_recovery(self):
+        root = pathlib.Path(os.environ.get("HW_AUDIT_PLUGIN_DIR") or boot.PLUGIN_DIR)
+        script = r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const marker = 'C:\\TestData\\account_switch.pending.json';
+const oldCookie = 'C:\\TestData\\hw_cookies.json';
+const elements = new Proxy({}, {get(o, key) { return o[key] ||= {}; }});
+const calls = [];
+const context = {
+  $: id => elements[id],
+  setMsg(node,text) { node.textContent = text; },
+  apiPost: async (path, body) => { calls.push([path, body.repair_account_switch]); },
+  unwrap: value => value,
+  loadStatus: async () => context.renderAccountSwitch({}),
+};
+vm.createContext(context);
+vm.runInContext(html.slice(html.indexOf('function renderAccountSwitch('),
+    html.indexOf('function renderStatus(')), context);
+vm.runInContext(html.slice(html.indexOf('async function doRepairAccountSwitch('),
+    html.indexOf('/* ---------- 账号登录 ---------- */')), context);
+(async () => {
+  assert.match(html, /检测到未完成的账号切换/);
+  assert.match(html, /删除切换标记 <code id="accountSwitchMarker">/);
+  context.renderAccountSwitch({pending: true, marker_path: marker, cookie_path: oldCookie});
+  assert.equal(elements.accountSwitchRepair.hidden, false);
+  assert.equal(elements.accountSwitchMarker.textContent, marker);
+  assert.equal(elements.accountSwitchCookie.textContent, oldCookie);
+  await context.doRepairAccountSwitch();
+  assert.deepEqual(calls, [['refresh', true]]);
+  assert.equal(elements.accountSwitchRepair.hidden, true);
+  assert.equal(elements.btnRepairAccountSwitch.disabled, false);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        subprocess.run([shutil.which("node"), "-e", script,
+                        str(root / "pages" / "health_console" / "index.html")],
+                       check=True, encoding="utf-8", capture_output=True)
+
     def test_real_javascript_preserves_errors_and_redacts_diagnostics(self):
         root = pathlib.Path(os.environ.get("HW_AUDIT_PLUGIN_DIR") or boot.PLUGIN_DIR)
         script = r"""

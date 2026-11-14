@@ -41,6 +41,10 @@ class CredentialsError(RuntimeError):
     """Base class for credential storage errors."""
 
 
+class CredentialsMissingError(CredentialsError):
+    """No saved credentials file."""
+
+
 class CredentialsUnavailableError(CredentialsError):
     """No usable encryption backend or external master key is configured."""
 
@@ -278,7 +282,7 @@ class HuaweiCredentialsStore:
     def available(self) -> bool:
         return bool(persistent_storage_status(self.data_dir)["available"])
 
-    def save(self, account: str, password: str) -> Dict[str, Any]:
+    def save(self, account: str, password: str, *, transaction=None) -> Dict[str, Any]:
         account = str(account or "").strip()
         password = str(password or "")
         if not account:
@@ -290,10 +294,15 @@ class HuaweiCredentialsStore:
         with self._lock:
             # A typo/replaced master key must never destroy the last readable
             # copy. Explicit clear is required to discard an unrecoverable file.
-            if os.path.exists(self.path):
+            try:
                 self.load()
+            except CredentialsMissingError:
+                pass
+            fields = {"account": account, "password": password, "updated_at": int(time.time())}
+            if transaction is not None:
+                fields["transaction"] = transaction
             payload = json.dumps(
-                {"account": account, "password": password, "updated_at": int(time.time())},
+                fields,
                 ensure_ascii=False, separators=(",", ":"),
             ).encode("utf-8")
             ciphertext = (MAGIC + _protect(payload) if sys.platform == "win32"
@@ -315,12 +324,22 @@ class HuaweiCredentialsStore:
         return self.status()
 
     def load(self) -> Dict[str, str]:
+        value = self._load()
+        return {"account": value["account"], "password": value["password"]}
+
+    def transition_id(self):
+        try:
+            return self._load().get("transaction")
+        except CredentialsMissingError:
+            return None
+
+    def _load(self):
         with self._lock:
-            if not os.path.isfile(self.path):
-                raise CredentialsError("credentials are not set")
             try:
                 with open(self.path, "rb") as stream:
                     raw = stream.read(1024 * 1024 + 1)
+            except FileNotFoundError as exc:
+                raise CredentialsMissingError("credentials are not set") from exc
             except OSError as exc:
                 # Locked / permission denied is NOT "never saved" — callers must
                 # be able to tell the user to close whatever holds the file.
@@ -341,7 +360,7 @@ class HuaweiCredentialsStore:
             raise CredentialsCorruptError("credentials cannot be decrypted") from exc
         if not isinstance(value, dict) or not isinstance(value.get("account"), str) or not isinstance(value.get("password"), str):
             raise CredentialsCorruptError("credentials payload is invalid")
-        return {"account": value["account"], "password": value["password"]}
+        return value
 
     def clear(self) -> bool:
         with self._lock:

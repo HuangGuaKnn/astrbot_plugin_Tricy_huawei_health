@@ -468,6 +468,7 @@ class HuaweiAuth:
         self._last_failure = state["last"]
         self.failure_cooldown = 180
         self.token_expire_at = 0.0
+        self.authenticated_cookie_digests = None
         self._plaintext_warned = False
 
     # ---------- cookie 读写 ----------
@@ -548,14 +549,12 @@ class HuaweiAuth:
 
     def _load_cookie_snapshot(self):
         with self._cookie_lock:
-            if not os.path.exists(self.cookie_file):
-                return [], None
-            with open(self.cookie_file, "rb") as f:
-                raw = f.read(1024 * 1024 + 1)
             try:
-                mtime_ns = os.stat(self.cookie_file).st_mtime_ns
-            except OSError:
-                mtime_ns = None
+                with open(self.cookie_file, "rb") as f:
+                    raw = f.read(1024 * 1024 + 1)
+                    mtime_ns = os.fstat(f.fileno()).st_mtime_ns
+            except FileNotFoundError:
+                return [], None
             return self._deserialize_cookies(raw), mtime_ns
 
     def load_cookies(self):
@@ -619,6 +618,18 @@ class HuaweiAuth:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    @classmethod
+    def config_cookie_digest(cls, json_text, fields):
+        incoming = _merge_cookies(
+            parse_cookie_input(json_text) if json_text else [],
+            cookies_from_fields(fields))
+        return cls._config_digest(incoming) if incoming else None
+
+    @classmethod
+    def cache_cookie_digest(cls, cookies):
+        effective = _merge_cookies(normalize_cookie(cookie) for cookie in cookies)
+        return cls._config_digest(effective) if effective else None
+
     def _read_config_marker(self) -> str:
         try:
             with open(self._marker_path(), "r", encoding="utf-8") as f:
@@ -626,12 +637,17 @@ class HuaweiAuth:
         except OSError:
             return ""
 
-    def _write_config_marker(self, digest: str) -> None:
+    def _write_config_marker(self, digest: str, *, strict=False) -> None:
         try:
             with open(self._marker_path(), "w", encoding="utf-8") as f:
                 f.write(digest)
+                if strict:
+                    f.flush()
+                    os.fsync(f.fileno())
             harden_file_permissions(self._marker_path())
         except OSError as exc:
+            if strict:
+                raise
             self._log("warning", "写入 cookie 配置指纹失败：%s" % redact_error(exc))
 
     def purge_stale_tmp(self) -> int:
@@ -925,10 +941,17 @@ class HuaweiAuth:
                     current_mtime_ns = None
                 if cookie_mtime_ns is None or current_mtime_ns != cookie_mtime_ns:
                     raise HuaweiAuthInvalidated("登录配置已变化，已丢弃旧认证结果，请重新查询")
+                digest_before = self.cache_cookie_digest(cookies)
+                if self.cache_cookie_digest(self.load_cookies()) != digest_before:
+                    raise HuaweiAuthInvalidated("登录配置已变化，已丢弃旧认证结果，请重新查询")
+                digest_after = digest_before
                 if len(fresh) >= max(5, len(cookies) // 2):
-                    if not self.save_cookies([normalize_cookie(c) for c in fresh], cookie_mtime_ns):
+                    normalized = [normalize_cookie(c) for c in fresh]
+                    if not self.save_cookies(normalized, cookie_mtime_ns):
                         raise HuaweiAuthInvalidated("登录配置已变化，已丢弃旧认证结果，请重新查询")
+                    digest_after = self.cache_cookie_digest(normalized)
                     self._log("info", "cookie 已回写：%d → %d 条" % (len(cookies), len(fresh)))
+                self.authenticated_cookie_digests = (digest_before, digest_after)
                 self.clear_failure()
                 self._log("info", "认证成功，耗时 %.1f 秒" % (time.monotonic() - started))
                 return token
