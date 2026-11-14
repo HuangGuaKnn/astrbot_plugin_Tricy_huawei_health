@@ -68,6 +68,8 @@
 
 ### 发现 1：缓存/单飞 key 不含账号指纹——跨进程换号（直接替换 cookie 文件）后 TTL 内会读到上一账号的数据
 
+> 2026-11-14 复核：仍然成立（停用期间仅替换 Cookie 文件且未触发配置导入时，旧持久化快照仍可命中。查询键无账号归属，见 `main.py:163-194`、`main.py:419-444`、`main.py:948-957`）。
+
 - 位置：`main.py:938-944 _query_key`（key 只含指标名、时区、日期、client_id、api_version）；`main.py:415-438 _cached`（flight_key = `(auth_epoch, data_epoch, key)`，不含账号）；`main.py:176-188 initialize` 的配置 cookie 导入；持久化层 `hw_store.py`（`health.db` 跨重启保留未过期快照）。
 - 触发条件：插件**停用期间**账号被换掉且只替换了 `hw_cookies.json`（换机拷贝、备份恢复、手工搬 `plugin_data`），而配置里的 `cookie_*` 字段没变（或配置里本来就只有 cookie 文件）。重启后 `_auth_epoch`/`_data_epoch` 归零，`initialize()` 的 `_import_config_cookies` 返回 0（配置指纹没变）→ **不清 health 缓存**；此时 `data_ttl`（默认 600 秒）内的 `hr:7 / sleep:7 / weight:1095 …` 仍命中上一个账号落盘的数据。`_query_key` 含当天日期，所以最坏在同一自然日内一直命中。
 - 后果：串账号（读方向：把 A 的健康数据当成 B 的返回给用户）。不会写坏文件、不会污染 cookie。
@@ -79,6 +81,8 @@
   不要改 `_query_key` 的 HTTP 语义部分（时区/日期那几项是对的）。
 
 ### 发现 2（已复现，中危）：`_commit_login_result` 不推进代数——password 模式的**自动登录会话**提交后，同 epoch 在飞的旧账号查询会把数据 publish 进新账号缓存
+
+> 2026-11-14 复核：已被 `181a113` 修掉（会话提交推进 `_data_epoch`，拒绝旧请求回写，见 `main.py:596-617`、`tests/test_state_revision.py:488`）。
 
 > 本发现最初被判为「依赖外部闸门、当前不可利用」；独立复核（另一名审计员 + Lead 用真实 `_token`/`_password_token`/`_cached` 路径重跑）推翻了该结论：WebUI 路径安全，但 `_password_token_impl` 发起的自动登录会话**不经过** `_change_auth_state`，提交时两项 epoch 都不动。
 >
@@ -106,6 +110,8 @@
 
 ### 发现 3：切号事务失败是「半完成 + 仅内存 fail-closed」——重启后半完成状态会丢，旧 cookie 可能把用户带回旧账号
 
+> 2026-11-14 复核：仍然成立（切换失败状态只存于内存。重启后若密码认证失败，仍可回退到残留 Cookie，见 `main.py:136`、`main.py:376-390`、`main.py:512-575`）。
+
 - 位置：`main.py:506-524 _change_auth_state_blocking`（`_clear_auth_cache_blocking` 已推进 `auth_epoch`、删 token、清 health 缓存 → `mutator()` 可能已经写入新凭据 → `clear_cookies` 抛错 → `_state_error` 留在内存 `True` 并向上抛）；`main.py:529-569 _change_auth_state_async`（finalize 抛错同样留 `_state_error=True`）；`main.py:370-384 _token` 的密码模式回退分支（凭据登录失败且 cookie 文件存在时回退 cookie 路线）；`main.py:1367-1384 terminate`（不处理 `_state_error`）。
 - 触发条件：`clear_cookies()` 抛 `OSError`（Windows 上 cookie 文件被备份/杀软短暂占用、ACL 被改、磁盘满），且此前的 `mutator()` 已经把新账号凭据写入并 `set_login_mode("password")`。此时进程内 fail-closed 是正确的（所有查询报「登录状态更新未完成」）；但 `_state_error` 没有落盘，**重启后插件认为状态正常**，于是「新账号凭据 + 旧账号 cookie 文件」共存：密码自动登录成功 → B；密码登录失败（密码错/冷却/额度）→ 回退 cookie 路线拿到 A 的 token → 返回 A 的数据。用户在 WebUI 看到的是 B 的掩码账号。
 - 后果：串账号（低概率、需要「磁盘/加密服务故障 + 密码登录失败」两个条件同时成立）；正常路径不会出现。更常见的后果是用户被 blocked 提示困住、只能重开插件，且失败原因没有被持久化。
@@ -114,6 +120,8 @@
 - 建议（最小改法）：`_change_auth_state_blocking` 失败时写一个 `auth_state_error.marker`（含 `auth_epoch` 与时间），`initialize()` 见到就 `_clear_auth_cache_blocking()` 一次再删 marker（恢复 fail-closed 的持久性）；或者更简单：`credentials_write` 的 `clear_cookies` 改成「先删 cookie 再写凭据」（把不可回滚的删除放在前面，失败时新凭据还没落盘，就不会出现新凭据+旧 cookie 共存）——`~4 行`。
 
 ### 发现 4：超时收敛有硬上界，但「已放弃的 worker 线程」会额外占用连接池槽位（最长约一个 socket 读超时）
+
+> 2026-11-14 复核：仍然成立（调用按 deadline 返回，在途同步 I/O 可继续占用共享池的三个槽位。DNS 与持续分段读取仍可超过预算，见 `main.py:138`、`main.py:455-456`、`main.py:976-1007`、`hw_client.py:401-434`、`hw_client.py:658-680`）。
 
 - 位置：`main.py:966-997 _run_items`（`asyncio.wait(..., timeout=deadline)` + finally 取消）；`main.py:413-480 _cached`（`asyncio.timeout` + `asyncio.shield`）；`hw_client.py:401-447 _request`（`Timeout(total=remaining, connect/read=min(25, remaining))`，`MAX_RETRIES=2` 的重试仍在总预算内）；`hw_client.py:617-694 ClientPool`（`max_size=3`）；`main.py:460-467 publish`（deadline + 代数双校验，拒绝超时结果落库）。
 - 触发条件：华为接口慢/网络黑洞，`_run_items` 的一批 producer 已经进入 `asyncio.to_thread`（线程无法被取消）；工具在 deadline 正常返回后，这些线程继续跑到 socket 超时/预算耗尽才退出。它们退出前一直持有 `ClientPool` 槽位（busy），最多 3 条并发；期间新查询的 `_checkout` 只能排队，直到自己的 deadline 也到点。
@@ -124,6 +132,8 @@
 
 ### 发现 5：`_cached` 对 `(auth_epoch, data_epoch)` 的两字段读取是撕裂快照——危险方向已被封死，但依赖相邻两行的顺序
 
+> 2026-11-14 复核：仍然成立（两代数仍分开读取，状态检查和锁内复核仍会拦截失配，见 `main.py:333-339`、`main.py:421-434`、`main.py:500-510`）。
+
 - 位置：`main.py:415`（`epoch, data_epoch = self._auth_epoch, self._data_epoch`，无锁）；`main.py:494-504 _clear_auth_cache_blocking`（496 先 `_auth_epoch += 1`，497 立刻 `_state_error = True`，503 才 `+data_epoch`）；`main.py:327-333 _assert_current`；`main.py:423-428 lookup`（在 `_state_lock` 内二次 `_assert_current`）。
 - 触发条件：读者恰好在线程切换点取到「新 auth_epoch + 旧 data_epoch」。但随后 `_assert_current` 会看到 `_state_error=True`（497 与 496 相邻，几乎无窗口）；即使侥幸过了第一关，`lookup` 在 `_state_lock` 内会等清理事务整体完成（data_epoch 已推进）再二次校验 → 抛 `StateChanged`。反向撕裂（旧 auth + 新 data）必然在 auth 校验失败。
 - 后果：**无**（攻击不可达）；属于「正确性依赖两行相邻顺序」的隐式不变量，未来若有人把 `_state_error = True` 挪到清理事务末尾，就会重新打开窗口。
@@ -132,6 +142,8 @@
 - 建议（最小改法）：把两代数合成一个对象/元组，在 `_state_lock` 内取快照（`with self._state_lock: epoch, data_epoch = self._auth_epoch, self._data_epoch`，3 行）；或把 `_state_error` 的置位与 `_data_epoch` 推进合成一个 `_epoch_bundle` 元组整体替换。
 
 ### 发现 6：`ClientPool.run(deadline=None)` 会永久等待（生产不可达，属于未来调用点的坑）
+
+> 2026-11-14 复核：仍然成立（缺省 deadline 可导致无界等待，当前生产借用链均传递 deadline，见 `hw_client.py:631-659`、`main.py:112`、`main.py:427`、`main.py:455-456`）。
 
 - 位置：`hw_client.py:631-656 _checkout`（`remaining = _remaining(deadline)` 为 `None` 时 `self._condition.wait(timeout=None)` 无上限）；`hw_client.py:658-680 run`；生产调用点：`main.py:450`（`_cached` 永远传入非 None deadline，因为 `main.py:421` 有默认 `QUERY_TIMEOUT`）、`main.py:111-112 _PooledClient`、`main.py:1206-1226 health_status` 探针（不走池）。
 - 触发条件：未来新增一个不传 deadline 的 `ClientPool.run` 调用点，且池槽位全忙。
@@ -142,6 +154,8 @@
 
 ### 发现 7：`_PooledClient` / `ClientPool` 异常路径未发现连接泄漏（审计结论项）
 
+> 2026-11-14 复核：仍然成立（异常后由 finally 归还槽位。失效时空闲客户端立即关闭，忙客户端归还时关闭，见 `hw_client.py:658-694`）。
+
 - 位置：`hw_client.py:658-680 run` 的 `try/finally`；`hw_client.py:682-694 invalidate/close`；`hw_client.py:631-656 _checkout`。
 - 触发条件（覆盖矩阵）：producer 抛任意异常 → finally 归还（既有 `test_exception_releases_slot_and_close_rejects_new_work`）；`invalidate()` 后 busy 客户端只在归还时关闭（既有 `test_invalidation_closes_busy_client_only_after_release`）；`close()` 幂等并拒绝新借用（同上）；`_checkout` 在创建/借出 entry 之前抛错不产生 entry，不会泄漏；`_closed` 分支先 remove 再 close，不会 double-close（`HuaweiHealthClient.close` 本身幂等）。
 - 后果：无泄漏。唯一真实成本是发现 4 的「已放弃线程占槽」。
@@ -149,6 +163,8 @@
 - 复现思路/建议：不需要修复；建议保持 `run` 的 finally 结构，不要在中间加 `return`（会跳过归还）。
 
 ### 发现 8：`_assert_current` 提交路径清点——所有会改变账号态的生产写路径都过校验，唯一例外是发现 2
+
+> 2026-11-14 复核：仍然成立（原代际例外已被 `181a113` 消除。`adb8cd7` 新增的分支只清理冗余配置副本，显式 Cookie 导入仍走状态事务，见 `main.py:596-617`、`hw_webapi.py:1138-1205`）。
 
 - 位置：逐路径见下表。
 - 后果：回答派活单问题「所有提交路径都过了这一关吗？」——**是**（下表 12 条路径逐条核对），唯一不推进代数的写路径是 `_commit_login_result`（发现 2）。
@@ -173,6 +189,8 @@
 
 ### 发现 9：`_cache_generation` 是「死防线」——注释声称防旧结果回写，但没有任何读者（低危）
 
+> 2026-11-14 复核：仍然成立（计数器仍无运行时校验读取点。误导性注释已被 `181a113` 修正，见 `main.py:141-146`、`main.py:488-492`、`tests/test_v041.py:2072-2074`）。
+
 - 位置：`main.py:141-142`（`self._cache_generation = {}` + 注释「generation 用于阻止刷新后旧请求把结果写回缓存」）；`main.py:485-486`（`_clear_health_cache` 里对已有键自增）；`tests/test_v041.py:2072-2074`（只断言自增）。全仓库检索 `_cache_generation` 只有这三处，**没有任何读取点参与放行/拒绝**。
 - 触发条件：不触发缺陷，是「防御声明与实现不一致」。
 - 后果：当前正确性完全由 `(auth_epoch, data_epoch)` + `_state_lock` 内 `_assert_current` 保证（发现 2 的复现说明：epoch 不动时旧结果确实会回写）。但若后续有人以为 generation 已兜底而放宽 epoch 断言，就会变成真实回写。
@@ -181,6 +199,8 @@
 - 建议：删除 `_cache_generation`（含注释与 485-486 两行），或真正接进 `_cached` 的 flight_key/publish 校验。保留现状会让后来者误判防线位置。**注意红线**：`tests/test_v041.py` 里那条自增断言是 v0.4.1 验收基线，本次未动；若决定删除该字段，需维护者单独评估那条基线用例。
 
 ### 发现 10：`_cached` 的共享单飞任务继承「首个调用者」的 deadline/ttl（低危，仅提前超时/缓存时长偏差）
+
+> 2026-11-14 复核：仍然成立（共享查询任务沿用首个调用者的 deadline 和 TTL，见 `main.py:444-484`、`main.py:930-943`、`main.py:1009-1015`、`main.py:1297`）。
 
 - 位置：`main.py:421`（deadline 由首个调用者确定）；`main.py:438-474`（flight_key 只含 `(epoch, data_epoch, key)`，已有任务直接复用）；`main.py:441-469 produce` 闭包捕获首个调用者的 `deadline`/`ttl`；`main.py:477-478` 第二个调用者用**自己的** timeout 等同一个 task。
 - 触发条件：两个调用者对同一 cache key 并发且首个 deadline 更早（例如 WebUI `/overview` 的 90 s 预算与 LLM 工具的调用先后脚），或两者传入的 ttl 不同（`_overview_items` 写死 600，`health_sleep` 用配置 `data_ttl`）。

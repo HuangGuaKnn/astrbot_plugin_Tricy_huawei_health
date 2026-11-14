@@ -37,6 +37,7 @@ from contextlib import nullcontext
 try:
     from .hw_auth import (
         HuaweiAuth,
+        HuaweiAuthDeadline,
         HuaweiAuthError,
         TRAINING_CAMP_URL,
         browser_launch_args,
@@ -58,6 +59,7 @@ try:
 except ImportError:
     from hw_auth import (
         HuaweiAuth,
+        HuaweiAuthDeadline,
         HuaweiAuthError,
         TRAINING_CAMP_URL,
         browser_launch_args,
@@ -108,6 +110,28 @@ TRUST_RETRY_GRACE = 12.0
 #: 各状态的 deadline 会被重试续期，这个上限兜底，防止会话无限期挂着。
 SESSION_HARD_CAP_FACTOR = 3
 
+COLD_HOST_RECHECK = 2.0
+COLD_NAVIGATION_BUDGET = 5.0
+COLD_HOST_POLL_INTERVAL = 0.2
+_TOKEN_SCRIPT = "sessionStorage.getItem('accessToken')"
+
+# Keep the host check in the same document as the page action. Navigation can
+# replace the CDP execution context between two separate evaluations.
+_LOGIN_HOST_CHECK = (
+    "const hostname=location.hostname;"
+    # The page can replace RegExp.prototype.test and String.prototype methods.
+    # A domain host in an HTTP(S) URL is already normalized to ASCII lowercase.
+    "const suffix='.huawei.com';"
+    "let allowed=hostname==='huawei.com';"
+    "if(!allowed&&hostname.length>=suffix.length){"
+    "allowed=true;for(let i=0;i<suffix.length;i++){"
+    "if(hostname[hostname.length-suffix.length+i]!==suffix[i]){allowed=false;break;}}}"
+    "if(!allowed)"
+    "return {host:location.href==='about:blank'?'about:blank':'external'};"
+    "const host=hostname==='health.cloud.huawei.com'||hostname==='id1.cloud.huawei.com'"
+    "?hostname:'huawei.com';"
+)
+
 #: 走可见浏览器兜底没有意义的错误码（重开浏览器不可能解决）。
 _FALLBACK_SKIP = (
     "credentials_missing", "credentials_unavailable", "credentials_corrupt",
@@ -147,13 +171,23 @@ class LoginFlowError(Exception):
 class HuaweiLoginSession:
     """单个浏览器登录会话；自动模式与人工模式共用验证码/信任状态机。"""
 
-    def __init__(self, manager, mode: str = "manual", manual: bool = False):
+    def __init__(self, manager, mode: str = "manual", manual: bool = False,
+                 *, cold_start: bool = False):
         self.manager = manager
         self.plugin = manager.plugin
         self.mode = mode
         self.manual = bool(manual)
         self.auto_trust = bool(manager.auto_trust)
         self._auto_attempted = mode == "auto"
+        self._cold_start = cold_start and self._auto_attempted and not self.manual
+        self._navigation_started = 0.0
+        self._navigation_deadline = None
+        self._startup_elapsed = None
+        self._first_host = "unavailable"
+        self._final_host = "unavailable"
+        self._recheck_elapsed = 0.0
+        self._renavigation_elapsed = 0.0
+        self._renavigation_started = None
         self._fallback_used = False
         self._headless = mode == "auto"
         self._session_timeout = max(60, int(getattr(manager, "session_timeout", 300)))
@@ -169,9 +203,12 @@ class HuaweiLoginSession:
         self._trust_retries = 0
         self._trust_last_choice = ""
         self._credentials_submitted = False
+        self._submitted_account = ""
+        self._injected_cookie_identity = None
         #: 本次会话是否真的在闸门里记过一笔（manual=True 不记账，成功时也就不能归还）。
         self._attempt_recorded = False
         self._state = "IDLE"
+        self._failure_code = ""
         self._message = STATE_MESSAGES["IDLE"]
         self._deadline = 0.0
         self._started_at = time.time()
@@ -250,6 +287,11 @@ class HuaweiLoginSession:
         if thread and thread.is_alive():
             thread.join(timeout=max(0.0, float(timeout)))
 
+    @property
+    def failure_code(self) -> str:
+        with self._lock:
+            return self._failure_code
+
     def _set_state(self, state: str, message: str = "", refresh: bool = None):
         """切换状态。
 
@@ -303,7 +345,8 @@ class HuaweiLoginSession:
         }
         message = messages.get(code, messages["failed"])
         with self._lock:
-            self._set_state("FAILED", message, refresh=True)
+            if self._set_state("FAILED", message, refresh=True):
+                self._failure_code = code
         try:
             self.plugin.logger.warning("[华为健康登录] " + message)
         except Exception:
@@ -327,21 +370,19 @@ class HuaweiLoginSession:
 
     def _run(self):
         try:
-            ready = self._launch() or {}
-            if self._cancel.is_set():
-                return
             if self.mode == "auto":
-                # Keep a token observed during navigation: another read may land
-                # in a transient document while the SPA redirects to its dashboard.
-                token = ready.get("token") or self._read_access_token()
-                if not token and not ready.get("await_token"):
-                    token = self._auto_submit_credentials()
+                token = self._begin_auto_login()
+                if self._cancel.is_set():
+                    return
                 if token:
                     self._finish(token)
                     return
                 with self._lock:
                     self._set_state("SUBMITTING", refresh=True)
             else:
+                self._launch()
+                if self._cancel.is_set():
+                    return
                 with self._lock:
                     self._set_state("NEED_CRED", refresh=True)
             self._wait_for_completion()
@@ -359,6 +400,75 @@ class HuaweiLoginSession:
                         self._record_auto_failure("failed")
         finally:
             self._cleanup()
+
+    def _begin_auto_login(self):
+        self._navigation_started = time.monotonic()
+        outcome = "ready"
+        try:
+            try:
+                return self._auto_token_after_navigation(self._launch())
+            except LoginFlowError as exc:
+                if exc.code != "navigation_pending":
+                    raise
+                return self._renavigate_cold_start()
+        except LoginFlowError as exc:
+            outcome = exc.code
+            raise
+        except Exception:
+            outcome = "failed"
+            raise
+        finally:
+            if self._cold_start:
+                self._log_cold_navigation(outcome)
+
+    def _auto_token_after_navigation(self, ready):
+        self._ensure_active()
+        ready = ready or {}
+        if ready.get("token") or ready.get("await_token"):
+            self._end_renavigation()
+            return ready.get("token", "")
+        # Keep a token observed during navigation: another read may land in a
+        # transient document while the SPA redirects to its dashboard.
+        token = self._read_access_token()
+        return token or self._auto_submit_credentials()
+
+    def _renavigate_cold_start(self):
+        self._ensure_active()
+        started = time.monotonic()
+        self._renavigation_started = started
+        self._navigation_deadline = started + COLD_NAVIGATION_BUDGET - self._recheck_elapsed
+        try:
+            self._auth._call(self._ws, "Page.navigate", {"url": TRAINING_CAMP_URL},
+                             deadline=self._navigation_deadline)
+            self._ensure_navigation_budget(self._navigation_deadline)
+            return self._auto_token_after_navigation(self._wait_login_ready(require_form=True))
+        except HuaweiAuthError as exc:
+            if self._navigation_deadline is None:
+                raise
+            raise LoginFlowError("wronghost") from exc
+        except LoginFlowError as exc:
+            if self._navigation_deadline is not None and exc.code == "credentials_page":
+                raise LoginFlowError("wronghost") from exc
+            raise
+        finally:
+            self._end_renavigation()
+
+    def _end_renavigation(self):
+        if self._navigation_deadline is not None:
+            self._renavigation_elapsed = time.monotonic() - self._renavigation_started
+            self._navigation_deadline = None
+
+    def _log_cold_navigation(self, outcome):
+        startup = self._startup_elapsed
+        if startup is None:
+            startup = time.monotonic() - self._navigation_started
+        self._log("info", (
+            "cold_navigation startup_ms=%.0f first_host=%s recheck_ms=%.0f "
+            "renavigated=%s renavigate_ms=%.0f final_host=%s total_extra_ms=%.0f outcome=%s"
+        ) % (startup * 1000, self._first_host, self._recheck_elapsed * 1000,
+             "yes" if self._renavigation_started is not None else "no", self._renavigation_elapsed * 1000,
+             self._final_host, (self._recheck_elapsed + self._renavigation_elapsed) * 1000,
+             outcome))
 
     def _launch(self):
         self._ensure_active()
@@ -414,6 +524,10 @@ class HuaweiLoginSession:
                 except Exception:
                     pass
         except Exception as exc:
+            # The cold-start retry owns this browser. A confirmed foreign host
+            # is reported before ordinary teardown, which may take longer.
+            if isinstance(exc, LoginFlowError) and exc.code in ("navigation_pending", "wronghost"):
+                raise
             self._close_browser()
             if isinstance(exc, LoginFlowError):
                 raise
@@ -445,27 +559,102 @@ class HuaweiLoginSession:
             self._ensure_active()
             self._auth._call(self._ws, "Network.setCookies", {"cookies": cookies})
             self._ensure_active()
+            source = getattr(self.plugin, "_cookie_owner_source", None)
+            if callable(source):
+                self._injected_cookie_identity = source(cookies)
+
+    @staticmethod
+    def _guarded_page_script(expr):
+        return "(()=>{" + _LOGIN_HOST_CHECK + "return {host,value:(" + expr + ")};})()"
+
+    def _observe_auto_page(self, expr, deadline=None):
+        self._ensure_active()
+        self._ensure_navigation_budget(deadline)
+        script = self._guarded_page_script(expr)
+        kwargs = {} if deadline is None else {"deadline": deadline}
+        try:
+            result = self._auth._js(self._ws, script, **kwargs)
+        except HuaweiAuthError as exc:
+            # A redirect may destroy a context between commands. An absent
+            # context has no authority to supply a token or receive a form.
+            if "execution context was destroyed" not in str(exc).lower():
+                raise
+            result = None
+        self._ensure_active()
+        self._ensure_navigation_budget(deadline)
+        host = result.get("host") if isinstance(result, dict) else None
+        if host not in ("about:blank", "external", "huawei.com",
+                        "health.cloud.huawei.com", "id1.cloud.huawei.com"):
+            return "unavailable", None
+        if self._startup_elapsed is None:
+            self._first_host = host
+            self._startup_elapsed = time.monotonic() - self._navigation_started
+        self._final_host = host
+        if host == "external":
+            raise LoginFlowError("wronghost")
+        return host, result.get("value")
+
+    def _await_auto_page(self, expr, deadline):
+        while time.monotonic() < deadline:
+            # Only probe the hostname on the blank page. Keep the guard on the
+            # action too because navigation could replace the page meanwhile.
+            host, _ = self._observe_auto_page("null", deadline)
+            if host not in ("about:blank", "unavailable"):
+                host, result = self._observe_auto_page(expr, deadline)
+                if host not in ("about:blank", "unavailable"):
+                    return result
+            self._navigation_wait(COLD_HOST_POLL_INTERVAL, deadline)
+            self._ensure_active()
+        raise HuaweiAuthDeadline("CDP 导航等待超时")
+
+    @staticmethod
+    def _ensure_navigation_budget(deadline):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise HuaweiAuthDeadline("CDP 导航等待超时")
+
+    def _auto_page_js(self, expr):
+        deadline = self._navigation_deadline
+        self._ensure_navigation_budget(deadline)
+        host, result = self._observe_auto_page(expr, deadline)
+        if host != "about:blank" and (host != "unavailable" or deadline is None):
+            return result
+        if deadline is not None:
+            return self._await_auto_page(expr, deadline)
+        if not self._cold_start or self._renavigation_started is not None:
+            raise LoginFlowError("wronghost")
+        started = time.monotonic()
+        deadline = started + COLD_HOST_RECHECK - self._recheck_elapsed
+        try:
+            return self._await_auto_page(expr, deadline)
+        except HuaweiAuthDeadline as exc:
+            raise LoginFlowError("navigation_pending") from exc
+        finally:
+            self._recheck_elapsed += time.monotonic() - started
+
+    def _navigation_wait(self, seconds, deadline):
+        self._cancel.wait(max(0.0, min(seconds, deadline - time.monotonic())))
 
     def _read_access_token(self):
-        self._ensure_active()
-        token = self._auth._js(self._ws, "sessionStorage.getItem('accessToken')")
-        self._ensure_active()
+        token = self._auto_page_js(_TOKEN_SCRIPT)
         return token.strip() if isinstance(token, str) else ""
 
-    def _wait_login_ready(self):
+    def _wait_login_ready(self, *, require_form=False):
         """Distinguish a token, a pending authenticated page, and a login form.
 
         A valid Cookie session can bypass the login button entirely. A direct
         redirect to the account form is also ready; neither requires that button.
         """
         deadline = time.monotonic() + min(40, max(1, self._auth.page_timeout))
+        if self._navigation_deadline is not None:
+            deadline = min(deadline, self._navigation_deadline)
+        clicked = False
         while time.monotonic() < deadline:
             self._ensure_active()
             try:
                 token = self._read_access_token()
                 if token:
                     return {"token": token}
-                result = self._auth._js(self._ws, self._login_click_script())
+                result = self._auto_page_js(self._login_click_script(click=not clicked))
                 self._ensure_active()
                 if isinstance(result, dict):
                     token = result.get("token")
@@ -473,15 +662,16 @@ class HuaweiLoginSession:
                         return {"token": token.strip()}
                     if result.get("await_token") is True:
                         return {"await_token": True}
-                if result in ("clicked", "credentials"):
+                if result == "credentials" or (result == "clicked" and not require_form):
                     return {}
+                clicked = clicked or result == "clicked"
             except LoginFlowError:
                 raise
             except HuaweiAuthError:
                 raise
             except Exception:
                 pass
-            self._cancel.wait(0.5)
+            self._navigation_wait(0.5, deadline)
         self._ensure_active()
         raise LoginFlowError("credentials_page")
 
@@ -528,6 +718,9 @@ class HuaweiLoginSession:
 
     def _auto_submit_credentials(self):
         token = self._read_access_token()
+        # Retry navigation is complete once the guarded readiness checks have
+        # found a usable page. Credential decryption and form I/O are unchanged.
+        self._end_renavigation()
         if token:
             return token
         store = getattr(self.plugin, "credentials", None)
@@ -546,12 +739,14 @@ class HuaweiLoginSession:
         account = values.get("account", "")
         password = values.get("password", "")
         deadline = time.monotonic() + min(45, max(1, self._auth.page_timeout))
+        if self._navigation_deadline is not None:
+            deadline = min(deadline, self._navigation_deadline)
         try:
             while time.monotonic() < deadline:
                 token = self._read_access_token()
                 if token:
                     return token
-                result = self._auth._js(self._ws, self._credential_fill_script(account, password))
+                result = self._auto_page_js(self._credential_fill_script(account, password))
                 self._ensure_active()
                 if isinstance(result, dict):
                     token = result.get("token")
@@ -561,11 +756,12 @@ class HuaweiLoginSession:
                         return ""
                 if result == "submitted":
                     self._credentials_submitted = True
+                    self._submitted_account = account.strip()
                     return ""
                 if result == "wronghost":
                     raise LoginFlowError("wronghost")
-                self._cancel.wait(0.5)
-        except LoginFlowError:
+                self._navigation_wait(0.5, deadline)
+        except (LoginFlowError, HuaweiAuthDeadline):
             raise
         except Exception as exc:
             raise LoginFlowError("credentials_page") from exc
@@ -587,6 +783,8 @@ class HuaweiLoginSession:
             self._close_browser(sweep_profile=self._sweep_allowed())
             self.mode = "manual"
             self._headless = False
+            self._submitted_account = ""
+            self._injected_cookie_identity = None
             # 兜底是「重新开始一次登录」，别让自动阶段耗掉的时间吃掉可见窗口的预算。
             self._started_at = time.time()
             with self._lock:
@@ -612,7 +810,7 @@ class HuaweiLoginSession:
         return True
 
     @staticmethod
-    def _login_click_script() -> str:
+    def _login_click_script(*, click=True) -> str:
         return (
             "(()=>{const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);"
             "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';};"
@@ -620,8 +818,9 @@ class HuaweiLoginSession:
             "const u=document.querySelector('input.userAccount'),"
             "p=document.querySelector('input.hwid-input-pwd');"
             "if(u&&p&&visible(u)&&visible(p))return 'credentials';"
-            "const b=document.querySelector('button.login-button');"
-            "if(b&&visible(b)){b.click();return 'clicked';}return 'notfound';})()"
+            + ("const b=document.querySelector('button.login-button');"
+               "if(b&&visible(b)){b.click();return 'clicked';}" if click else "") +
+            "return 'notfound';})()"
         )
 
     def _wait_for_completion(self):
@@ -634,7 +833,15 @@ class HuaweiLoginSession:
             if (deadline and now >= deadline) or now >= hard_deadline:
                 raise LoginFlowError("timeout")
             try:
-                token = self._auth._js(self._ws, "sessionStorage.getItem('accessToken')")
+                if self._headless:
+                    host, token = self._observe_auto_page(_TOKEN_SCRIPT)
+                    if host in ("about:blank", "unavailable"):
+                        self._cancel.wait(COLD_HOST_POLL_INTERVAL)
+                        continue
+                else:
+                    token = self._auth._js(self._ws, _TOKEN_SCRIPT)
+            except LoginFlowError:
+                raise
             except HuaweiAuthError:
                 # CDP 已断：立刻退出，别空等（v0.4.0 会在这里空转 90 秒）。
                 if self._proc is not None and self._proc.poll() is not None:
@@ -1010,6 +1217,7 @@ class HuaweiLoginManager:
         self.session_timeout = LOGIN_DEFAULTS["session_timeout"]
         self.allow_visible_fallback = LOGIN_DEFAULTS["allow_visible_fallback"]
         self._attempts = []
+        self._started_background_auto = False
         self.failure_cooldown_until = 0.0
         self._load_login_config()
 
@@ -1117,7 +1325,7 @@ class HuaweiLoginManager:
             self._save_login_config()
             return new_value
 
-    def _save_login_config(self):
+    def _save_login_config(self, *, strict=False):
         data = {
             "mode": self.login_mode,
             "auto_trust": bool(self.auto_trust),
@@ -1140,6 +1348,8 @@ class HuaweiLoginManager:
             os.replace(tmp, self.login_config_path)
             harden_file_permissions(self.login_config_path)
         except OSError as exc:
+            if strict:
+                raise
             # 只读目录 / 文件被占用：闸门状态丢了比抛裸 OSError 一路穿到 WebUI 好。
             # v0.4.1 第一版这里会把 PermissionError 抛到 manager.start() 的调用方。
             self._log_warning("写入 login_config.json 失败（%s），本次状态未持久化"
@@ -1163,13 +1373,16 @@ class HuaweiLoginManager:
         except Exception:
             pass
 
-    def set_login_mode(self, mode: str):
+    def set_login_mode(self, mode: str, *, strict=False):
         mode = str(mode or "").strip().lower()
         if mode not in ("cookie", "password"):
             raise LoginFlowError("mode_invalid")
         with self._lock:
             self.login_mode = mode
-            self._save_login_config()
+            if strict:
+                self._save_login_config(strict=True)
+            else:
+                self._save_login_config()
 
     # ---------- 风控闸门 ----------
 
@@ -1329,13 +1542,17 @@ class HuaweiLoginManager:
                 if not manual:
                     self._check_auto_gate()
                     self._record_auto_attempt()
+            background_auto = mode == "auto" and not manual
             self._log_info(
                 "开始登录：mode=%s manual=%s auto_trust=%s prefer_auto=%s"
                 % (mode, manual, self.auto_trust, self.prefer_auto))
-            session = HuaweiLoginSession(self, mode=mode, manual=manual)
-            session._attempt_recorded = (mode == "auto" and not manual)
+            cold_start = background_auto and not self._started_background_auto
+            session = HuaweiLoginSession(self, mode=mode, manual=manual, cold_start=cold_start)
+            session._attempt_recorded = background_auto
             self._session = session
             session.start()
+            if background_auto:
+                self._started_background_auto = True
             return session.snapshot()
 
     def submit_sms(self, code: str) -> dict:

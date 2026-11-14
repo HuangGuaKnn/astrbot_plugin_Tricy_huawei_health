@@ -274,6 +274,13 @@ class HuaweiHealthWebApi:
             # T7：权限可见范围 + 不合法的 UMO 回显（不改动上面的现有字段）。
             "permission": self._permission_snapshot(p),
         }
+        if p.account_transition_pending:
+            data["account_switch"] = {
+                "pending": True,
+                "marker_path": p.account_transition_path,
+                "cookie_path": os.path.abspath(p.cookie_file),
+            }
+            return json_response({"status": "ok", "data": data})
 
         # cookie
         cf = p.cookie_file
@@ -393,6 +400,19 @@ class HuaweiHealthWebApi:
     async def refresh(self):
         p = self.plugin
         try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict) and body.get("repair_account_switch") is True:
+            try:
+                await p._recover_account_transition()
+            except Exception:
+                return json_response({
+                    "status": "error",
+                    "message": "账号切换仍待修复。请检查数据目录权限和凭据存储，再重试或按页面提示手工处理。",
+                }, status_code=409)
+            return json_response({"status": "ok", "message": "账号切换恢复完成"})
+        try:
             # 清理失败必须中止，不可继续认证后把失败误报为成功。
             await p._change_auth_state()
             await asyncio.wait_for(p._token(force=True), timeout=getattr(p, "QUERY_TIMEOUT", 90))
@@ -487,19 +507,8 @@ class HuaweiHealthWebApi:
                 "status": "error", "message": storage_status["storage"]["error"] or
                 "加密存储尚未就绪，请先按 README 配置主密钥，再保存账号密码",
             }, status_code=409)
-        def save_credentials():
-            store.save(account, password)
-            self.plugin.login_manager.set_login_mode("password")
-            # 用户刚把密码改对：把 6 小时失败冷却立刻清掉，否则提示会自相矛盾
-            # （「请重新保存账号密码」→ 保存完 → 「冷却中，请稍后再试」）。
-            try:
-                self.plugin.login_manager.clear_cooldown()
-            except Exception:
-                pass
-
         try:
-            # 保存新账号时撤销旧登录态，避免新账号认证失败后回退到旧账号 Cookie。
-            await self.plugin._change_auth_state(save_credentials, clear_cookies=True)
+            await self.plugin._save_account_credentials(account, password)
         except CredentialsUnavailableError as exc:
             return json_response({
                 "status": "error", "message": redact_error(exc) or "加密存储不可用，请检查主密钥配置",
@@ -536,6 +545,11 @@ class HuaweiHealthWebApi:
             if isinstance(body.get("allow_visible_fallback"), bool) else None
         )
         prefer_auto = body.get("prefer_auto") if isinstance(body.get("prefer_auto"), bool) else None
+        if p.account_transition_pending:
+            return json_response({
+                "status": "error",
+                "message": "检测到未完成的账号切换，请先在控制台修复。",
+            }, status_code=409)
         try:
             session = p.login_manager.current_session()
             if (session is not None and session.is_running()

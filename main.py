@@ -21,8 +21,10 @@ import asyncio
 import datetime
 import json
 import os
+import tempfile
 import threading
 import time
+import uuid
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -36,7 +38,8 @@ try:  # 插件作为包加载
     )
     from .hw_store import HealthStore
     from .hw_login import HuaweiLoginManager, LoginFlowError
-    from .hw_credentials import HuaweiCredentialsStore, harden_dir_permissions
+    from .hw_credentials import (CredentialsMissingError, CredentialsUnavailableError,
+                                 HuaweiCredentialsStore, harden_dir_permissions)
     from .hw_privacy import redact_error
 except ImportError:  # 插件目录在 sys.path 里
     from hw_auth import HuaweiAuth, HuaweiAuthError, MIN_COOKIE_SPECS, compute_expire_at
@@ -46,7 +49,8 @@ except ImportError:  # 插件目录在 sys.path 里
     )
     from hw_store import HealthStore
     from hw_login import HuaweiLoginManager, LoginFlowError
-    from hw_credentials import HuaweiCredentialsStore, harden_dir_permissions
+    from hw_credentials import (CredentialsMissingError, CredentialsUnavailableError,
+                                HuaweiCredentialsStore, harden_dir_permissions)
     from hw_privacy import redact_error
 
 PLUGIN_NAME = "astrbot_plugin_Tricy_huawei_health"
@@ -134,6 +138,7 @@ class HuaweiHealthPlugin(Star):
         self._auth_epoch = 0
         self._data_epoch = 0
         self._state_error = False
+        self.account_transition_pending = False
         self._closed = False
         self._client_pool = ClientPool(max_size=3)
         # 记录每个缓存键的进行中任务，避免并发请求重复打华为接口。
@@ -174,12 +179,13 @@ class HuaweiHealthPlugin(Star):
         except Exception:
             pass
         # 配置同时兼容旧整段 JSON 和新分条值，避免升级后必须重新导出全部 cookie。
-        raw = (self.config.get("cookie_json") or "").strip()
-        fields = {
-            name: self.config.get("cookie_" + name, "")
-            for name, _, _ in MIN_COOKIE_SPECS
-        }
-        if raw or any(str(value or "").strip() for value in fields.values()):
+        try:
+            await self._recover_account_transition()
+        except StateChanged:
+            self.logger.warning("[华为健康] 账号切换清理待完成，请在控制台重试")
+        raw, fields = self._configured_cookies()
+        if (not self.account_transition_pending
+                and (raw or any(str(value or "").strip() for value in fields.values()))):
             try:
                 # only_if_changed：配置没变就什么都不做。否则每次插件启动都会用
                 # 几天前的配置快照整份覆盖 hw_cookies.json，把认证回写的滚续结果
@@ -192,6 +198,11 @@ class HuaweiHealthPlugin(Star):
                     self.logger.info("[华为健康] 配置里的 cookie 未变化，保留现有 cookie 文件")
             except Exception as exc:
                 self.logger.warning("[华为健康] 配置里的 cookie 解析失败：%s" % redact_error(exc))
+        if not self.account_transition_pending:
+            try:
+                await asyncio.to_thread(self._check_persisted_cache_owner)
+            except Exception as exc:
+                self.logger.warning("[华为健康] 缓存归属核对失败：%s" % redact_error(exc))
         # 会话白名单：格式非法的条目在这里就报错，WebUI 的 /status 也会回显。
         try:
             self._build_umo_whitelist()
@@ -209,7 +220,7 @@ class HuaweiHealthPlugin(Star):
         except Exception as exc:
             self.logger.warning("[华为健康] WebUI API 注册失败：%s" % redact_error(exc))
         # 后台预热 token：首次查询就不用等 30 多秒的浏览器启动
-        if self.config.get("warmup", True):
+        if not self._state_error and self.config.get("warmup", True):
             self._warmup_task = asyncio.create_task(self._warmup())
 
     async def _warmup(self):
@@ -308,7 +319,8 @@ class HuaweiHealthPlugin(Star):
             if state == "FAILED":
                 raise fail(
                     "自动登录失败：%s" % (status.get("message") or "请查看 WebUI 登录状态"),
-                    "session_failed")
+                    "wronghost" if getattr(session, "failure_code", "") == "wronghost"
+                    else "session_failed")
             if state in ("NEED_SMS", "NEED_CRED", "NEED_TRUST"):
                 break
             await asyncio.sleep(0.5)
@@ -380,6 +392,8 @@ class HuaweiHealthPlugin(Star):
                     raise
                 except HuaweiAuthError as exc:
                     self._assert_current(epoch)
+                    if getattr(exc, "code", "") == "wronghost":
+                        raise
                     if not os.path.exists(self.cookie_file):
                         raise
                     self.logger.warning("[华为健康] 账号密码登录不可用（%s），退回 cookie 路线" % redact_error(exc))
@@ -394,6 +408,9 @@ class HuaweiHealthPlugin(Star):
             def commit():
                 with self._state_lock:
                     self._assert_current(epoch)
+                    digests = getattr(auth, "authenticated_cookie_digests", None)
+                    if isinstance(digests, tuple):
+                        self._bind_cookie_authentication(*digests)
                     stored = self.store.get("token") or {}
                     if mode == "password" and stored.get("token") == token and stored.get("expire_at"):
                         expire_at = float(stored["expire_at"])
@@ -499,21 +516,26 @@ class HuaweiHealthPlugin(Star):
 
     def _clear_auth_cache_blocking(self):
         with self._state_lock:
-            self._auth_epoch += 1
-            self._state_error = True
-            manager = getattr(self, "login_manager", None)
-            if manager and callable(getattr(manager, "invalidate", None)):
-                manager.invalidate()
-            self._client_pool.invalidate()
+            self._invalidate_auth_readers()
             self.store.delete("token")
             self._clear_health_cache(strict=True)
             self._state_error = False
+
+    def _invalidate_auth_readers(self):
+        self._auth_epoch += 1
+        self._state_error = True
+        manager = getattr(self, "login_manager", None)
+        if manager and callable(getattr(manager, "invalidate", None)):
+            manager.invalidate()
+        self._client_pool.invalidate()
 
     def _change_auth_state_blocking(self, mutator=None, clear_cookies=False,
                                     keep_blocked=False):
         with self._state_lock:
             if self._closed:
                 raise StateChanged("插件已停用，请重新启用后修改登录状态。")
+            if self.account_transition_pending:
+                self._recover_account_transition_blocking()
             self._clear_auth_cache_blocking()
             self._state_error = True
             try:
@@ -548,24 +570,7 @@ class HuaweiHealthPlugin(Star):
                         mutator, clear_cookies, keep_blocked=finalize is not None)
                     return result, self._auth_epoch
 
-            worker = asyncio.create_task(asyncio.to_thread(begin))
-            try:
-                result, epoch = await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                # to_thread keeps running after request cancellation. Keep the
-                # mutation lock until it exits, and leave the state blocked.
-                while not worker.done():
-                    try:
-                        await asyncio.shield(worker)
-                    except asyncio.CancelledError:
-                        continue
-                    except Exception:
-                        break
-                if not worker.cancelled():
-                    worker.exception()
-                with self._state_lock:
-                    self._state_error = True
-                raise
+            result, epoch = await self._wait_auth_worker(begin)
             if finalize is not None:
                 await finalize(result)
             with self._state_lock:
@@ -574,8 +579,240 @@ class HuaweiHealthPlugin(Star):
                 self._state_error = False
             return result
 
+    async def _wait_auth_worker(self, work):
+        worker = asyncio.create_task(asyncio.to_thread(work))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # A cancelled request cannot release the auth lock while its worker
+            # is still changing credentials or cache ownership.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not worker.cancelled():
+                worker.exception()
+            with self._state_lock:
+                self._state_error = True
+            raise
+
     async def _invalidate_auth_cache(self):
         await self._change_auth_state()
+
+    def _configured_cookies(self):
+        raw = (self.config.get("cookie_json") or "").strip()
+        fields = {name: self.config.get("cookie_" + name, "") for name, _, _ in MIN_COOKIE_SPECS}
+        return raw, fields
+
+    def _private_cookie_digest(self, digest):
+        return self.store.owner_digest("cookie-v1", digest.encode("ascii")) if digest else None
+
+    def _cookie_owner_source(self, cookies):
+        try:
+            return self._private_cookie_digest(HuaweiAuth.cache_cookie_digest(cookies))
+        except CredentialsUnavailableError:
+            if self.store.current_auth_binding():
+                raise
+            return None
+
+    def _password_owner_source(self, account):
+        return self.store.owner_digest("password-v1", account.strip().encode("utf-8"))
+
+    def _check_persisted_cache_owner(self):
+        with self._state_lock:
+            try:
+                previous = self.store.current_auth_binding()
+                binding = previous if previous and self._binding_matches_source(previous) else None
+                self.store.bind_auth_cache(binding)
+            except Exception:
+                self._state_error = True
+                raise
+            self._state_error = False
+
+    def _binding_matches_source(self, binding, cookie=None, *, check_cookie=True):
+        if check_cookie:
+            cookie = self._cookie_owner_source(self.auth.load_cookies())
+        if binding[2] != cookie:
+            return False
+        if binding[0] == "cookie":
+            return bool(cookie) and binding[3] == self._configured_password_owner()
+        return binding[1] == self._configured_password_owner()
+
+    def _configured_password_owner(self):
+        if self.login_manager.login_mode != "password":
+            return None
+        try:
+            account = self.credentials.load()["account"]
+        except CredentialsMissingError:
+            return None
+        return self._password_owner_source(account)
+
+    def _cookie_binding(self, cookie, continuation=None):
+        if continuation:
+            source, owner, _, context = continuation
+            return source, owner, cookie, context
+        return ("cookie", cookie, cookie, self._configured_password_owner()) if cookie else None
+
+    def _bind_cookie_authentication(self, previous_digest, current_digest):
+        if HuaweiAuth.cache_cookie_digest(self.auth.load_cookies()) != current_digest:
+            self._data_epoch += 1
+            self._client_pool.invalidate()
+            self.store.bind_auth_cache(None)
+            raise StateChanged("登录状态已更新，旧查询已作废，请重新查询。")
+        try:
+            previous_cookie = self._private_cookie_digest(previous_digest)
+            cookie = self._private_cookie_digest(current_digest)
+        except CredentialsUnavailableError:
+            self.store.bind_auth_cache(None)
+            return
+        previous = self.store.current_auth_binding()
+        continuation = (previous if previous and self._binding_matches_source(
+            previous, previous_cookie, check_cookie=False) else None)
+        binding = self._cookie_binding(cookie, continuation)
+        if not continuation and previous is not None and previous != binding:
+            # A live file substitution can switch the account while the caller
+            # waits in _token(). Invalidate all older in-flight publications.
+            self._data_epoch += 1
+            self._client_pool.invalidate()
+        self.store.bind_auth_cache(binding, continuation=continuation)
+
+    @property
+    def account_transition_path(self):
+        return os.path.abspath(os.path.join(self.data_dir, "account_switch.pending.json"))
+
+    def _write_account_transition(self, transaction, config_digest, continuation):
+        path = self.account_transition_path
+        descriptor, temporary = tempfile.mkstemp(prefix=".account_switch.", dir=self.data_dir)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "transaction": transaction,
+                           "config_digest": config_digest,
+                           "continuation": continuation}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            self._sync_transition_directory()
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def _sync_transition_directory(self):
+        # POSIX needs a directory sync to persist creation/removal of the marker.
+        if os.name != "nt":
+            directory = os.open(self.data_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+
+    def _recover_account_transition_blocking(self):
+        with self._state_lock:
+            try:
+                with open(self.account_transition_path, encoding="utf-8") as stream:
+                    self.account_transition_pending = True
+                    self._state_error = True
+                    marker = json.loads(stream.read(1025))
+            except FileNotFoundError:
+                if self.account_transition_pending:
+                    raise StateChanged("账号切换记录无法读取，请通过控制台处理。")
+                return False
+            except Exception as exc:
+                self.account_transition_pending = True
+                self._state_error = True
+                raise StateChanged("账号切换记录无法读取，请通过控制台处理。") from exc
+            try:
+                transaction = marker["transaction"]
+                digest = marker["config_digest"]
+                continuation = marker.get("continuation")
+                if (marker["version"] != 1 or uuid.UUID(transaction).hex != transaction
+                        or (digest is not None and (
+                            len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest)))
+                        or (continuation is not None and not self.store.valid_auth_binding(continuation))):
+                    raise ValueError("invalid account transition marker")
+                self._complete_account_transition(transaction, digest, continuation)
+            except Exception as exc:
+                raise StateChanged("账号切换清理尚未完成，请在控制台重试。") from exc
+            return True
+
+    def _complete_account_transition(self, transaction, config_digest, continuation):
+        if self.credentials.transition_id() == transaction:
+            account = self.credentials.load()["account"]
+            binding = ("password", self._password_owner_source(account), None, None)
+            continuation = (tuple(continuation) if continuation
+                            and tuple(continuation[:2]) == binding[:2] else None)
+            self._invalidate_auth_readers()
+            self._data_epoch += 1
+            self.store.bind_auth_cache(binding, continuation=continuation, revoke_token=True,
+                                       discard=continuation is None)
+            self.login_manager.set_login_mode("password", strict=True)
+            self.auth.clear_cookies()
+            if config_digest:
+                self.auth._write_config_marker(config_digest, strict=True)
+            try:
+                self.login_manager.clear_cooldown()
+            except Exception:
+                pass
+        os.unlink(self.account_transition_path)
+        self.account_transition_pending = False
+        self._state_error = False
+        self._sync_transition_directory()
+
+    async def _recover_account_transition(self):
+        async with self._auth_change_lock:
+            return await self._wait_auth_worker(self._recover_account_transition_blocking)
+
+    async def _save_account_credentials(self, account, password):
+        def save():
+            with self._state_lock:
+                if self._closed:
+                    raise StateChanged("插件已停用，请重新启用后修改登录状态。")
+                self._recover_account_transition_blocking()
+                raw, fields = self._configured_cookies()
+                try:
+                    digest = HuaweiAuth.config_cookie_digest(raw, fields)
+                except HuaweiAuthError:
+                    # Malformed config cannot be imported on restart.
+                    digest = None
+                previous = self.store.current_auth_binding()
+                continuation = None
+                if (previous and previous[0] == "password"
+                        and previous[1] == self._password_owner_source(account)):
+                    try:
+                        if self._binding_matches_source(previous):
+                            continuation = previous
+                    except (HuaweiAuthError, OSError):
+                        # A stored account can be saved again to replace broken
+                        # Cookie state, but its previous cache cannot be proven.
+                        pass
+                transaction = uuid.uuid4().hex
+                try:
+                    self._write_account_transition(transaction, digest, continuation)
+                except OSError:
+                    # A replace can succeed before directory sync fails.
+                    self._recover_account_transition_blocking()
+                    raise
+                self.account_transition_pending = True
+                self._state_error = True
+                try:
+                    self.credentials.save(account, password, transaction=transaction)
+                except Exception:
+                    # A replace may have succeeded before the write reported an
+                    # error. Preserve the marker whenever that is uncertain.
+                    try:
+                        if self.credentials.transition_id() != transaction:
+                            self._complete_account_transition(transaction, digest, continuation)
+                    except Exception:
+                        pass
+                    raise
+                self._complete_account_transition(transaction, digest, continuation)
+
+        async with self._auth_change_lock:
+            await self._wait_auth_worker(save)
 
     def _import_config_cookies(self, raw, fields):
         with self._state_lock:
@@ -602,9 +839,24 @@ class HuaweiHealthPlugin(Star):
                 if (self._closed or self._state_error or session._cancel.is_set()
                         or session._auth_epoch != self._auth_epoch):
                     return False
-                # Cookie, token and health snapshots share the same account transition lock.
-                self.store.delete("token")
-                self.store.clear_except("token")
+                cookie = self._cookie_owner_source(cookies)
+                previous = self.store.current_auth_binding()
+                submitted = getattr(session, "_submitted_account", "")
+                injected = getattr(session, "_injected_cookie_identity", None)
+                # A visible window lets the user choose a different Huawei
+                # account after our initial Cookie injection.
+                continuation = (previous if previous and injected and getattr(session, "_headless", False)
+                                and self._binding_matches_source(previous, injected, check_cookie=False)
+                                else None)
+                if submitted and self.login_manager.login_mode == "password":
+                    owner = self._password_owner_source(submitted)
+                    if owner != self._configured_password_owner():
+                        return False
+                    binding = ("password", owner, cookie, None)
+                    continuation = (previous if previous and previous[:2] == binding[:2]
+                                    and self._binding_matches_source(previous) else None)
+                else:
+                    binding = self._cookie_binding(cookie, continuation)
                 # 这里的账号切换同样是一次「数据代际」变更：在飞的旧账号查询会在
                 # publish 时用 (auth_epoch, data_epoch) 复核，不推进代际就会被放行，
                 # 把上一个账号的健康数据写进新账号的缓存（最长 data_ttl）。
@@ -612,6 +864,8 @@ class HuaweiHealthPlugin(Star):
                 self._client_pool.invalidate()
                 if not session._auth.save_cookies(cookies):
                     return False
+                self.store.bind_auth_cache(binding, continuation=continuation, revoke_token=True,
+                                           discard=continuation is None)
                 self.store.set("token", {"token": token, "expire_at": expire_at,
                                          "obtained_at": time.strftime("%Y-%m-%d %H:%M:%S")})
                 return True

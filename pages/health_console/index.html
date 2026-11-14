@@ -214,6 +214,16 @@ header{display:flex;align-items:baseline;gap:10px;margin-bottom:4px;position:sti
   </header>
   <p class="sub">数据来自华为运动健康网页端：cookie 注入、自动 OAuth 登录、accessToken、只读取数。</p>
 
+  <section class="panel" id="accountSwitchRepair" hidden aria-label="账号切换修复">
+    <p role="alert">检测到未完成的账号切换。请修复后再登录或取数。</p>
+    <button class="act primary" type="button" id="btnRepairAccountSwitch">修复账号切换</button>
+    <p class="msg info" id="accountSwitchMsg" role="status"></p>
+    <details>
+      <summary>重试失败时手工修复</summary>
+      <p>请先停用插件。移走旧 Cookie 文件 <code id="accountSwitchCookie"></code>，并在 AstrBot 的插件配置中清空旧 Cookie 字段。然后删除切换标记 <code id="accountSwitchMarker"></code>，重新启用插件并保存正确账号。</p>
+    </details>
+  </section>
+
   <nav class="tabs" id="tabs" role="tablist" aria-label="功能分区">
     <button class="tab" type="button" role="tab" data-tab="overview" aria-selected="true">概览</button>
     <button class="tab" type="button" role="tab" data-tab="data" aria-selected="false">数据</button>
@@ -671,8 +681,15 @@ function switchTab(name){
 }
 
 /* ---------- 状态渲染 ---------- */
+function renderAccountSwitch(accountSwitch){
+  $("accountSwitchRepair").hidden = accountSwitch.pending !== true;
+  $("accountSwitchCookie").textContent = accountSwitch.cookie_path || "";
+  $("accountSwitchMarker").textContent = accountSwitch.marker_path || "";
+}
+
 function renderStatus(d){
   d = d || {};
+  renderAccountSwitch(d.account_switch || {});
   const ck = d.cookie || {};
   $("cookieProtection").textContent = (ck.storage || {}).message || "Cookie 存储状态暂时不可用";
   const tk = d.token || {};
@@ -872,6 +889,22 @@ async function doRefresh(){
     loadStatus(true);
   }catch(e){ setMsg($("opMsg"), "失败：" + e.message, "err"); }
   finally{ b.disabled = false; renderDiag(); }
+}
+
+async function doRepairAccountSwitch(){
+  const button = $("btnRepairAccountSwitch");
+  const message = $("accountSwitchMsg");
+  button.disabled = true;
+  setMsg(message, "正在修复账号切换…", "info");
+  try{
+    unwrap(await apiPost("refresh", {repair_account_switch:true}));
+    await loadStatus(true);
+    setMsg($("opMsg"), "账号切换恢复完成", "ok");
+  }catch(e){
+    setMsg(message, e.message, "err");
+  }finally{
+    button.disabled = false;
+  }
 }
 
 /* ---------- 账号登录 ---------- */
@@ -1775,6 +1808,7 @@ function bindAll(){
   $("btnOverview").onclick = doOverview;
   $("btnOverviewQuick").onclick = doOverview;
   $("btnRefresh").onclick = doRefresh;
+  $("btnRepairAccountSwitch").onclick = doRepairAccountSwitch;
   $("btnStatus").onclick = () => loadStatus(false);
   $("btnOvToggle").onclick = () => {
     const cards = $all("#overview .ovcard");

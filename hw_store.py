@@ -10,6 +10,7 @@
 
 import base64
 import binascii
+import hmac
 import json
 import os
 import sqlite3
@@ -23,6 +24,12 @@ except ImportError:
 
 
 _PROTECTED_TOKEN_FIELD = "_protected"
+_OWNER_KEY_PURPOSE = "cache-owner-key"
+
+
+def _is_owner_digest(value):
+    return (isinstance(value, str) and len(value) == 64
+            and all(ch in "0123456789abcdef" for ch in value))
 
 
 class HealthStore:
@@ -63,6 +70,10 @@ class HealthStore:
                 "CREATE TABLE IF NOT EXISTS kv ("
                 "k TEXT PRIMARY KEY, v TEXT NOT NULL, expire_at REAL NOT NULL)"
             )
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS auth_cache_metadata ("
+                "id INTEGER PRIMARY KEY CHECK(id=1), owner_key BLOB NOT NULL, binding TEXT)"
+            )
             row = c.execute("SELECT v FROM kv WHERE k='token'").fetchone()
             if row and self._is_legacy_token(row["v"]):
                 c.execute("DELETE FROM kv WHERE k='token' AND v=?", (row["v"],))
@@ -71,6 +82,81 @@ class HealthStore:
             c.execute("DELETE FROM kv WHERE expire_at > 0 AND expire_at < ?", (time.time(),))
         if removed_legacy_token:
             self._checkpoint_removed_token()
+
+    def owner_digest(self, source, value):
+        """Protect low-entropy account names from guessing with an installation key."""
+        key = self._owner_key()
+        return hmac.digest(key, source.encode("ascii") + b"\0" + value, "sha256").hex()
+
+    def _owner_key(self):
+        with self._conn() as c:
+            row = c.execute("SELECT owner_key FROM auth_cache_metadata WHERE id=1").fetchone()
+            if row is None:
+                c.execute("BEGIN IMMEDIATE")
+                row = c.execute("SELECT owner_key FROM auth_cache_metadata WHERE id=1").fetchone()
+                if row is None:
+                    key = os.urandom(32)
+                    protected = credential_storage.protect_persistent_secret(
+                        key, _OWNER_KEY_PURPOSE, self.data_dir)
+                    c.execute("INSERT INTO auth_cache_metadata(id, owner_key) VALUES (1, ?)",
+                              (protected,))
+                    return key
+        key = credential_storage.unprotect_persistent_secret(
+            row["owner_key"], _OWNER_KEY_PURPOSE, self.data_dir)
+        if len(key) != 32:
+            raise credential_storage.CredentialsCorruptError("cache owner key is invalid")
+        return key
+
+    @staticmethod
+    def valid_auth_binding(value):
+        # (effective source, owner fingerprint, current Cookie fingerprint,
+        # password context of a Cookie-mode authentication or fallback)
+        return (isinstance(value, (list, tuple)) and len(value) == 4
+                and value[0] in ("cookie", "password") and _is_owner_digest(value[1])
+                and (value[2] is None or _is_owner_digest(value[2]))
+                and (value[3] is None or _is_owner_digest(value[3]))
+                and (value[2] is not None if value[0] == "cookie" else value[3] is None))
+
+    @classmethod
+    def _read_binding(cls, c):
+        row = c.execute("SELECT binding FROM auth_cache_metadata WHERE id=1").fetchone()
+        if row is None or row["binding"] is None:
+            return None
+        try:
+            value = json.loads(row["binding"])
+        except (ValueError, TypeError):
+            return None
+        return tuple(value) if cls.valid_auth_binding(value) else None
+
+    def current_auth_binding(self):
+        with self._conn() as c:
+            return self._read_binding(c)
+
+    def bind_auth_cache(self, binding, *, continuation=None, revoke_token=False, discard=False):
+        """Publish the binding and invalidate rows in the same database transaction.
+
+        A known continuation may carry snapshots across the auth source update.
+        """
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            previous = self._read_binding(c)
+            matches = binding is not None and previous == binding
+            keep_health = not discard and (
+                matches or (continuation is not None and previous == continuation))
+            if not keep_health or revoke_token:
+                row = c.execute("SELECT v FROM kv WHERE k='token'").fetchone()
+                if row and not self._is_legacy_token(row["v"]):
+                    try:
+                        token = json.loads(row["v"])
+                    except (ValueError, TypeError) as exc:
+                        raise credential_storage.CredentialsCorruptError(
+                            "token storage envelope is invalid") from exc
+                    self._unprotect_token(token)
+                c.execute("DELETE FROM kv WHERE k='token'")
+            if not keep_health:
+                c.execute("DELETE FROM kv WHERE k!='token'")
+            c.execute("UPDATE auth_cache_metadata SET binding=? WHERE id=1",
+                      (json.dumps(binding) if binding is not None else None,))
 
     @staticmethod
     def _is_legacy_token(raw):
